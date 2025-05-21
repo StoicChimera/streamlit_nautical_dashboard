@@ -371,57 +371,57 @@ def render():
         st.title("Freight Breakdown: Fulfillment vs. Project")
         st.markdown("### Fulfillment Freight by Month")
 
-    @st.cache_data(ttl=300)
-    def get_fulfillment_freight():
-        query = """
-            SELECT 
-                customer,
-                DATE_TRUNC('month', entry_date) AS month_start,
-                SUM(ledger_amount) AS total_freight
-            FROM mv_wip_fulfillment_freight
-            GROUP BY customer, DATE_TRUNC('month', entry_date)
-            ORDER BY month_start DESC;
-        """
-        return pd.read_sql(query, engine)
+        @st.cache_data(ttl=300)
+        def get_fulfillment_freight():
+            query = """
+                SELECT 
+                    customer,
+                    DATE_TRUNC('month', entry_date) AS month_start,
+                    SUM(ledger_amount) AS total_freight
+                FROM mv_wip_fulfillment_freight
+                GROUP BY customer, DATE_TRUNC('month', entry_date)
+                ORDER BY month_start DESC;
+            """
+            return pd.read_sql(query, engine)
 
 
-    freight_df = get_fulfillment_freight()
-    freight_df["Month"] = freight_df["month_start"].dt.strftime("%Y-%m")
-    freight_df["numeric_freight"] = freight_df["total_freight"]
-    freight_df["total_freight"] = freight_df["total_freight"].map("${:,.2f}".format)
+        freight_df = get_fulfillment_freight()
+        freight_df["Month"] = freight_df["month_start"].dt.strftime("%Y-%m")
+        freight_df["numeric_freight"] = freight_df["total_freight"]
+        freight_df["total_freight"] = freight_df["total_freight"].map("${:,.2f}".format)
 
-    # === 1. Total Freight by Month
-    freight_total_by_month = (
-        freight_df.groupby("Month")["numeric_freight"]
-        .sum()
-        .reset_index()
-        .rename(columns={"numeric_freight": "total_freight"})
-    )
-    freight_total_by_month["Formatted Total"] = freight_total_by_month["total_freight"].map("${:,.2f}".format)
+        # === 1. Total Freight by Month
+        freight_total_by_month = (
+            freight_df.groupby("Month")["numeric_freight"]
+            .sum()
+            .reset_index()
+            .rename(columns={"numeric_freight": "total_freight"})
+        )
+        freight_total_by_month["Formatted Total"] = freight_total_by_month["total_freight"].map("${:,.2f}".format)
 
-    st.subheader("Total Fulfillment Freight by Month")
-    st.dataframe(freight_total_by_month[["Month", "Formatted Total"]], use_container_width=True)
+        st.subheader("Total Fulfillment Freight by Month")
+        st.dataframe(freight_total_by_month[["Month", "Formatted Total"]], use_container_width=True)
 
-    st.subheader("Trend: Total Fulfillment Freight Over Time")
-    st.line_chart(freight_total_by_month.set_index("Month")["total_freight"])
+        st.subheader("Trend: Total Fulfillment Freight Over Time")
+        st.line_chart(freight_total_by_month.set_index("Month")["total_freight"])
 
-    # === 2. By Customer Breakdown
-    st.markdown("---")
-    st.subheader("Monthly Fulfillment Freight by Customer")
-    st.dataframe(
-        freight_df.drop(columns=["month_start", "numeric_freight"]),
-        use_container_width=True
-    )
+        # === 2. By Customer Breakdown
+        st.markdown("---")
+        st.subheader("Monthly Fulfillment Freight by Customer")
+        st.dataframe(
+            freight_df.drop(columns=["month_start", "numeric_freight"]),
+            use_container_width=True
+        )
 
-    st.subheader("Trend: Monthly Freight Cost by Customer")
-    freight_chart_df = freight_df.pivot_table(
-        index="Month", columns="customer", values="numeric_freight", aggfunc="sum"
-    ).fillna(0)
-    st.line_chart(freight_chart_df)
+        st.subheader("Trend: Monthly Freight Cost by Customer")
+        freight_chart_df = freight_df.pivot_table(
+            index="Month", columns="customer", values="numeric_freight", aggfunc="sum"
+        ).fillna(0)
+        st.line_chart(freight_chart_df)
 
-    if st.button("🔄 Refresh Fulfillment Freight MV"):
-        with engine.begin() as conn:
-            conn.execute(text("REFRESH MATERIALIZED VIEW mv_wip_fulfillment_freight"))
-        st.success("Fulfillment Freight MV refreshed!")
-        st.cache_data.clear()
-        st.rerun()
+        if st.button("🔄 Refresh Fulfillment Freight MV"):
+            with engine.begin() as conn:
+                conn.execute(text("REFRESH MATERIALIZED VIEW mv_wip_fulfillment_freight"))
+            st.success("Fulfillment Freight MV refreshed!")
+            st.cache_data.clear()
+            st.rerun()
