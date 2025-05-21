@@ -1,0 +1,9 @@
+[theme]
+base = "light"
+primaryColor = "#00C2FF"              # Palantir electric blue
+backgroundColor = "#F5F6F8"           # soft light gray background
+secondaryBackgroundColor = "#E1E4E8"  # slightly darker gray panels
+textColor = "#0F1117"                 # deep navy / charcoal text
+font = "sans serif"
+
+pageTitle = "Home"
