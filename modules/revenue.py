@@ -36,7 +36,7 @@ def render():
                 WHERE contract_completion_date >= '2025-01-01'
                 GROUP BY 1 ORDER BY 1;
             """
-            df = pd.read_sql(query, engine)
+            df = pd.read_sql(text(query), engine)
             df["Month"] = pd.to_datetime(df["month"], errors="coerce").dt.strftime("%Y-%m")
             return df.dropna(subset=["Month"])
 
