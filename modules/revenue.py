@@ -9,6 +9,7 @@ import altair as alt
 engine = create_engine(st.secrets["SUPABASE_CONN"])
 
 def get_data(sql: str):
+    print("DEBUG SQL:", sql) 
     df = pd.read_sql(text(sql), engine)
     df["Month"] = pd.to_datetime(df["month"], errors="coerce").dt.strftime("%Y-%m")
     return df.dropna(subset=["Month"])
@@ -104,44 +105,44 @@ def render():
 
     # === Tabs 1–4: Revenue by Category ===
     category_queries = {
-        "Kits": """
-            SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
-                   SUM(amount) AS total_revenue
-            FROM stg_product_service_detail
-            WHERE (
-                product_service ILIKE '%full kit%' OR product_service ILIKE '%base kit%' OR
-                product_service ILIKE '%full target%' OR product_service ILIKE '%target easel kit%' OR
-                product_service ILIKE '%full sfg%' OR product_service ILIKE '%full abs kit%' OR
-                product_service ILIKE '%full go kit%' OR product_service ILIKE '%generic kit%'
-            )
-              AND contract_completion_date >= '2025-01-01'
-            GROUP BY 1 ORDER BY 1;
-        """,
-        "OW Units": """
-            SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
-                   SUM(amount) AS total_revenue
-            FROM stg_product_service_detail
-            WHERE product_service ILIKE '%ow%'
-              AND contract_completion_date >= '2025-01-01'
-            GROUP BY 1 ORDER BY 1;
-        """,
-        "Bags": """
-            SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
-                   SUM(amount) AS total_revenue
-            FROM stg_product_service_detail
-            WHERE product_service ILIKE '%tote%' OR product_service ILIKE '%tote bag%'
-              AND contract_completion_date >= '2025-01-01''
-            GROUP BY 1 ORDER BY 1;
-        """,
-        "Pallets": """
-            SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
-                   SUM(amount) AS total_revenue
-            FROM stg_product_service_detail
-            WHERE product_service ILIKE '%pallet storage full month%'
-              AND contract_completion_date >= '2025-01-01'
-            GROUP BY 1 ORDER BY 1;
-        """
-    }
+    "Kits": """
+        SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
+               SUM(amount) AS total_revenue
+        FROM stg_product_service_detail
+        WHERE (
+            product_service ILIKE '%full kit%' OR product_service ILIKE '%base kit%' OR
+            product_service ILIKE '%full target%' OR product_service ILIKE '%target easel kit%' OR
+            product_service ILIKE '%full sfg%' OR product_service ILIKE '%full abs kit%' OR
+            product_service ILIKE '%full go kit%' OR product_service ILIKE '%generic kit%'
+        )
+        AND contract_completion_date >= '2025-01-01'
+        GROUP BY 1 ORDER BY 1;
+    """,
+    "OW Units": """
+        SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
+               SUM(amount) AS total_revenue
+        FROM stg_product_service_detail
+        WHERE product_service ILIKE '%ow%'
+        AND contract_completion_date >= '2025-01-01'
+        GROUP BY 1 ORDER BY 1;
+    """,
+    "Bags": """
+        SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
+               SUM(amount) AS total_revenue
+        FROM stg_product_service_detail
+        WHERE (product_service ILIKE '%tote%' OR product_service ILIKE '%tote bag%')
+        AND contract_completion_date >= '2025-01-01'
+        GROUP BY 1 ORDER BY 1;
+    """,
+    "Pallets": """
+        SELECT TO_CHAR(DATE_TRUNC('month', contract_completion_date), 'YYYY-MM') AS month,
+               SUM(amount) AS total_revenue
+        FROM stg_product_service_detail
+        WHERE product_service ILIKE '%pallet storage full month%'
+        AND contract_completion_date >= '2025-01-01'
+        GROUP BY 1 ORDER BY 1;
+    """
+}
 
     def render_bar_tab(tab, label, sql):
         with tab:
