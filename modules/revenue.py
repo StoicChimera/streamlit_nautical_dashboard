@@ -114,7 +114,7 @@ def render():
                 product_service ILIKE '%full sfg%' OR product_service ILIKE '%full abs kit%' OR
                 product_service ILIKE '%full go kit%' OR product_service ILIKE '%generic kit%'
             )
-              WHERE contract_completion_date >= '2025-01-01'
+              AND contract_completion_date >= '2025-01-01'
             GROUP BY 1 ORDER BY 1;
         """,
         "OW Units": """
@@ -122,7 +122,7 @@ def render():
                    SUM(amount) AS total_revenue
             FROM stg_product_service_detail
             WHERE product_service ILIKE '%ow%'
-              WHERE contract_completion_date >= '2025-01-01'
+              AND contract_completion_date >= '2025-01-01'
             GROUP BY 1 ORDER BY 1;
         """,
         "Bags": """
@@ -130,7 +130,7 @@ def render():
                    SUM(amount) AS total_revenue
             FROM stg_product_service_detail
             WHERE product_service ILIKE '%tote%' OR product_service ILIKE '%tote bag%'
-              WHERE contract_completion_date >= '2025-01-01''
+              AND contract_completion_date >= '2025-01-01''
             GROUP BY 1 ORDER BY 1;
         """,
         "Pallets": """
@@ -138,7 +138,7 @@ def render():
                    SUM(amount) AS total_revenue
             FROM stg_product_service_detail
             WHERE product_service ILIKE '%pallet storage full month%'
-              WHERE contract_completion_date >= '2025-01-01'
+              AND contract_completion_date >= '2025-01-01'
             GROUP BY 1 ORDER BY 1;
         """
     }
