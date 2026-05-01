@@ -1,0 +1,28 @@
+# env
+.env*
+*.env
+.env.prod
+
+# python
+__pycache__/
+*.pyc
+
+# mac
+.DS_Store
+
+# streamlit
+.streamlit/secrets.toml
+
+# misc
+*.log
+
+# build artifacts
+*.egg-info/
+
+# exports / outputs
+*.pdf
+*.xlsx
+
+# optional: if you want to keep export folder but ignore files
+src/nautical_dashboard/app/export/*.pdf
+src/nautical_dashboard/app/export/*.xlsx

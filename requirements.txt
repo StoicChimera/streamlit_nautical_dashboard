@@ -1,0 +1,7 @@
+streamlit==1.45.1
+pandas
+numpy
+sqlalchemy
+psycopg2-binary
+python-dotenv
+altair
