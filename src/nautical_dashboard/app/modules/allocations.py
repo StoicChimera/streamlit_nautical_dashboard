@@ -27,7 +27,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-from app.modules.allocation_engine import (
+from nautical_dashboard.app.modules.allocation_engine import (
     ALL_BUCKETS,
     commit_warehouse_allocation,
     copy_adhoc_pct_forward,
