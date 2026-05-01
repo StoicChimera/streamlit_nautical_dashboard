@@ -1,5 +1,14 @@
 import streamlit as st
-from app.modules import revenue, allocations,profitability,sga, wip_labor, production_activity, wip_freight, raw_goods
+from nautical_dashboard.app.modules import (
+    revenue,
+    allocations,
+    profitability,
+    sga,
+    wip_labor,
+    production_activity,
+    wip_freight,
+    raw_goods,
+)
 import subprocess
 import os
 
