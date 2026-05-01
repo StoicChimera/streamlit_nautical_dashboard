@@ -299,16 +299,9 @@ def list_employees_for_review(period: str, labor_source: str) -> pd.DataFrame:
     Joined view of UKG employees with their allocation state for review.
 
     Returns columns:
-        employee_name        — display
-        total_labor_cost     — period total from UKG raw tables
-        ukg_program          — raw UKG program string (informational)
-        ukg_role             — raw UKG role string (informational)
-        role_name            — canonical role if set (NULL if not yet allocated)
-        reviewed             — bool, NULL if no allocation exists
-        reviewed_by          — reviewer, NULL if not reviewed
-        reviewed_at          — timestamp, NULL if not reviewed
-        sum_pct              — sum of allocation_pct across lines (0 if no lines)
-        line_count           — number of allocation lines
+        employee_name, total_labor_cost, ukg_program, ukg_role,
+        role_name, reviewed, reviewed_by, reviewed_at,
+        sum_pct, line_count, is_new_employee
     """
     if labor_source not in ('direct', 'temp'):
         raise ValueError(f"labor_source must be 'direct' or 'temp', got: {labor_source!r}")
@@ -318,18 +311,27 @@ def list_employees_for_review(period: str, labor_source: str) -> pd.DataFrame:
             SELECT employee_name,
                    SUM(total_labor_cost)  AS total_labor_cost,
                    MAX(nmf_program)       AS ukg_program,
-                   MAX(nmf_role)          AS ukg_role
+                   MAX(nmf_role)          AS ukg_role,
+                   bool_and(NOT EXISTS (
+                       SELECT 1 FROM stg_labor_direct_hire prior
+                       WHERE prior.employee_id    = stg_labor_direct_hire.employee_id
+                         AND prior.accrual_period < :period
+                   )) AS is_new_employee
             FROM stg_labor_direct_hire
             WHERE accrual_period = :period
             GROUP BY employee_name
         """
     else:
-        # Mirror the temp filter from the legacy get_temp_labor
         ukg_cte = """
             SELECT employee_name,
                    SUM(total_labor_cost)  AS total_labor_cost,
                    MAX(sbs2_raw)          AS ukg_program,
-                   MAX(sbs3)              AS ukg_role
+                   MAX(sbs3)              AS ukg_role,
+                   bool_and(NOT EXISTS (
+                       SELECT 1 FROM stg_labor_temp prior
+                       WHERE prior.employee_name  = stg_labor_temp.employee_name
+                         AND prior.accrual_period < :period
+                   )) AS is_new_employee
             FROM stg_labor_temp
             WHERE accrual_period = :period
               AND COALESCE(sbs3, '') != 'Not Nautical'
@@ -363,6 +365,7 @@ def list_employees_for_review(period: str, labor_source: str) -> pd.DataFrame:
                u.total_labor_cost,
                u.ukg_program,
                u.ukg_role,
+               u.is_new_employee,
                a.role_name,
                a.reviewed,
                a.reviewed_by,
@@ -589,6 +592,171 @@ def unmark_employee_reviewed(period: str, employee: str, labor_source: str) -> N
 
     list_employees_for_review.clear()
 
+
+def bulk_approve_carried_forward(
+    period: str, labor_source: str, reviewer_name: str,
+) -> dict:
+    """
+    For every employee in the period with no current allocation:
+      - Pull their most recent prior reviewed allocation
+      - Validate role + every program/cost_center still exists and is active
+      - Validate lines sum to 1.00
+      - On pass: write lines + mark reviewed in one transaction
+      - On fail: skip with a reason
+
+    Skips silently any employee who already has a current allocation
+    (their state is whatever the user left it).
+
+    Returns:
+      {
+        'approved':  int,
+        'skipped':   list[{employee, reason}],
+        'no_prior':  int,
+        'current':   int,
+      }
+    """
+    if labor_source not in ('direct', 'temp'):
+        raise ValueError(f"labor_source must be 'direct' or 'temp', got: {labor_source!r}")
+    if not reviewer_name or not reviewer_name.strip():
+        raise ValueError("reviewer_name is required.")
+
+    employees_df = list_employees_for_review(period, labor_source)
+    if employees_df.empty:
+        return {'approved': 0, 'skipped': [], 'no_prior': 0, 'current': 0}
+
+    # Validation lookups (active dim values + current period programs)
+    roles_df = pd.read_sql(text("""
+        SELECT role_name FROM dim_nmf_role WHERE active = TRUE
+    """), engine)
+    valid_roles = set(roles_df['role_name'].tolist())
+
+    cc_df = pd.read_sql(text("""
+        SELECT cost_center_name FROM dim_cost_center WHERE active = TRUE
+    """), engine)
+    valid_cost_centers = set(cc_df['cost_center_name'].tolist())
+
+    customers_df = pd.read_sql(text("""
+        SELECT customer_name FROM dim_customer
+        WHERE active = TRUE AND is_revenue_customer = TRUE
+          AND roll_up_for_cost = FALSE
+    """), engine)
+    valid_programs = set(customers_df['customer_name'].tolist())
+
+    approved = 0
+    skipped  = []
+    no_prior = 0
+    current  = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    with engine.begin() as conn:
+        for _, emp_row in employees_df.iterrows():
+            employee = str(emp_row['employee_name'])
+
+            # Skip employees who already have a current allocation
+            if int(emp_row['line_count']) > 0:
+                current += 1
+                continue
+
+            prior = get_prior_period_allocation(period, employee, labor_source)
+            if not prior:
+                no_prior += 1
+                continue
+
+            # Validate role
+            role = prior['role_name']
+            if role not in valid_roles:
+                skipped.append({
+                    'employee': employee,
+                    'reason': f"Role '{role}' no longer active",
+                })
+                continue
+
+            # Validate every line
+            lines = prior['lines']
+            total_pct = sum(float(ln.get('allocation_pct', 0)) for ln in lines)
+            if abs(total_pct - 1.0) > 1e-6:
+                skipped.append({
+                    'employee': employee,
+                    'reason': f"Lines sum to {total_pct:.4f}, not 1.00",
+                })
+                continue
+
+            line_failure = None
+            for i, ln in enumerate(lines, start=1):
+                lt = ln.get('line_type')
+                if lt == 'direct_program':
+                    tp = ln.get('target_program')
+                    if not tp or tp not in valid_programs:
+                        line_failure = f"Line {i}: program '{tp}' no longer active"
+                        break
+                elif lt == 'cost_center':
+                    cc = ln.get('cost_center_name')
+                    if not cc or cc not in valid_cost_centers:
+                        line_failure = f"Line {i}: cost center '{cc}' no longer active"
+                        break
+                    pr = ln.get('program_restrictions') or []
+                    if pr:
+                        try:
+                            eligible = set(get_programs_for_cost_center(cc, period))
+                        except ValueError:
+                            line_failure = f"Line {i}: cost center '{cc}' rejected"
+                            break
+                        missing = [p for p in pr if p not in eligible]
+                        if missing:
+                            line_failure = (
+                                f"Line {i}: restrictions no longer eligible: "
+                                f"{', '.join(missing)}"
+                            )
+                            break
+                else:
+                    line_failure = f"Line {i}: invalid line_type {lt!r}"
+                    break
+
+            if line_failure:
+                skipped.append({'employee': employee, 'reason': line_failure})
+                continue
+
+            # All checks passed — write lines + mark reviewed
+            for i, ln in enumerate(lines, start=1):
+                conn.execute(text("""
+                    INSERT INTO stg_labor_employee_allocation
+                        (accrual_period, employee_name, labor_source,
+                         role_name, line_order, line_type,
+                         target_program, cost_center_name, allocation_pct,
+                         program_restrictions,
+                         reviewed, reviewed_by, reviewed_at,
+                         set_by, set_at)
+                    VALUES
+                        (:period, :employee, :labor_source,
+                         :role_name, :line_order, :line_type,
+                         :target_program, :cost_center_name, :allocation_pct,
+                         :program_restrictions,
+                         TRUE, :reviewer, :now,
+                         :reviewer, :now)
+                """), {
+                    'period':               period,
+                    'employee':             employee,
+                    'labor_source':         labor_source,
+                    'role_name':            role,
+                    'line_order':           i,
+                    'line_type':            ln['line_type'],
+                    'target_program':       ln.get('target_program'),
+                    'cost_center_name':     ln.get('cost_center_name'),
+                    'allocation_pct':       float(ln['allocation_pct']),
+                    'program_restrictions': ln.get('program_restrictions'),
+                    'reviewer':             reviewer_name.strip(),
+                    'now':                  now,
+                })
+            approved += 1
+
+    list_employees_for_review.clear()
+
+    return {
+        'approved': approved,
+        'skipped':  skipped,
+        'no_prior': no_prior,
+        'current':  current,
+    }
 
 # -------------------------------------------------------------
 # Commit-state guard

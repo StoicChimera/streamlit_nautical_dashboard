@@ -104,8 +104,7 @@ def delete_receiving_return(period: str, customer_name: str):
             DELETE FROM stg_labor_receiving_returns
             WHERE accrual_period = :period AND customer_name = :customer
         """), {"period": period, "customer": customer_name})
-
-
+    
 # ---------------------------------------------------------------------------
 # Data helpers — review tabs
 # ---------------------------------------------------------------------------
@@ -128,6 +127,11 @@ def get_available_periods() -> list[str]:
 def get_direct_hire(period: str) -> pd.DataFrame:
     sql = text("""
         SELECT
+            NOT EXISTS (
+                SELECT 1 FROM stg_labor_direct_hire prior
+                WHERE prior.employee_id    = d.employee_id
+                AND prior.accrual_period < d.accrual_period
+            ) AS is_new_employee,
             d.employee_id,
             d.employee_name,
             d.nmf_program                                       AS program_raw,
@@ -158,11 +162,46 @@ def get_direct_hire(period: str) -> pd.DataFrame:
     return pd.read_sql(sql, engine, params={"period": period})
 
 
+def get_prior_period(period: str) -> str | None:
+    periods = get_available_periods()
+    periods_sorted = sorted(periods)
+    try:
+        idx = periods_sorted.index(period)
+        return periods_sorted[idx - 1] if idx > 0 else None
+    except ValueError:
+        return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_prior_direct_mappings(period: str) -> pd.DataFrame:
+    prior = get_prior_period(period)
+    if not prior:
+        return pd.DataFrame()
+
+    sql = text("""
+        SELECT
+            employee_id,
+            nmf_program,
+            nmf_role,
+            nmf_cogs_flag,
+            is_returns_specialist
+        FROM stg_labor_direct_hire
+        WHERE accrual_period = :period
+    """)
+
+    return pd.read_sql(sql, engine, params={"period": prior})
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_temp_labor(period: str) -> pd.DataFrame:
     sql = text("""
         SELECT
             t.employee_name,
+            NOT EXISTS (
+                SELECT 1 FROM stg_labor_temp prior
+                WHERE prior.employee_name  = t.employee_name
+                AND prior.accrual_period < t.accrual_period
+            ) AS is_new_employee,
             t.sbs1,
             t.sbs2_raw                                          AS program_raw,
             COALESCE(NULLIF(t.sbs3, ''), t.sbs2_raw)           AS program_detail,
@@ -3423,6 +3462,59 @@ def reassign_program_temp(employee_name, old_program, new_program, period):
         """), {"new_prog": new_program, "emp": employee_name, "old_prog": old_program, "period": period})
 
 
+def backfill_mappings_from_prior(period: str) -> dict:
+    """
+    Pre-fills nmf_program/nmf_role/nmf_cogs_flag/is_returns_specialist on the
+    current period from the most recent prior period each employee appears in.
+
+    Only updates rows that are still untouched UKG defaults — i.e. nmf_program
+    still equals original_program AND reviewed = FALSE. Once a row is
+    reassigned or approved, this function will not overwrite it.
+
+    Returns row counts so the caller can clear caches if anything changed.
+    """
+    with engine.begin() as conn:
+        direct = conn.execute(text("""
+            UPDATE stg_labor_direct_hire d
+            SET nmf_program           = prior.nmf_program,
+                nmf_role              = prior.nmf_role,
+                nmf_cogs_flag         = prior.nmf_cogs_flag,
+                is_returns_specialist = prior.is_returns_specialist
+            FROM (
+                SELECT DISTINCT ON (employee_id)
+                    employee_id, nmf_program, nmf_role,
+                    nmf_cogs_flag, is_returns_specialist
+                FROM stg_labor_direct_hire
+                WHERE accrual_period < :period
+                  AND nmf_program IS NOT NULL
+                ORDER BY employee_id, accrual_period DESC
+            ) prior
+            WHERE d.accrual_period = :period
+              AND d.employee_id    = prior.employee_id
+              AND d.reviewed       = FALSE
+              AND COALESCE(d.nmf_program, '') = COALESCE(d.original_program, '')
+        """), {"period": period})
+
+        temp = conn.execute(text("""
+            UPDATE stg_labor_temp t
+            SET sbs2_raw = prior.sbs2_raw
+            FROM (
+                SELECT DISTINCT ON (employee_name)
+                    employee_name, sbs2_raw
+                FROM stg_labor_temp
+                WHERE accrual_period < :period
+                  AND sbs2_raw IS NOT NULL
+                ORDER BY employee_name, accrual_period DESC
+            ) prior
+            WHERE t.accrual_period = :period
+              AND t.employee_name  = prior.employee_name
+              AND t.reviewed       = FALSE
+              AND COALESCE(t.sbs2_raw, '') = COALESCE(t.original_program, '')
+        """), {"period": period})
+
+    return {"direct_filled": direct.rowcount, "temp_filled": temp.rowcount}
+
+
 # ---------------------------------------------------------------------------
 # Shared UI components
 # ---------------------------------------------------------------------------
@@ -4371,6 +4463,12 @@ def render():
         selected_period = st.selectbox(
             "Accrual Period", periods, index=len(periods) - 1, key="wip_period",
         )
+    # Carry forward prior period mappings (idempotent — only fills untouched rows)
+    backfill = backfill_mappings_from_prior(selected_period)
+    if backfill["direct_filled"] > 0 or backfill["temp_filled"] > 0:
+        get_direct_hire.clear()
+        get_temp_labor.clear()
+
     with col2:
         reviewer_name = st.text_input("Reviewer's Name", key="wip_reviewer")
 

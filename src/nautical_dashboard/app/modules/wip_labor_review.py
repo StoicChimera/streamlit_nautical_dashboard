@@ -100,29 +100,46 @@ def _row_label(row: pd.Series, show_amounts: bool = False) -> str:
     name = str(row['employee_name'])
     cost = _dollar_or_hidden(row['total_labor_cost'], show_amounts)
     reviewed = bool(row['reviewed']) if pd.notna(row['reviewed']) else False
-    status = "✓" if reviewed else "⚠"
+    is_new = bool(row.get('is_new_employee', False)) if 'is_new_employee' in row else False
+
+    if is_new:
+        status = "NEW"
+    elif reviewed:
+        status = "✓"
+    else:
+        status = "⚠"
     return f"{status}  {name}  ·  {cost}"
 
+
+def _render_row_button(row: pd.Series, period: str, labor_source: str,
+                       show_amounts: bool, currently_selected):
+    name = row['employee_name']
+    is_selected = (name == currently_selected)
+    btn_key = f"row_btn_{period}_{labor_source}_{name}"
+    if st.button(
+        _row_label(row, show_amounts),
+        key=btn_key,
+        type="primary" if is_selected else "secondary",
+        use_container_width=True,
+    ):
+        st.session_state[_selected_key(period, labor_source)] = name
 
 # -------------------------------------------------------------
 # Left column — employee list
 # -------------------------------------------------------------
 
 def _render_employee_list(period: str, labor_source: str, employees: pd.DataFrame, show_amounts: bool = False):
-    """Renders the filterable employee list with click-to-select buttons."""
+    """Renders the filterable employee list, segregated into new hires,
+    returning-pending, and returning-approved sections."""
     sel_k = _selected_key(period, labor_source)
     currently_selected = st.session_state.get(sel_k)
 
-    # Search
-    search_k = f"search_{period}_{labor_source}"
     search_term = st.text_input(
         "Search",
-        key=search_k,
+        key=f"search_{period}_{labor_source}",
         placeholder="Employee name...",
         label_visibility="collapsed",
     )
-
-    # Filter
     filter_choice = st.radio(
         "Show",
         options=["All", "Not allocated", "Approved"],
@@ -132,6 +149,9 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
     )
 
     df = employees.copy()
+    if 'is_new_employee' not in df.columns:
+        df['is_new_employee'] = False
+
     if search_term:
         df = df[df['employee_name'].str.contains(search_term, case=False, na=False)]
     if filter_choice == "Not allocated":
@@ -145,21 +165,27 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
         st.info("No employees match the current filter.")
         return
 
-    # Scrollable list — one button per row
+    new_hires            = df[df['is_new_employee'].fillna(False) == True]
+    returning_unreviewed = df[(df['is_new_employee'].fillna(False) == False) & (~df['reviewed'].fillna(False))]
+    returning_reviewed   = df[(df['is_new_employee'].fillna(False) == False) & (df['reviewed'].fillna(False) == True)]
+
     with st.container(height=560):
-        for _, row in df.iterrows():
-            name = row['employee_name']
-            is_selected = (name == currently_selected)
-            btn_key = f"row_btn_{period}_{labor_source}_{name}"
+        if not new_hires.empty:
+            st.markdown(f"**New hires ({len(new_hires)})** — no prior allocation")
+            for _, row in new_hires.iterrows():
+                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
+            st.markdown("")
 
-            if st.button(
-                _row_label(row, show_amounts),
-                key=btn_key,
-                type="primary" if is_selected else "secondary",
-                use_container_width=True,
-            ):
-                st.session_state[sel_k] = name
+        if not returning_unreviewed.empty:
+            st.markdown(f"**Returning — pending approval ({len(returning_unreviewed)})**")
+            for _, row in returning_unreviewed.iterrows():
+                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
+            st.markdown("")
 
+        if not returning_reviewed.empty:
+            st.markdown(f"**Approved ({len(returning_reviewed)})**")
+            for _, row in returning_reviewed.iterrows():
+                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
 
 # -------------------------------------------------------------
 # Right column — editor body
@@ -448,6 +474,51 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
     pct_done = reviewed_count / total_employees if total_employees else 0
     st.progress(pct_done, text=f"{reviewed_count} of {total_employees} approved ({pct_done:.0%})")
 
+    # Bulk approve carried-forward employees
+    if not wla.is_period_committed(period):
+        eligible_mask = (
+            (~employees['is_new_employee'].fillna(False))
+            & (~employees['reviewed'].fillna(False))
+            & (employees['line_count'].fillna(0) == 0)
+        )
+        eligible_count = int(eligible_mask.sum())
+        if eligible_count > 0:
+            col_btn, col_msg = st.columns([2, 5])
+            with col_btn:
+                if st.button(
+                    f"Carry forward + approve {eligible_count} returning",
+                    key=f"bulk_carry_{period}_{labor_source}",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=not reviewer_name.strip(),
+                ):
+                    result = wla.bulk_approve_carried_forward(
+                        period, labor_source, reviewer_name,
+                    )
+                    msg = (
+                        f"Approved {result['approved']}. "
+                        f"Skipped {len(result['skipped'])}. "
+                        f"No prior allocation: {result['no_prior']}."
+                    )
+                    if result['skipped']:
+                        st.warning(msg + " See expander for skipped employees.")
+                        with st.expander(f"Skipped ({len(result['skipped'])})", expanded=False):
+                            st.dataframe(
+                                pd.DataFrame(result['skipped']),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                    else:
+                        st.success(msg)
+                    st.rerun()
+            with col_msg:
+                st.caption(
+                    "Copies prior period role + lines, validates, and marks reviewed. "
+                    "Anyone whose role/program/cost center is no longer active, or "
+                    "whose lines don't sum to 100%, lands in 'pending approval' for "
+                    "individual review."
+                )
+                
     st.markdown("")
 
     # --- Drill-down layout ---
