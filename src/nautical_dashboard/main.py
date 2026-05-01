@@ -1,7 +1,10 @@
 import sys
 import os
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+SRC_DIR = os.path.join(ROOT_DIR, "src")
+
+sys.path.insert(0, SRC_DIR)
 
 import streamlit as st
 
