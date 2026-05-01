@@ -22,3 +22,6 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 nautical_dashboard = ["*.toml", "*.yaml", "*.env*"]
+
+[project]
+requires-python = ">=3.11,<3.12"
