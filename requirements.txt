@@ -5,6 +5,3 @@ sqlalchemy
 psycopg2-binary
 python-dotenv
 altair
-altair==5.2.0
-sqlalchemy==2.0.29
-typing-extensions==4.12.2
