@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from streamlit_cookies_controller import CookieController
+from . import email_client
 
 load_dotenv()
 SUPABASE_CONN = os.getenv("SUPABASE_CONN")
@@ -216,8 +217,7 @@ def _clear_session():
 # ============================================================
 
 def _render_login_form():
-    # Center the form with constrained width
-    _, center, _ = st.columns([2, 3, 2])
+    _, center, _ = st.columns([1, 2, 1])
 
     with center:
         st.title("Nautical Financial Platform")
@@ -227,6 +227,11 @@ def _render_login_form():
             email = st.text_input("Email", key="login_email").strip().lower()
             password = st.text_input("Password", type="password", key="login_password")
             submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+
+        # Forgot password link below the form
+        if st.button("Forgot password?", key="forgot_pw_btn", type="tertiary"):
+            st.session_state["_show_forgot_form"] = True
+            st.rerun()
 
         if not submitted:
             st.stop()
@@ -308,19 +313,219 @@ def _render_password_change():
         st.rerun()
 
 
+def _render_forgot_password_form():
+    _, center, _ = st.columns([1, 2, 1])
+
+    with center:
+        st.title("Reset password")
+        st.caption("Enter your email and we'll send you a reset link.")
+
+        with st.form("forgot_pw_form"):
+            email = st.text_input("Email", key="forgot_email").strip().lower()
+            submitted = st.form_submit_button("Send reset link", type="primary", use_container_width=True)
+
+        if st.button("← Back to sign in", key="back_to_login_btn", type="tertiary"):
+            del st.session_state["_show_forgot_form"]
+            st.rerun()
+
+        if not submitted:
+            st.stop()
+
+        if not email:
+            st.error("Email required.")
+            st.stop()
+
+        token = _create_reset_token(email)
+
+        # Always show same success message — don't leak whether email exists
+        if token:
+            user = _lookup_user(email)
+            sent = email_client.send_password_reset_email(
+                to_email=email,
+                token=token,
+                user_name=user["name"] if user else email,
+            )
+            if not sent:
+                st.error(
+                    "Could not send the email. Contact admin — this is a "
+                    "configuration issue, not your account."
+                )
+                st.stop()
+
+        st.success(
+            "If an account exists with that email, a reset link has been sent. "
+            "Check your inbox (and spam folder). The link expires in 1 hour."
+        )
+        st.stop()
+
+
+def _render_reset_password_form(token: str):
+    _, center, _ = st.columns([1, 2, 1])
+
+    with center:
+        st.title("Set new password")
+
+        user = _validate_reset_token(token)
+        if not user:
+            st.error(
+                "This reset link is invalid or has expired. "
+                "Request a new one from the sign-in page."
+            )
+            if st.button("Back to sign in", type="primary"):
+                # Clear the reset_token from URL
+                st.query_params.clear()
+                st.rerun()
+            st.stop()
+
+        st.info(f"Resetting password for **{user['name']}** ({user['email']})")
+
+        with st.form("reset_pw_form"):
+            new_pw = st.text_input("New password", type="password", key="reset_new_pw")
+            confirm = st.text_input("Confirm password", type="password", key="reset_confirm_pw")
+            submitted = st.form_submit_button("Set password", type="primary", use_container_width=True)
+
+        if not submitted:
+            st.stop()
+
+        if len(new_pw) < 12:
+            st.error("Password must be at least 12 characters.")
+            st.stop()
+        if new_pw != confirm:
+            st.error("Passwords do not match.")
+            st.stop()
+
+        success = _consume_reset_token(token, new_pw)
+        if not success:
+            st.error("Could not reset password. The link may have expired or already been used.")
+            st.stop()
+
+        # Clear URL param and redirect to login
+        st.query_params.clear()
+        st.success("Password reset successfully. Sign in with your new password.")
+        st.balloons()
+
+
+# ============================================================
+# Password reset tokens
+# ============================================================
+
+RESET_TOKEN_TTL_HOURS = 1
+
+
+def _create_reset_token(email: str) -> str | None:
+    """
+    Generates a secure token, stores it in DB, returns it.
+    Returns None if the email isn't a real user (silent fail to
+    prevent email enumeration).
+    """
+    user = _lookup_user(email)
+    if not user:
+        return None
+
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=RESET_TOKEN_TTL_HOURS)
+
+    with _engine.begin() as conn:
+        conn.execute(text("""
+            INSERT INTO auth_password_reset_tokens (token, email, expires_at)
+            VALUES (:token, :email, :expires_at)
+        """), {
+            "token":      token,
+            "email":      email.lower(),
+            "expires_at": expires_at,
+        })
+
+    return token
+
+
+def _validate_reset_token(token: str) -> dict | None:
+    """
+    Returns {email, name, role} if the token is valid and unused.
+    Returns None otherwise.
+    """
+    df = pd.read_sql(text("""
+        SELECT email, expires_at, used_at
+        FROM auth_password_reset_tokens
+        WHERE token = :token
+    """), _engine, params={"token": token})
+
+    if df.empty:
+        return None
+
+    row = df.iloc[0]
+    if pd.notna(row["used_at"]):
+        return None  # already used
+
+    expires = pd.to_datetime(row["expires_at"], utc=True)
+    if expires <= datetime.now(timezone.utc):
+        return None  # expired
+
+    return _lookup_user(str(row["email"]))
+
+
+def _consume_reset_token(token: str, new_password: str) -> bool:
+    """
+    Atomically: validate token, set new password, mark token used,
+    clear lockout. Returns True on success.
+    """
+    user = _validate_reset_token(token)
+    if not user:
+        return False
+
+    new_hash = _hash_password(new_password)
+
+    with _engine.begin() as conn:
+        # Update password
+        conn.execute(text("""
+            UPDATE dim_app_users
+            SET pw_hash             = :pw_hash,
+                must_change_pw      = FALSE,
+                failed_login_count  = 0,
+                lockout_until       = NULL
+            WHERE LOWER(email) = LOWER(:email)
+        """), {"pw_hash": new_hash, "email": user["email"]})
+
+        # Mark token consumed
+        conn.execute(text("""
+            UPDATE auth_password_reset_tokens
+            SET used_at = NOW()
+            WHERE token = :token
+        """), {"token": token})
+
+    _log_attempt(user["email"], True, "password_reset_completed")
+    return True
+
+
 # ============================================================
 # Public API
 # ============================================================
 
 def require_login() -> dict:
     """
-    Call at the top of every page. Returns user dict or halts the page.
-    Handles login form, password change, session loading, idle timeout.
+    Call at the top of every page. Handles all auth flows:
+      - Reset password via URL token
+      - Forgot password form
+      - Forced password change after first login
+      - Login form
+      - Existing session
     """
+    # 1. Password reset via URL token (highest priority)
+    reset_token = st.query_params.get("reset_token")
+    if reset_token:
+        _render_reset_password_form(reset_token)
+        st.stop()
+
+    # 2. Forgot password form
+    if st.session_state.get("_show_forgot_form"):
+        _render_forgot_password_form()
+        st.stop()
+
+    # 3. Forced password change after first login
     if "_pending_pw_change" in st.session_state:
         _render_password_change()
         st.stop()
 
+    # 4. Existing session
     user = _load_session()
     if not user:
         _render_login_form()

@@ -9,4 +9,5 @@ plotly
 reportlab
 bcrypt>=4.0.0
 streamlit-cookies-controller>=0.0.4
+resend>=0.8.0
 # force rebuild
