@@ -17,6 +17,7 @@ from nautical_dashboard.app.modules import (
     production_activity,
     wip_freight,
     raw_goods,
+    auth_admin,
 )
 import subprocess
 import os
@@ -37,6 +38,7 @@ PAGES = {
     "Warehouse Allocations":   allocations.render,
     "WIP Labor":               wip_labor.render,
     "WIP Freight":             wip_freight.render,
+    "Auth Admin":              auth_admin.render,
 }
 
 st.sidebar.title("Navigation")
