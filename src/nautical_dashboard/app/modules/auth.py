@@ -217,7 +217,7 @@ def _clear_session():
 
 def _render_login_form():
     # Center the form with constrained width
-    _, center, _ = st.columns([1, 2, 1])
+    _, center, _ = st.columns([2, 3, 2])
 
     with center:
         st.title("Nautical Financial Platform")
@@ -273,7 +273,7 @@ def _render_login_form():
 def _render_password_change():
     user = st.session_state["_pending_pw_change"]
 
-    _, center, _ = st.columns([1, 2, 1])
+    _, center, _ = st.columns([2, 3, 2])
 
     with center:
         st.title("Change Password")
