@@ -363,6 +363,18 @@ def _render_reset_password_form(token: str):
     _, center, _ = st.columns([1, 2, 1])
 
     with center:
+        # Success screen — shown after reset completes
+        if st.session_state.get("_reset_success"):
+            st.title("Password reset")
+            st.success("Your password has been updated.")
+            st.markdown("You can now sign in with your new password.")
+
+            if st.button("Sign in", type="primary", use_container_width=True):
+                del st.session_state["_reset_success"]
+                st.rerun()
+            st.stop()
+
+        # Normal flow — token validation + form
         st.title("Set new password")
 
         user = _validate_reset_token(token)
@@ -372,7 +384,6 @@ def _render_reset_password_form(token: str):
                 "Request a new one from the sign-in page."
             )
             if st.button("Back to sign in", type="primary"):
-                # Clear the reset_token from URL
                 st.query_params.clear()
                 st.rerun()
             st.stop()
@@ -399,10 +410,10 @@ def _render_reset_password_form(token: str):
             st.error("Could not reset password. The link may have expired or already been used.")
             st.stop()
 
-        # Clear URL param and redirect to login
+        # Mark success in session state so we render success screen on rerun
+        st.session_state["_reset_success"] = True
         st.query_params.clear()
-        st.success("Password reset successfully. Sign in with your new password.")
-        st.balloons()
+        st.rerun()
 
 
 # ============================================================
