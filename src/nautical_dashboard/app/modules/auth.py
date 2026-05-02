@@ -37,10 +37,9 @@ def _streamlit_user_email() -> str | None:
     Returns the logged-in user's email, or None if not authenticated.
 
     Streamlit Community Cloud sets st.user.email when viewer auth is on.
-    On older Streamlit versions it's st.experimental_user.email.
-    Locally (no auth), both are None.
+    Locally (no auth), it's None.
     """
-    user = getattr(st, "user", None) or getattr(st, "experimental_user", None)
+    user = getattr(st, "user", None)
     if user is None:
         return None
     email = getattr(user, "email", None)
