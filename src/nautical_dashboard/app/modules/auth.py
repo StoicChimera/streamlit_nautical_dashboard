@@ -216,89 +216,96 @@ def _clear_session():
 # ============================================================
 
 def _render_login_form():
-    st.title("Nautical Financial Platform")
-    st.caption("Sign in to continue")
+    # Center the form with constrained width
+    _, center, _ = st.columns([1, 2, 1])
 
-    with st.form("login_form", clear_on_submit=False):
-        email = st.text_input("Email", key="login_email").strip().lower()
-        password = st.text_input("Password", type="password", key="login_password")
-        submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
+    with center:
+        st.title("Nautical Financial Platform")
+        st.caption("Sign in to continue")
 
-    if not submitted:
-        st.stop()
+        with st.form("login_form", clear_on_submit=False):
+            email = st.text_input("Email", key="login_email").strip().lower()
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Sign in", type="primary", use_container_width=True)
 
-    if not email or not password:
-        st.error("Email and password required.")
-        st.stop()
+        if not submitted:
+            st.stop()
 
-    is_locked, lock_msg = _check_lockout(email)
-    if is_locked:
-        _log_attempt(email, False, "lockout")
-        st.error(lock_msg)
-        st.stop()
+        if not email or not password:
+            st.error("Email and password required.")
+            st.stop()
 
-    user = _lookup_user(email)
-    if not user:
-        _log_attempt(email, False, "unknown_email")
-        st.error("Invalid email or password.")
-        st.stop()
+        is_locked, lock_msg = _check_lockout(email)
+        if is_locked:
+            _log_attempt(email, False, "lockout")
+            st.error(lock_msg)
+            st.stop()
 
-    if not user["pw_hash"]:
-        _log_attempt(email, False, "no_password_set")
-        st.error("Account exists but no password set. Contact admin.")
-        st.stop()
+        user = _lookup_user(email)
+        if not user:
+            _log_attempt(email, False, "unknown_email")
+            st.error("Invalid email or password.")
+            st.stop()
 
-    if not _verify_password(password, user["pw_hash"]):
-        _record_failed_login(email)
-        _log_attempt(email, False, "bad_password")
-        st.error("Invalid email or password.")
-        st.stop()
+        if not user["pw_hash"]:
+            _log_attempt(email, False, "no_password_set")
+            st.error("Account exists but no password set. Contact admin.")
+            st.stop()
 
-    # Success
-    _reset_failed_logins(email)
-    _log_attempt(email, True)
+        if not _verify_password(password, user["pw_hash"]):
+            _record_failed_login(email)
+            _log_attempt(email, False, "bad_password")
+            st.error("Invalid email or password.")
+            st.stop()
 
-    if user["must_change_pw"]:
-        st.session_state["_pending_pw_change"] = user
+        # Success
+        _reset_failed_logins(email)
+        _log_attempt(email, True)
+
+        if user["must_change_pw"]:
+            st.session_state["_pending_pw_change"] = user
+            st.rerun()
+
+        _save_session(user["email"], user["name"], user["role"])
         st.rerun()
-
-    _save_session(user["email"], user["name"], user["role"])
-    st.rerun()
 
 
 def _render_password_change():
     user = st.session_state["_pending_pw_change"]
 
-    st.title("Change Password")
-    st.info(f"First-time login for **{user['name']}**. Set a new password to continue.")
+    _, center, _ = st.columns([1, 2, 1])
 
-    with st.form("pw_change_form"):
-        new_pw = st.text_input("New password", type="password", key="new_pw")
-        confirm = st.text_input("Confirm password", type="password", key="confirm_pw")
-        submitted = st.form_submit_button("Set password", type="primary", use_container_width=True)
+    with center:
+        st.title("Change Password")
+        st.info(f"First-time login for **{user['name']}**. Set a new password to continue.")
 
-    if not submitted:
-        st.stop()
+        with st.form("pw_change_form"):
+            new_pw = st.text_input("New password", type="password", key="new_pw")
+            confirm = st.text_input("Confirm password", type="password", key="confirm_pw")
+            submitted = st.form_submit_button("Set password", type="primary", use_container_width=True)
 
-    if len(new_pw) < 12:
-        st.error("Password must be at least 12 characters.")
-        st.stop()
-    if new_pw != confirm:
-        st.error("Passwords do not match.")
-        st.stop()
+        if not submitted:
+            st.stop()
 
-    new_hash = _hash_password(new_pw)
-    with _engine.begin() as conn:
-        conn.execute(text("""
-            UPDATE dim_app_users
-            SET pw_hash = :pw_hash, must_change_pw = FALSE
-            WHERE LOWER(email) = LOWER(:email)
-        """), {"pw_hash": new_hash, "email": user["email"]})
+        if len(new_pw) < 12:
+            st.error("Password must be at least 12 characters.")
+            st.stop()
+        if new_pw != confirm:
+            st.error("Passwords do not match.")
+            st.stop()
 
-    del st.session_state["_pending_pw_change"]
-    _save_session(user["email"], user["name"], user["role"])
-    st.success("Password changed. Loading app...")
-    st.rerun()
+        new_hash = _hash_password(new_pw)
+        with _engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE dim_app_users
+                SET pw_hash = :pw_hash, must_change_pw = FALSE
+                WHERE LOWER(email) = LOWER(:email)
+            """), {"pw_hash": new_hash, "email": user["email"]})
+
+        del st.session_state["_pending_pw_change"]
+        _save_session(user["email"], user["name"], user["role"])
+        st.success("Password changed. Loading app...")
+        st.rerun()
 
 
 # ============================================================
