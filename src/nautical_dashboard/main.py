@@ -21,8 +21,12 @@ from nautical_dashboard.app.modules import (
 import subprocess
 import os
 
+from nautical_dashboard.app.modules import auth
 
 st.set_page_config(page_title="Finance Hub", layout="wide")
+
+user = auth.require_login()
+auth.render_logout_button()
 
 PAGES = {
     "Profitability Dashboard": profitability.render,

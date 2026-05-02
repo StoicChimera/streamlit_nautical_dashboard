@@ -7,4 +7,6 @@ python-dotenv
 altair
 plotly
 reportlab
+bcrypt>=4.0.0
+streamlit-cookies-controller>=0.0.4
 # force rebuild

@@ -4468,18 +4468,13 @@ def render():
         "Review labor cost by program for each accrual period. "
         "Mark employees as cleared once allocation is confirmed correct."
     )
-    
-    # Auth gate — must run first
-    user = auth.require_login()
-
-    if user["role"] not in ("admin", "controller", "manager", "viewer"):
-        st.error("Insufficient permissions for this page.")
-        st.stop()
 
     periods = get_available_periods()
     if not periods:
         st.warning("No labor data found.")
         return
+
+    user = auth.current_user()  # auth handled at app entry; just read here
 
     col1, col2 = st.columns([2, 6])
     with col1:

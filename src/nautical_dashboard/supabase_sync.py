@@ -17,9 +17,6 @@ load_dotenv()
 LOCAL_CONN = os.getenv("POSTGRES_CONN")
 SUPABASE_CONN = os.getenv("SUPABASE_CONN")
 
-print("SUPABASE_CONN =", os.getenv("SUPABASE_CONN"))
-print("CWD =", Path.cwd())
-
 # ---------------------------------------------------------------------------
 # Table lists
 # ---------------------------------------------------------------------------
@@ -511,9 +508,6 @@ def main():
         pool_pre_ping=True,
         connect_args={"options": "-c statement_timeout=0"},
     )
-
-    with supabase_engine.connect() as conn:
-        print(conn.execute(text("select current_database();")).fetchall())
 
     init_refresh_log_table(engine=supabase_engine)
 
