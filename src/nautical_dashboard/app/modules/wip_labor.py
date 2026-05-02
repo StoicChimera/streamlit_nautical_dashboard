@@ -10,6 +10,7 @@ from . import wip_labor_review as wlr
 from . import wip_labor_container_unload as wcu
 from . import wip_labor_compute as wlc
 from . import wip_labor_allocation as wla
+from . import auth
 
 # === Load env + DB ===
 load_dotenv()
@@ -2956,7 +2957,13 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
         locked_by = existing["committed_by"].iloc[0] if "committed_by" in existing.columns else "unknown"
         locked_at = existing["committed_at"].iloc[0] if "committed_at" in existing.columns else ""
         st.success(f"Allocation committed by **{locked_by}** at {locked_at}")
-        if st.button("Unlock and Recommit", key=f"unlock_{period}", type="secondary"):
+        can_unlock = auth.has_role("admin", "controller")
+        if st.button(
+            "Unlock and Recommit",
+            key=f"unlock_{period}",
+            type="secondary",
+            disabled=not can_unlock,
+        ):
             unlock_allocation(period)
             get_existing_allocation.clear()
             wla.is_period_committed.clear()
@@ -3320,11 +3327,20 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
             )
         st.markdown("")
 
+    can_commit = auth.has_role("admin", "controller")
+
+    if not can_commit:
+        st.info(
+            "Committing allocation requires admin or controller role. "
+            f"Your current role is `{auth.current_user()['role']}`."
+        )
+
     if st.button(
                 "Commit Allocation",
                 key=f"commit_{period}",
                 type="primary",
                 use_container_width=True,
+                disabled=not can_commit,
             ):
                 if not reviewer_name:
                     st.warning("Enter your name in the Reviewer's Name field above.")
@@ -4452,6 +4468,13 @@ def render():
         "Review labor cost by program for each accrual period. "
         "Mark employees as cleared once allocation is confirmed correct."
     )
+    
+    # Auth gate — must run first
+    user = auth.require_login()
+
+    if user["role"] not in ("admin", "controller", "manager", "viewer"):
+        st.error("Insufficient permissions for this page.")
+        st.stop()
 
     periods = get_available_periods()
     if not periods:
@@ -4463,14 +4486,17 @@ def render():
         selected_period = st.selectbox(
             "Accrual Period", periods, index=len(periods) - 1, key="wip_period",
         )
-    # Carry forward prior period mappings (idempotent — only fills untouched rows)
+    with col2:
+        st.markdown("**Reviewer**")
+        st.markdown(f"{user['name']}  ·  `{user['role']}`")
+
+    reviewer_name = user["name"]
+
+    # Carry forward prior period mappings (only fills untouched rows)
     backfill = backfill_mappings_from_prior(selected_period)
     if backfill["direct_filled"] > 0 or backfill["temp_filled"] > 0:
         get_direct_hire.clear()
         get_temp_labor.clear()
-
-    with col2:
-        reviewer_name = st.text_input("Reviewer's Name", key="wip_reviewer")
 
     # ============================================================
     # Privacy toggle — defaults OFF so screen-share is safe
