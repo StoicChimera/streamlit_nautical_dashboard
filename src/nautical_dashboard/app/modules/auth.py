@@ -74,14 +74,16 @@ def _lookup_user(email: str) -> dict | None:
 # -------------------------------------------------------------
 
 def require_login() -> dict:
-    """
-    Call at the top of every page. Returns the logged-in user's
-    {email, name, role} dict, or halts the page with st.stop() if
-    the user is not authenticated or not provisioned.
-    """
     email = _streamlit_user_email()
 
-    # Local dev escape hatch — set DEV_USER_EMAIL in .env to bypass
+    # DEBUG — remove after confirming
+    user_obj = getattr(st, "user", None)
+    st.write("DEBUG st.user:", user_obj)
+    if user_obj:
+        st.write("DEBUG attributes:", {k: getattr(user_obj, k, None) for k in dir(user_obj) if not k.startswith('_')})
+    st.write("DEBUG resolved email:", email)
+    # END DEBUG
+
     if not email:
         dev_email = os.getenv("DEV_USER_EMAIL")
         if dev_email:
@@ -98,7 +100,6 @@ def require_login() -> dict:
         )
         st.stop()
 
-    # Cache on session_state for the rest of the request
     st.session_state["_auth_user"] = user
     return user
 
