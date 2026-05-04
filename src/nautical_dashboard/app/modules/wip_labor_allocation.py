@@ -439,10 +439,6 @@ def _validate_lines(lines: list[dict]) -> None:
     if abs(total_pct - 1.0) > 1e-6:
         raise ValueError(f"Allocation pct must sum to 1.00, got {total_pct:.6f}")
 
-    cc_count = sum(1 for ln in lines if ln.get('line_type') == 'cost_center')
-    if cc_count > 1:
-        raise ValueError(f"At most one cost_center line allowed, got {cc_count}")
-
     for i, ln in enumerate(lines, start=1):
         lt  = ln.get('line_type')
         pct = float(ln.get('allocation_pct', 0))
