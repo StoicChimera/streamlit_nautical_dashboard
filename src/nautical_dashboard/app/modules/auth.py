@@ -39,16 +39,18 @@ SESSION_COOKIE     = "nautical_session_v2"
 
 def _get_cookies() -> CookieController:
     """
-    Per-session cookie controller.
+    Per-call cookie controller.
 
-    Module-level CookieController instances leak state across users on
-    Streamlit Community Cloud, where Python processes are reused across
-    sessions. By stashing the instance in st.session_state, each user's
-    cookie state stays isolated to their own session.
+    Module-level instances leaked state across users on Streamlit Cloud
+    because the Python process is reused across sessions.
+
+    Caching in st.session_state caused refresh-signs-you-out, because the
+    cached controller couldn't re-bind to the new render context.
+
+    Creating a fresh instance per call is cheap, correct, and isolates
+    state per session.
     """
-    if "_cookie_controller" not in st.session_state:
-        st.session_state["_cookie_controller"] = CookieController()
-    return st.session_state["_cookie_controller"]
+    return CookieController()
 
 
 # ============================================================
