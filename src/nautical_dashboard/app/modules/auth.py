@@ -35,9 +35,20 @@ _engine = create_engine(SUPABASE_CONN)
 IDLE_TIMEOUT_HOURS = 8
 MAX_FAILED_LOGINS  = 5
 LOCKOUT_MINUTES    = 15
-SESSION_COOKIE     = "nautical_session"
+SESSION_COOKIE     = "nautical_session_v2"
 
-_cookies = CookieController()
+def _get_cookies() -> CookieController:
+    """
+    Per-session cookie controller.
+
+    Module-level CookieController instances leak state across users on
+    Streamlit Community Cloud, where Python processes are reused across
+    sessions. By stashing the instance in st.session_state, each user's
+    cookie state stays isolated to their own session.
+    """
+    if "_cookie_controller" not in st.session_state:
+        st.session_state["_cookie_controller"] = CookieController()
+    return st.session_state["_cookie_controller"]
 
 
 # ============================================================
@@ -162,7 +173,7 @@ def _save_session(email: str, name: str, role: str):
         "expires": expires.isoformat(),
     }
     st.session_state["_auth_user"] = session
-    _cookies.set(SESSION_COOKIE, session, expires=expires)
+    _get_cookies().set(SESSION_COOKIE, session, expires=expires)
 
 
 def _refresh_session():
@@ -173,7 +184,7 @@ def _refresh_session():
     expires = datetime.now(timezone.utc) + timedelta(hours=IDLE_TIMEOUT_HOURS)
     user["expires"] = expires.isoformat()
     st.session_state["_auth_user"] = user
-    _cookies.set(SESSION_COOKIE, user, expires=expires)
+    _get_cookies().set(SESSION_COOKIE, user, expires=expires)
 
 
 def _load_session() -> dict | None:
@@ -185,11 +196,11 @@ def _load_session() -> dict | None:
         else:
             del st.session_state["_auth_user"]
 
-    cookie = _cookies.get(SESSION_COOKIE)
+    cookie = _get_cookies().get(SESSION_COOKIE)
     if not cookie or not isinstance(cookie, dict):
         return None
     if not _is_session_valid(cookie):
-        _cookies.remove(SESSION_COOKIE)
+        _get_cookies().remove(SESSION_COOKIE)
         return None
 
     st.session_state["_auth_user"] = cookie
@@ -209,7 +220,7 @@ def _is_session_valid(user: dict) -> bool:
 def _clear_session():
     if "_auth_user" in st.session_state:
         del st.session_state["_auth_user"]
-    _cookies.remove(SESSION_COOKIE)
+    _get_cookies().remove(SESSION_COOKIE)
 
 
 # ============================================================
