@@ -365,8 +365,11 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
             pct_display = float(line.get('allocation_pct', 0)) * 100
             pct = st.number_input(
                 "%",
-                min_value=0.0, max_value=100.0, step=1.0,
+                min_value=0.0,
+                max_value=100.0,
+                step=5.0,
                 value=pct_display,
+                format="%.2f",
                 key=pct_k,
                 label_visibility='collapsed',
             )
