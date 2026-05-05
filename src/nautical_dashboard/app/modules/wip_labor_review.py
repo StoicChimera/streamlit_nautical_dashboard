@@ -102,13 +102,9 @@ def _row_label(row: pd.Series, show_amounts: bool = False) -> str:
     reviewed = bool(row['reviewed']) if pd.notna(row['reviewed']) else False
     is_new = bool(row.get('is_new_employee', False)) if 'is_new_employee' in row else False
 
-    if is_new:
-        status = "NEW"
-    elif reviewed:
-        status = "✓"
-    else:
-        status = "⚠"
-    return f"{status}  {name}  ·  {cost}"
+    status = "Approved" if reviewed else "Pending"
+    new_tag = " NEW" if is_new else ""
+    return f"[{status}]{new_tag}  {name}  ·  {cost}"
 
 
 def _render_row_button(row: pd.Series, period: str, labor_source: str,
@@ -129,8 +125,9 @@ def _render_row_button(row: pd.Series, period: str, labor_source: str,
 # -------------------------------------------------------------
 
 def _render_employee_list(period: str, labor_source: str, employees: pd.DataFrame, show_amounts: bool = False):
-    """Renders the filterable employee list, segregated into new hires,
-    returning-pending, and returning-approved sections."""
+    """Renders the filterable employee list, segregated into new-hires-pending,
+    returning-pending, and approved sections. Approved employees from both
+    new and returning paths land in the same approved section."""
     sel_k = _selected_key(period, labor_source)
     currently_selected = st.session_state.get(sel_k)
 
@@ -165,14 +162,17 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
         st.info("No employees match the current filter.")
         return
 
-    new_hires            = df[df['is_new_employee'].fillna(False) == True]
-    returning_unreviewed = df[(df['is_new_employee'].fillna(False) == False) & (~df['reviewed'].fillna(False))]
-    returning_reviewed   = df[(df['is_new_employee'].fillna(False) == False) & (df['reviewed'].fillna(False) == True)]
+    is_new      = df['is_new_employee'].fillna(False) == True
+    is_reviewed = df['reviewed'].fillna(False) == True
+
+    new_hires_pending    = df[is_new  & ~is_reviewed]
+    returning_unreviewed = df[~is_new & ~is_reviewed]
+    all_approved         = df[is_reviewed]
 
     with st.container(height=560):
-        if not new_hires.empty:
-            st.markdown(f"**New hires ({len(new_hires)})** — no prior allocation")
-            for _, row in new_hires.iterrows():
+        if not new_hires_pending.empty:
+            st.markdown(f"**New hires — pending approval ({len(new_hires_pending)})** — no prior allocation")
+            for _, row in new_hires_pending.iterrows():
                 _render_row_button(row, period, labor_source, show_amounts, currently_selected)
             st.markdown("")
 
@@ -182,9 +182,9 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
                 _render_row_button(row, period, labor_source, show_amounts, currently_selected)
             st.markdown("")
 
-        if not returning_reviewed.empty:
-            st.markdown(f"**Approved ({len(returning_reviewed)})**")
-            for _, row in returning_reviewed.iterrows():
+        if not all_approved.empty:
+            st.markdown(f"**Approved ({len(all_approved)})**")
+            for _, row in all_approved.iterrows():
                 _render_row_button(row, period, labor_source, show_amounts, currently_selected)
 
 # -------------------------------------------------------------
@@ -521,7 +521,7 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
                     "whose lines don't sum to 100%, lands in 'pending approval' for "
                     "individual review."
                 )
-                
+
     st.markdown("")
 
     # --- Drill-down layout ---
