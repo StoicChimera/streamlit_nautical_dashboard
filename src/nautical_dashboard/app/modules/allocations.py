@@ -5,9 +5,8 @@ Warehouse Allocation page — Streamlit module.
 
 Architecture:
   - alloc_warehouse_cost_monthly         manual total $ input
-  - alloc_warehouse_shared_sqft_monthly  manual sqft for 15 shared buckets
+  - alloc_warehouse_shared_sqft_monthly  manual sqft for shared buckets
   - alloc_footprint_monthly_input        manual sqft for direct (non-shared) programs
-  - stg_wh_adhoc_period_config           elected programs for Ad-Hoc bucket
   - stg_warehouse_allocation             committed output (written on Commit)
   - mv_warehouse_by_program              view over committed output → profitability MV
 
@@ -29,20 +28,13 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from nautical_dashboard.app.modules.allocation_engine import (
     ALL_BUCKETS,
-    commit_warehouse_allocation,
-    copy_adhoc_pct_forward,
     copy_sqft_forward,
-    get_adhoc_config,
-    get_adhoc_pct_config,
     get_committed_allocation,
     get_prior_warehouse_wip_applicable,
     get_sqft_inputs,
-    get_sqft_months,
     get_warehouse_wip,
     get_warehouse_wip_all_periods,
     is_committed,
-    save_adhoc_config,
-    save_adhoc_pct_config,
     save_sqft_inputs,
     seed_sqft_month,
     unlock_allocation,
@@ -74,7 +66,6 @@ BUCKET_ROWS = [
     ("OGP ADV",                   "Production"),
     ("Demo ADV",                  "Production"),
     ("E-Comm",                    "Production"),
-    ("Ad-Hoc",                    "Production"),
     ("OverWrap",                  "Production"),
     ("Demo - ADV - Inbound",      "Dock - Inbound"),
     ("OGP - ADV - Inbound",       "Dock - Inbound"),
@@ -388,24 +379,6 @@ def clear_footprint_rows(month_start: date) -> None:
 
 
 # =====================================================
-# E-Comm customers (for ad-hoc config — reuse same pool)
-# =====================================================
-@st.cache_data(ttl=300)
-def get_all_customers(cache_bust: int) -> pd.DataFrame:
-    return pd.read_sql(
-        text("""
-            SELECT c.canonical_key, c.customer_name,
-                COALESCE(parent.customer_name, '') AS parent_name
-            FROM public.dim_customer c
-            LEFT JOIN public.dim_customer parent ON parent.customer_id = c.parent_id
-            WHERE c.active = TRUE AND c.is_revenue_customer = TRUE AND c.roll_up_for_cost = FALSE
-            ORDER BY c.customer_name
-        """),
-        engine,
-    )
-
-
-# =====================================================
 # Direct footprint commit helper
 # Computes allocation rows for direct (non-shared) programs.
 # =====================================================
@@ -480,7 +453,7 @@ def _render_warehouse_cost(month_start: date) -> float:
 def _render_shared_sqft(month_start: date, months: list[date]) -> None:
     st.markdown(f'<h3 style="color:{SECTION_COLOR};">Shared Space Sqft Inputs</h3>', unsafe_allow_html=True)
     st.caption(
-        "Enter the total sqft for each of the 15 shared space buckets. "
+        "Enter the total sqft for each shared space bucket. "
         "The compute engine will allocate each bucket's cost to programs using its activity driver. "
         "Use Initialize to create a blank grid for a new month."
     )
@@ -548,93 +521,6 @@ def _render_shared_sqft(month_start: date, months: list[date]) -> None:
             save_sqft_inputs(month_start, rows, reviewer)
             st.success("Sqft saved.")
             _bust_cache_and_rerun()
-
-
-def _render_adhoc_config(month_start: date, months: list[date]) -> None:
-    st.markdown(f'<h3 style="color:{SECTION_COLOR};">Ad-Hoc Program Allocation</h3>', unsafe_allow_html=True)
-    st.caption(
-        "Fixed percentage allocation for Ad-Hoc production space. "
-        "Percentages must sum to 100%. Persists month to month — copy forward or edit as needed."
-    )
-
-    current = get_adhoc_pct_config(month_start)
-    reviewer = st.session_state.get("wh_reviewer", "")
-
-    # Copy forward control
-    prior = [m for m in months if m < month_start]
-    if prior and current.empty:
-        col_copy, _ = st.columns([2, 5])
-        with col_copy:
-            prev = st.selectbox("Copy from month", prior, key="adhoc_pct_copy_from")
-            if st.button("Copy forward", key="btn_copy_adhoc_pct"):
-                if not reviewer:
-                    st.warning("Enter your name above before copying.")
-                else:
-                    copy_adhoc_pct_forward(prev, month_start)
-                    st.success(f"Copied from {prev}.")
-                    _bust_cache_and_rerun()
-
-    # Build editable grid
-    if current.empty:
-        # Blank grid with default programs
-        default_rows = [
-            {"customer_name": "Advantage - NSA (former SFG)",              "allocation_pct": 0.375},
-            {"customer_name": "Advantage - NSG (former INX)",              "allocation_pct": 0.375},
-            {"customer_name": "Advantage - Whole Foods Other Fulfillment", "allocation_pct": 0.200},
-            {"customer_name": "Advantage - Kroger Demo",                   "allocation_pct": 0.025},
-            {"customer_name": "Advantage - Walmart Demo",                  "allocation_pct": 0.025},
-        ]
-        edit_df = pd.DataFrame(default_rows)
-    else:
-        edit_df = current[["customer_name", "allocation_pct"]].copy()
-
-    all_customers = get_all_customers(cache_bust=_cb())
-    customer_options = all_customers["customer_name"].tolist()
-
-    edited = st.data_editor(
-        edit_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "customer_name":  st.column_config.SelectboxColumn(
-                "Program", options=customer_options, required=True
-            ),
-            "allocation_pct": st.column_config.NumberColumn(
-                "Allocation %", min_value=0.0, max_value=1.0,
-                step=0.005, format="%.3f",
-            ),
-        },
-        key=f"adhoc_pct_editor_{month_start}",
-    )
-
-    # Show last saved metadata
-    if not current.empty:
-        updated_by = str(current["updated_by"].iloc[0]) if "updated_by" in current.columns else ""
-        updated_at = str(current["updated_at"].iloc[0]) if "updated_at" in current.columns else ""
-        st.caption(f"Last saved by {updated_by} at {updated_at}")
-
-    # Validation
-    total_pct = float(edited["allocation_pct"].fillna(0).sum())
-    if abs(total_pct - 1.0) > 0.001:
-        st.warning(f"Percentages sum to {total_pct:.1%} — must equal 100% before saving.")
-
-    col_save, _ = st.columns([2, 6])
-    with col_save:
-        if st.button("Save Ad-Hoc percentages", key="btn_save_adhoc_pct", type="primary", use_container_width=True):
-            if not reviewer:
-                st.warning("Enter your name above before saving.")
-            elif abs(total_pct - 1.0) > 0.001:
-                st.error(f"Cannot save — percentages sum to {total_pct:.1%}, must equal 100%.")
-            else:
-                rows = [
-                    {"customer_name": r["customer_name"], "allocation_pct": float(r["allocation_pct"])}
-                    for _, r in edited.iterrows()
-                    if pd.notna(r["customer_name"]) and r["customer_name"] != ""
-                ]
-                save_adhoc_pct_config(month_start, rows, reviewer)
-                st.success("Saved.")
-                _bust_cache_and_rerun()
 
 
 def _render_direct_footprints(month_start: date, months: list[date]) -> None:
@@ -1095,8 +981,6 @@ def render():
     with tab_setup:
         if not committed:
             _render_shared_sqft(month_start, months)
-            st.markdown("---")
-            _render_adhoc_config(month_start, months)
             st.markdown("---")
             _render_direct_footprints(month_start, months)
             st.markdown("---")

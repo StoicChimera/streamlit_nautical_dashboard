@@ -11,7 +11,6 @@ Reads:
   - stg_smartsheet_ogp                   (ogp bags driver)
   - stg_smartsheet_overwrap              (ow units driver)
   - stg_labor_ecomm_period_config        (e-comm program elections)
-  - stg_wh_adhoc_period_config           (ad-hoc program elections)
   - stg_labor_direct_hire                (office headcount split)
   - dim_customer_alias                   (customer name normalization)
   - dim_customer                         (is_experiential flag)
@@ -37,7 +36,6 @@ Bucket → driver map:
     OGP ADV                 → OGP bags
     Demo ADV                → Demo kits
     E-Comm                  → revenue weight of elected programs
-    Ad-Hoc                  → revenue weight of elected programs
     OverWrap                → OW units
 
   Dock - Inbound:
@@ -570,14 +568,6 @@ def _get_ecomm_revenue_weights(period: str, revenue_df: pd.DataFrame) -> pd.Data
 
 
 # =====================================================
-# Driver: ad-hoc elected programs revenue weight
-# =====================================================
-
-def _get_adhoc_fixed_pcts(month_start: date) -> pd.DataFrame:
-    """Returns fixed allocation percentages for Ad-Hoc programs."""
-    return get_adhoc_pct_config(month_start)
-
-# =====================================================
 # Driver: office headcount split
 # Returns (ops_pct, sga_pct) from approved labor for the period.
 # =====================================================
@@ -826,7 +816,7 @@ def save_sqft_inputs(month_start: date, rows: list[dict], updated_by: str) -> No
 
 
 def seed_sqft_month(month_start: date) -> None:
-    """Initialize 15-row sqft grid for a new month with 0 values."""
+    """Initialize sqft grid for a new month with 0 values."""
     buckets = [
         ("Experiential ADV",         "Storage"),
         ("OGP ADV - Overwrap",        "Storage"),
@@ -836,7 +826,6 @@ def seed_sqft_month(month_start: date) -> None:
         ("OGP ADV",                   "Production"),
         ("Demo ADV",                  "Production"),
         ("E-Comm",                    "Production"),
-        ("Ad-Hoc",                    "Production"),
         ("OverWrap",                  "Production"),
         ("Demo - ADV - Inbound",      "Dock - Inbound"),
         ("OGP - ADV - Inbound",       "Dock - Inbound"),
@@ -1046,105 +1035,6 @@ def write_warehouse_wip_applied(
                 },
             )
 
-
-# =====================================================
-# Ad-hoc config helpers (mirrors ecomm config pattern)
-# =====================================================
-
-def get_adhoc_config(period: str) -> pd.DataFrame:
-    try:
-        return pd.read_sql(
-            text("""
-                SELECT canonical_key, customer_name, set_by, set_at
-                FROM stg_wh_adhoc_period_config
-                WHERE accrual_period = :period AND active = TRUE
-                ORDER BY customer_name
-            """),
-            engine,
-            params={"period": period},
-        )
-    except Exception:
-        return pd.DataFrame()
-
-
-def get_adhoc_pct_config(month_start: date) -> pd.DataFrame:
-    try:
-        return pd.read_sql(
-            text("""
-                SELECT customer_name, canonical_key, allocation_pct, updated_by, updated_at
-                FROM alloc_wh_adhoc_program_pct
-                WHERE month_start = :m AND is_active = TRUE
-                ORDER BY allocation_pct DESC
-            """),
-            engine,
-            params={"m": month_start},
-        )
-    except Exception:
-        return pd.DataFrame()
-
-
-def save_adhoc_pct_config(month_start: date, rows: list[dict], updated_by: str) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE alloc_wh_adhoc_program_pct SET is_active = FALSE, updated_at = :now WHERE month_start = :m AND is_active = TRUE"),
-            {"m": month_start, "now": now},
-        )
-        for r in rows:
-            conn.execute(
-                text("""
-                    INSERT INTO alloc_wh_adhoc_program_pct
-                        (month_start, customer_name, canonical_key, allocation_pct, is_active, updated_by, updated_at)
-                    VALUES (:m, :name, :key, :pct, TRUE, :by, :now)
-                """),
-                {
-                    "m":    month_start,
-                    "name": r["customer_name"],
-                    "key":  r.get("canonical_key"),
-                    "pct":  float(r["allocation_pct"]),
-                    "by":   updated_by,
-                    "now":  now,
-                },
-            )
-
-
-def copy_adhoc_pct_forward(prev_month: date, new_month: date) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    with engine.begin() as conn:
-        conn.execute(
-            text("UPDATE alloc_wh_adhoc_program_pct SET is_active = FALSE, updated_at = :now WHERE month_start = :m AND is_active = TRUE"),
-            {"m": new_month, "now": now},
-        )
-        conn.execute(
-            text("""
-                INSERT INTO alloc_wh_adhoc_program_pct
-                    (month_start, customer_name, canonical_key, allocation_pct, is_active, updated_by, updated_at)
-                SELECT :new_m, customer_name, canonical_key, allocation_pct, TRUE, updated_by, :now
-                FROM alloc_wh_adhoc_program_pct
-                WHERE month_start = :prev_m AND is_active = TRUE
-            """),
-            {"prev_m": prev_month, "new_m": new_month, "now": now},
-        )
-
-
-def save_adhoc_config(period: str, selected_keys: list[str], customer_names: dict[str, str], set_by: str) -> None:
-    now = datetime.now(timezone.utc).isoformat()
-    with engine.begin() as conn:
-        conn.execute(
-            text("DELETE FROM stg_wh_adhoc_period_config WHERE accrual_period = :period"),
-            {"period": period},
-        )
-        for key in selected_keys:
-            conn.execute(
-                text("""
-                    INSERT INTO stg_wh_adhoc_period_config
-                        (accrual_period, canonical_key, customer_name, active, set_by, set_at)
-                    VALUES (:period, :key, :name, TRUE, :by, :at)
-                """),
-                {"period": period, "key": key, "name": customer_names.get(key, key), "by": set_by, "at": now},
-            )
-
-
 # =====================================================
 # MAIN COMPUTE FUNCTION
 # =====================================================
@@ -1309,37 +1199,6 @@ def compute_warehouse_allocation(
         for r in ecomm_alloc:
             r["driver_type"] = "Revenue (E-Comm elected)"
     _record(bucket, ecomm_alloc)
-
-  # ---- Ad-Hoc (Production) — fixed percentages ----
-    bucket      = "Ad-Hoc"
-    adhoc_cost  = _bucket_cost(bucket)
-    adhoc_pct_df = _get_adhoc_fixed_pcts(month_start)
-    adhoc_alloc  = []
-
-    if not adhoc_pct_df.empty:
-        total_pct = float(adhoc_pct_df["allocation_pct"].sum())
-        for _, r in adhoc_pct_df.iterrows():
-            pct    = float(r["allocation_pct"])
-            amount = round(adhoc_cost * pct, 2)
-            adhoc_alloc.append({
-                "month_start":       month_start,
-                "customer_program":  str(r["customer_name"]),
-                "program_bucket":    bucket,
-                "category":          "Production",
-                "cost_type":         "cogs",
-                "driver_type":       f"Fixed % ({pct:.1%})",
-                "driver_value":      pct,
-                "total_driver":      total_pct,
-                "allocation_pct":    pct,
-                "bucket_sqft":       sqft_map.get(bucket, 0),
-                "total_sqft":        total_sqft,
-                "sqft_pct":          round(sqft_map.get(bucket, 0) / total_sqft, 6) if total_sqft > 0 else 0.0,
-                "total_wh_cost":     total_wh_cost,
-                "allocation_amount": amount,
-                "committed_by":      committed_by,
-                "committed_at":      committed_at,
-            })
-    _record(bucket, adhoc_alloc)
 
     # ---- OverWrap (Production) ----
     bucket = "OverWrap"
