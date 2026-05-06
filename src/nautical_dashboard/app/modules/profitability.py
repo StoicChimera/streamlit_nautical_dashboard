@@ -37,7 +37,23 @@ def load_customer_flags(_engine) -> dict[str, set]:
         "scaas":        set(df[df["is_scaas"] == True]["customer_name"]),
     }
 
-def _render_consolidated_pnl(df: pd.DataFrame, period_label: str) -> None:
+@st.cache_data(ttl=60, show_spinner=False)
+def load_sga_breakdown(_engine, year: int, month: int) -> pd.DataFrame:
+    """SG&A category totals for a single period."""
+    period = f"{year}-{month:02d}"
+    return pd.read_sql(
+        text("""
+            SELECT category, SUM(amount) AS total
+            FROM vw_sga_transactions
+            WHERE accrual_period = :period
+            GROUP BY category
+            ORDER BY total DESC
+        """),
+        _engine,
+        params={"period": period},
+    )
+
+def _render_consolidated_pnl(df: pd.DataFrame, sga_df: pd.DataFrame, period_label: str) -> None:
     """Standard income statement rollup across all programs for the period."""
     if df.empty:
         return
@@ -54,9 +70,19 @@ def _render_consolidated_pnl(df: pd.DataFrame, period_label: str) -> None:
                      + commission + freight + applied_wh)
     gross_profit  = revenue - total_cogs
     gp_margin     = gross_profit / revenue if revenue else 0
-    applied_sga   = float(df["applied_sga"].sum())
-    net_profit    = gross_profit - applied_sga
-    net_margin    = net_profit / revenue if revenue else 0
+
+    if not sga_df.empty:
+        sga_categories = [
+            (str(r["category"]), float(r["total"]))
+            for _, r in sga_df.iterrows()
+        ]
+        total_sga = sum(amt for _, amt in sga_categories)
+    else:
+        sga_categories = []
+        total_sga = float(df["applied_sga"].sum())  # fallback to MV total
+
+    net_profit  = gross_profit - total_sga
+    net_margin  = net_profit / revenue if revenue else 0
 
     def _pct(v: float) -> str:
         return f"{(v / revenue * 100):.1f}%" if revenue else "—"
@@ -80,10 +106,14 @@ def _render_consolidated_pnl(df: pd.DataFrame, period_label: str) -> None:
         ("Gross Profit",           gross_profit,  f"{gp_margin*100:.1f}%"),
         ("", None, ""),
         ("Operating Expenses",     None,          ""),
-        ("  Applied SG&A",         applied_sga,   _pct(applied_sga)),
+    ]
+    for cat, amt in sga_categories:
+        rows.append((f"  {cat}", amt, _pct(amt)))
+    rows.extend([
+        ("Total SG&A",             total_sga,     _pct(total_sga)),
         ("", None, ""),
         ("Net Profit",             net_profit,    f"{net_margin*100:.1f}%"),
-    ]
+    ])
 
     pnl_df = pd.DataFrame([
         {
@@ -94,19 +124,12 @@ def _render_consolidated_pnl(df: pd.DataFrame, period_label: str) -> None:
         for label, amount, pct in rows
     ])
 
-    st.markdown(
-        f"""
-        <div style="background-color:#1f77b4;padding:8px;border-radius:4px;margin-bottom:12px;">
-            <h3 style="color:white;margin:0;">Consolidated P&L — {period_label}</h3>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.subheader(f"Consolidated P&L — {period_label}")
 
     def _highlight_pnl(row):
         label = str(row["Line Item"])
         styles = [""] * len(row)
-        if label in ("Revenue", "Gross Profit", "Net Profit", "Total COGS"):
+        if label in ("Revenue", "Gross Profit", "Net Profit", "Total COGS", "Total SG&A"):
             styles = ["font-weight: bold"] * len(row)
         if label in ("Gross Profit", "Net Profit"):
             try:
@@ -1128,8 +1151,10 @@ def render():
         st.warning("No data for this period.")
         return
 
+    sga_breakdown = load_sga_breakdown(engine, year, month)
+    
     # ── Consolidated P&L ────────────────────────────────────────────────────
-    _render_consolidated_pnl(df, month_label)
+    _render_consolidated_pnl(df, sga_breakdown, month_label)
 
     st.divider()
 
