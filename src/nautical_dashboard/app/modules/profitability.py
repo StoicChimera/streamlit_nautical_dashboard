@@ -37,6 +37,88 @@ def load_customer_flags(_engine) -> dict[str, set]:
         "scaas":        set(df[df["is_scaas"] == True]["customer_name"]),
     }
 
+def _render_consolidated_pnl(df: pd.DataFrame, period_label: str) -> None:
+    """Standard income statement rollup across all programs for the period."""
+    if df.empty:
+        return
+
+    revenue       = float(df["revenue"].sum())
+    temp_labor    = float(df["temp_labor"].sum())
+    direct_hire   = float(df["direct_hire"].sum())
+    raw_materials = float(df["raw_materials"].sum())
+    equipment     = float(df["equipment"].sum())
+    commission    = float(df["commission"].sum())
+    freight       = float(df["freight_storage"].sum())
+    applied_wh    = float(df["applied_wh"].sum())
+    total_cogs    = (temp_labor + direct_hire + raw_materials + equipment
+                     + commission + freight + applied_wh)
+    gross_profit  = revenue - total_cogs
+    gp_margin     = gross_profit / revenue if revenue else 0
+    applied_sga   = float(df["applied_sga"].sum())
+    net_profit    = gross_profit - applied_sga
+    net_margin    = net_profit / revenue if revenue else 0
+
+    def _pct(v: float) -> str:
+        return f"{(v / revenue * 100):.1f}%" if revenue else "—"
+
+    def _amt(v: float) -> str:
+        return f"${v:,.2f}"
+
+    rows = [
+        ("Revenue",                revenue,       "100.0%"),
+        ("", None, ""),
+        ("Cost of Goods Sold",     None,          ""),
+        ("  Temp Labor",           temp_labor,    _pct(temp_labor)),
+        ("  Direct Hire",          direct_hire,   _pct(direct_hire)),
+        ("  Raw Materials",        raw_materials, _pct(raw_materials)),
+        ("  Equipment",            equipment,     _pct(equipment)),
+        ("  Commission",           commission,    _pct(commission)),
+        ("  Freight & Storage",    freight,       _pct(freight)),
+        ("  Applied Warehouse",    applied_wh,    _pct(applied_wh)),
+        ("Total COGS",             total_cogs,    _pct(total_cogs)),
+        ("", None, ""),
+        ("Gross Profit",           gross_profit,  f"{gp_margin*100:.1f}%"),
+        ("", None, ""),
+        ("Operating Expenses",     None,          ""),
+        ("  Applied SG&A",         applied_sga,   _pct(applied_sga)),
+        ("", None, ""),
+        ("Net Profit",             net_profit,    f"{net_margin*100:.1f}%"),
+    ]
+
+    pnl_df = pd.DataFrame([
+        {
+            "Line Item":     label,
+            "Amount":        _amt(amount) if amount is not None else "",
+            "% of Revenue":  pct,
+        }
+        for label, amount, pct in rows
+    ])
+
+    st.markdown(
+        f"""
+        <div style="background-color:#1f77b4;padding:8px;border-radius:4px;margin-bottom:12px;">
+            <h3 style="color:white;margin:0;">Consolidated P&L — {period_label}</h3>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    def _highlight_pnl(row):
+        label = str(row["Line Item"])
+        styles = [""] * len(row)
+        if label in ("Revenue", "Gross Profit", "Net Profit", "Total COGS"):
+            styles = ["font-weight: bold"] * len(row)
+        if label in ("Gross Profit", "Net Profit"):
+            try:
+                amt = float(row["Amount"].replace("$", "").replace(",", ""))
+                if amt < 0:
+                    styles = ["font-weight: bold; color: red"] * len(row)
+            except Exception:
+                pass
+        return styles
+
+    styled = pnl_df.style.apply(_highlight_pnl, axis=1)
+    st.dataframe(styled, use_container_width=True, hide_index=True)
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_wip_summary_as_of(_engine, year: int, month: int) -> dict:
@@ -1042,13 +1124,16 @@ def render():
             )
 
     df = load_profitability(engine, year, month)
-    print(df.dtypes)
-    print(df["revenue"].head())
     if df.empty:
         st.warning("No data for this period.")
         return
 
-    # ── Grouped bar chart ───────────────────────────────────────────────────
+    # ── Consolidated P&L ────────────────────────────────────────────────────
+    _render_consolidated_pnl(df, month_label)
+
+    st.divider()
+
+        # ── Grouped bar chart ───────────────────────────────────────────────────
     chart_df = (
         df.groupby("customer_program", dropna=False)[
             ["billed_amount", "gross_profit", "net_profit"]
