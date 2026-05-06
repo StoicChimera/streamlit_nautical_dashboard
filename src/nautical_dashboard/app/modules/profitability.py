@@ -1203,6 +1203,8 @@ def render():
     sga_warehouse_total = load_sga_warehouse_total(engine, year, month)
 
     # ── Consolidated P&L ────────────────────────────────────────────────────
+    st.divider()
+    
     _render_consolidated_pnl(
         df, sga_breakdown, sga_labor_total, sga_warehouse_total, month_label
     )
