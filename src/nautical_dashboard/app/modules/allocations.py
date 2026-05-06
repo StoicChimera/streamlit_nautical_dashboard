@@ -25,6 +25,7 @@ import streamlit as st
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
+from nautical_dashboard.app.modules import auth
 
 from nautical_dashboard.app.modules.allocation_engine import (
     ALL_BUCKETS,
@@ -635,9 +636,23 @@ def _render_commit_section(month_start: date, total_wh_cost: float, reviewer: st
     _render_office_headcount(month_start)
 
     st.markdown("")
+    can_commit = auth.has_role("admin", "controller")
+    if not can_commit:
+        st.info(
+            "Committing warehouse allocation requires admin or controller role. "
+            f"Your current role is `{auth.current_user()['role']}`."
+        )
+
+    st.markdown("")
     commit_col, _ = st.columns([2, 6])
     with commit_col:
-        if st.button("Commit Warehouse Allocation", key="btn_commit_wh", type="primary", use_container_width=True):
+        if st.button(
+            "Commit Warehouse Allocation",
+            key="btn_commit_wh",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_commit,
+        ):
             if not reviewer:
                 st.warning("Enter your name in the Reviewer field above before committing.")
                 return
@@ -948,6 +963,9 @@ def render():
     if st.session_state["wh_month_calendar"] is None:
         st.session_state["wh_month_calendar"] = default_month
 
+    user = auth.current_user()
+    st.session_state["wh_reviewer"] = user["name"]   # back-compat for nested functions
+
     col_month, col_reviewer, col_spacer = st.columns([2, 2, 4])
     with col_month:
         picked = st.date_input("Allocation month", value=st.session_state["wh_month_calendar"], key="wh_month_picker")
@@ -955,7 +973,10 @@ def render():
         st.session_state["wh_month_calendar"] = month_start
         st.session_state["wh_controls"]["month_start"] = month_start
     with col_reviewer:
-        reviewer = st.text_input("Reviewer name", key="wh_reviewer")
+        st.markdown("**Reviewer**")
+        st.markdown(f"{user['name']}  ·  `{user['role']}`")
+
+    reviewer = user["name"]
 
     st.markdown("---")
 

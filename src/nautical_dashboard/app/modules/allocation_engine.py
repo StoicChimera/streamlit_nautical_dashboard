@@ -861,9 +861,11 @@ def copy_sqft_forward(prev_month: date, new_month: date) -> None:
                     (month_start, program_bucket, category, total_sqft, is_active)
                 SELECT :new_m, program_bucket, category, total_sqft, TRUE
                 FROM alloc_warehouse_shared_sqft_monthly
-                WHERE month_start = :prev_m AND is_active = TRUE
+                WHERE month_start = :prev_m 
+                AND is_active = TRUE
+                AND program_bucket = ANY(:active_buckets)
             """),
-            {"prev_m": prev_month, "new_m": new_month},
+            {"prev_m": prev_month, "new_m": new_month, "active_buckets": ALL_BUCKETS},
         )
 
 
