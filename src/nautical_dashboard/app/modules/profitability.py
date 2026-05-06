@@ -25,6 +25,7 @@ ALL_NUMERIC = [
 def get_engine():
     return create_engine(CONN_STRING)
 
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_customer_flags(_engine) -> dict[str, set]:
     df = pd.read_sql(text("""
@@ -36,6 +37,7 @@ def load_customer_flags(_engine) -> dict[str, set]:
         "experiential": set(df[df["is_experiential"] == True]["customer_name"]),
         "scaas":        set(df[df["is_scaas"] == True]["customer_name"]),
     }
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_sga_breakdown(_engine, year: int, month: int) -> pd.DataFrame:
@@ -53,7 +55,48 @@ def load_sga_breakdown(_engine, year: int, month: int) -> pd.DataFrame:
         params={"period": period},
     )
 
-def _render_consolidated_pnl(df: pd.DataFrame, sga_df: pd.DataFrame, period_label: str) -> None:
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_sga_labor_total(_engine, year: int, month: int) -> float:
+    """Total labor SG&A (direct_sga labor type) allocated for the period."""
+    period = f"{year}-{month:02d}"
+    df = pd.read_sql(
+        text("""
+            SELECT COALESCE(SUM(allocated_cost), 0) AS total
+            FROM stg_labor_incurred
+            WHERE accrual_period = :period
+              AND labor_type = 'direct_sga'
+        """),
+        _engine,
+        params={"period": period},
+    )
+    return float(df["total"].iloc[0])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_sga_warehouse_total(_engine, year: int, month: int) -> float:
+    """Total warehouse SG&A allocation for the period."""
+    month_start = pd.Timestamp(year=year, month=month, day=1).date()
+    df = pd.read_sql(
+        text("""
+            SELECT COALESCE(SUM(allocation_amount), 0) AS total
+            FROM stg_warehouse_allocation
+            WHERE month_start = :m
+              AND cost_type = 'sga'
+        """),
+        _engine,
+        params={"m": month_start},
+    )
+    return float(df["total"].iloc[0])
+
+
+def _render_consolidated_pnl(
+    df: pd.DataFrame,
+    sga_df: pd.DataFrame,
+    labor_sga: float,
+    warehouse_sga: float,
+    period_label: str,
+) -> None:
     """Standard income statement rollup across all programs for the period."""
     if df.empty:
         return
@@ -76,13 +119,12 @@ def _render_consolidated_pnl(df: pd.DataFrame, sga_df: pd.DataFrame, period_labe
             (str(r["category"]), float(r["total"]))
             for _, r in sga_df.iterrows()
         ]
-        total_sga = sum(amt for _, amt in sga_categories)
     else:
         sga_categories = []
-        total_sga = float(df["applied_sga"].sum())  # fallback to MV total
 
-    net_profit  = gross_profit - total_sga
-    net_margin  = net_profit / revenue if revenue else 0
+    total_sga  = sum(amt for _, amt in sga_categories) + labor_sga + warehouse_sga
+    net_profit = gross_profit - total_sga
+    net_margin = net_profit / revenue if revenue else 0
 
     def _pct(v: float) -> str:
         return f"{(v / revenue * 100):.1f}%" if revenue else "—"
@@ -109,6 +151,10 @@ def _render_consolidated_pnl(df: pd.DataFrame, sga_df: pd.DataFrame, period_labe
     ]
     for cat, amt in sga_categories:
         rows.append((f"  {cat}", amt, _pct(amt)))
+    if labor_sga:
+        rows.append(("  Salaries (SG&A)",  labor_sga,     _pct(labor_sga)))
+    if warehouse_sga:
+        rows.append(("  Warehouse (SG&A)", warehouse_sga, _pct(warehouse_sga)))
     rows.extend([
         ("Total SG&A",             total_sga,     _pct(total_sga)),
         ("", None, ""),
@@ -142,6 +188,7 @@ def _render_consolidated_pnl(df: pd.DataFrame, sga_df: pd.DataFrame, period_labe
 
     styled = pnl_df.style.apply(_highlight_pnl, axis=1)
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_wip_summary_as_of(_engine, year: int, month: int) -> dict:
@@ -1151,10 +1198,14 @@ def render():
         st.warning("No data for this period.")
         return
 
-    sga_breakdown = load_sga_breakdown(engine, year, month)
-    
+    sga_breakdown       = load_sga_breakdown(engine, year, month)
+    sga_labor_total     = load_sga_labor_total(engine, year, month)
+    sga_warehouse_total = load_sga_warehouse_total(engine, year, month)
+
     # ── Consolidated P&L ────────────────────────────────────────────────────
-    _render_consolidated_pnl(df, sga_breakdown, month_label)
+    _render_consolidated_pnl(
+        df, sga_breakdown, sga_labor_total, sga_warehouse_total, month_label
+    )
 
     st.divider()
 
