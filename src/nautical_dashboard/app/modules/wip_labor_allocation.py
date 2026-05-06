@@ -754,6 +754,126 @@ def bulk_approve_carried_forward(
         'current':  current,
     }
 
+
+def bulk_apply_allocation(
+    period: str, labor_source: str, employees: list[str],
+    role_name: str, lines: list[dict], reviewer_name: str,
+) -> dict:
+    """
+    Apply the same role + lines to multiple employees. One outer transaction
+    wraps the whole batch; each employee runs inside a savepoint so a single
+    bad employee rolls back independently without poisoning the rest. Existing
+    lines for each employee are replaced.
+
+    Returns:
+      {
+        'applied':  int,   # count actually committed to DB
+        'skipped':  list[{employee, reason}],
+        'total':    int,
+      }
+    """
+    if labor_source not in ('direct', 'temp'):
+        raise ValueError(f"labor_source must be 'direct' or 'temp', got: {labor_source!r}")
+    if not role_name or not role_name.strip():
+        raise ValueError("role_name is required.")
+    if not reviewer_name or not reviewer_name.strip():
+        raise ValueError("reviewer_name is required.")
+    if not employees:
+        return {'applied': 0, 'skipped': [], 'total': 0}
+
+    _validate_lines(lines)
+
+    # Validate role + targets against active dim values
+    roles_df = pd.read_sql(
+        text("SELECT role_name FROM dim_nmf_role WHERE active = TRUE"), engine,
+    )
+    if role_name not in set(roles_df['role_name'].tolist()):
+        raise ValueError(f"Role '{role_name}' is not active.")
+
+    customers_df = pd.read_sql(text("""
+        SELECT customer_name FROM dim_customer
+        WHERE active = TRUE AND is_revenue_customer = TRUE AND roll_up_for_cost = FALSE
+    """), engine)
+    valid_programs = set(customers_df['customer_name'].tolist())
+
+    cc_df = pd.read_sql(
+        text("SELECT cost_center_name FROM dim_cost_center WHERE active = TRUE"), engine,
+    )
+    valid_cost_centers = set(cc_df['cost_center_name'].tolist())
+
+    for i, ln in enumerate(lines, start=1):
+        if ln['line_type'] == 'direct_program':
+            if ln.get('target_program') not in valid_programs:
+                raise ValueError(
+                    f"Line {i}: program '{ln.get('target_program')}' is not active."
+                )
+        elif ln['line_type'] == 'cost_center':
+            if ln.get('cost_center_name') not in valid_cost_centers:
+                raise ValueError(
+                    f"Line {i}: cost center '{ln.get('cost_center_name')}' is not active."
+                )
+
+    now = datetime.now(timezone.utc).isoformat()
+    applied = 0
+    skipped = []
+
+    with engine.begin() as conn:
+        for raw_emp in employees:
+            employee = str(raw_emp).strip()
+            if not employee:
+                continue
+            try:
+                # SAVEPOINT — isolates this employee. A failure inside this
+                # block rolls back only this employee's writes (DELETE + any
+                # INSERTs that already ran) and leaves the outer transaction
+                # healthy, so the next iteration of the loop can proceed
+                # normally instead of inheriting a poisoned txn state.
+                with conn.begin_nested():
+                    conn.execute(text("""
+                        DELETE FROM stg_labor_employee_allocation
+                        WHERE accrual_period = :period
+                          AND employee_name  = :employee
+                          AND labor_source   = :labor_source
+                    """), {'period': period, 'employee': employee, 'labor_source': labor_source})
+
+                    for i, ln in enumerate(lines, start=1):
+                        conn.execute(text("""
+                            INSERT INTO stg_labor_employee_allocation
+                                (accrual_period, employee_name, labor_source,
+                                 role_name, line_order, line_type,
+                                 target_program, cost_center_name, allocation_pct,
+                                 program_restrictions,
+                                 reviewed, reviewed_by, reviewed_at,
+                                 set_by, set_at)
+                            VALUES
+                                (:period, :employee, :labor_source,
+                                 :role_name, :line_order, :line_type,
+                                 :target_program, :cost_center_name, :allocation_pct,
+                                 :program_restrictions,
+                                 TRUE, :reviewer, :now,
+                                 :reviewer, :now)
+                        """), {
+                            'period':               period,
+                            'employee':             employee,
+                            'labor_source':         labor_source,
+                            'role_name':            role_name.strip(),
+                            'line_order':           i,
+                            'line_type':            ln['line_type'],
+                            'target_program':       ln.get('target_program'),
+                            'cost_center_name':     ln.get('cost_center_name'),
+                            'allocation_pct':       float(ln['allocation_pct']),
+                            'program_restrictions': ln.get('program_restrictions'),
+                            'reviewer':             reviewer_name.strip(),
+                            'now':                  now,
+                        })
+                applied += 1
+            except Exception as e:
+                skipped.append({'employee': employee, 'reason': str(e)})
+
+    list_employees_for_review.clear()
+
+    return {'applied': applied, 'skipped': skipped, 'total': len(employees)}
+
 # -------------------------------------------------------------
 # Commit-state guard
 # -------------------------------------------------------------
