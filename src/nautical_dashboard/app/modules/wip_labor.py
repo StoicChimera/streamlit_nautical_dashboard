@@ -4530,7 +4530,12 @@ def render():
             "Employee review and allocation totals may be understated until all required reports are loaded."
         )
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    # Lazy-loaded tabs. st.tabs renders ALL contents on every script run,
+    # so an expensive tab (Allocation, with 4x calls into wlc.build_employee_allocations
+    # plus 6 activity queries plus reconciliation plus charts) drags every
+    # other interaction. st.segmented_control gives the same tab-bar UX but
+    # only the active branch's render function runs.
+    TABS = [
         "Direct Hire",
         "Temp Labor",
         "E-Commerce Config",
@@ -4538,25 +4543,26 @@ def render():
         "Container Unload",
         "Allocation",
         "Outstanding WIP",
-    ])
+    ]
+    active_tab = st.segmented_control(
+        "View",
+        options=TABS,
+        default=TABS[0],
+        key=f"labor_active_tab_{selected_period}",
+        label_visibility="collapsed",
+    ) or TABS[0]
 
-    with tab1:
+    if active_tab == "Direct Hire":
         wlr.render_review_tab(selected_period, 'direct', reviewer_name, show_amounts=show_amounts)
-
-    with tab2:
+    elif active_tab == "Temp Labor":
         wlr.render_review_tab(selected_period, 'temp', reviewer_name, show_amounts=show_amounts)
-
-    with tab3:
+    elif active_tab == "E-Commerce Config":
         render_ecomm_config_tab(selected_period, reviewer_name)
-
-    with tab4:
+    elif active_tab == "Receiving Returns":
         render_receiving_returns_tab(selected_period, reviewer_name)
-
-    with tab5:
+    elif active_tab == "Container Unload":
         wcu.render_container_unload_tab(selected_period, reviewer_name)
-
-    with tab6:
+    elif active_tab == "Allocation":
         render_allocation_tab(selected_period, reviewer_name, cost_type_filter)
-
-    with tab7:
+    elif active_tab == "Outstanding WIP":
         render_production_wip_tab(selected_period, reviewer_name)
