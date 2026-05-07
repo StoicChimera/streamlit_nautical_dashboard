@@ -141,23 +141,6 @@ def _row_label(row: pd.Series, show_amounts: bool = False) -> str:
     return f"[{status}]{new_tag}  {name}  ·  {cost}"
 
 
-def _render_row_button(row: pd.Series, period: str, labor_source: str,
-                       show_amounts: bool, currently_selected):
-    """Single-mode row renderer. Click selects the employee for the
-    editor in the right-hand column."""
-    name = row['employee_name']
-    is_selected = (name == currently_selected)
-    btn_key = f"row_btn_{period}_{labor_source}_{name}"
-    if st.button(
-        _row_label(row, show_amounts),
-        key=btn_key,
-        type="primary" if is_selected else "secondary",
-        use_container_width=True,
-    ):
-        st.session_state[_selected_key(period, labor_source)] = name
-        st.rerun()
-
-
 # -------------------------------------------------------------
 # Left column — employee list
 # -------------------------------------------------------------
@@ -327,34 +310,69 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
         return
 
     # =============================================================
-    # SINGLE MODE — button per row, three sections (unchanged path)
+    # SINGLE MODE — virtualized dataframe with single-row selection
+    # Replaces the prior button-per-row pattern, which registered
+    # 74+ widgets per render and made every interaction multi-minute
+    # on Streamlit Cloud (per-widget websocket cost compounds).
     # =============================================================
     st.caption(f"Showing {len(df)} of {len(employees)}")
 
-    is_new      = df['is_new_employee'].fillna(False) == True
-    is_reviewed = df['reviewed'].fillna(False) == True
+    # Sort: new hires pending → returning pending → approved (mirrors
+    # the prior section grouping; user can re-sort by column header).
+    df_sorted = df.copy()
+    df_sorted['_status_order'] = (
+        df_sorted['reviewed'].fillna(False).astype(int) * 2
+        + (~df_sorted['is_new_employee'].fillna(False)).astype(int)
+    )
+    df_sorted = df_sorted.sort_values(
+        ['_status_order', 'employee_name']
+    ).reset_index(drop=True)
 
-    new_hires_pending    = df[is_new  & ~is_reviewed]
-    returning_unreviewed = df[~is_new & ~is_reviewed]
-    all_approved         = df[is_reviewed]
+    display_df = pd.DataFrame({
+        'Status': df_sorted['reviewed']
+                      .fillna(False)
+                      .map({True: 'Approved', False: 'Pending'})
+                      .values,
+        'Type': df_sorted['is_new_employee']
+                    .fillna(False)
+                    .map({True: 'New hire', False: 'Returning'})
+                    .values,
+        'Employee': df_sorted['employee_name'].values,
+        'UKG Role': df_sorted.get('ukg_role', pd.Series([''] * len(df_sorted))).fillna('').values,
+        'Cost': [
+            _dollar_or_hidden(v, show_amounts)
+            for v in df_sorted['total_labor_cost'].values
+        ],
+    })
 
-    with st.container(height=560):
-        if not new_hires_pending.empty:
-            st.markdown(f"**New hires — pending approval ({len(new_hires_pending)})** — no prior allocation")
-            for _, row in new_hires_pending.iterrows():
-                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
-            st.markdown("")
+    single_df_key = f"emp_single_df_{period}_{labor_source}"
 
-        if not returning_unreviewed.empty:
-            st.markdown(f"**Returning — pending approval ({len(returning_unreviewed)})**")
-            for _, row in returning_unreviewed.iterrows():
-                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
-            st.markdown("")
+    event = st.dataframe(
+        display_df,
+        use_container_width=True,
+        height=520,
+        hide_index=True,
+        on_select='rerun',
+        selection_mode='single-row',
+        key=single_df_key,
+        column_config={
+            'Status':   st.column_config.TextColumn('Status', width='small'),
+            'Type':     st.column_config.TextColumn('Type', width='small'),
+            'Employee': st.column_config.TextColumn('Employee', width='medium'),
+            'UKG Role': st.column_config.TextColumn('UKG Role'),
+            'Cost':     st.column_config.TextColumn('Cost', width='small'),
+        },
+    )
 
-        if not all_approved.empty:
-            st.markdown(f"**Approved ({len(all_approved)})**")
-            for _, row in all_approved.iterrows():
-                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
+    selected_idx: list = []
+    if event is not None and getattr(event, 'selection', None) is not None:
+        selected_idx = list(getattr(event.selection, 'rows', []) or [])
+
+    if selected_idx:
+        new_selected = df_sorted.iloc[selected_idx[0]]['employee_name']
+        if new_selected != currently_selected:
+            st.session_state[_selected_key(period, labor_source)] = new_selected
+            st.rerun()
 
 
 # -------------------------------------------------------------
