@@ -5,26 +5,29 @@ wip_labor_review.py
 Review tab UI for per-employee allocation.
 
 Drill-down layout:
-  - Left column: employee list with search + filter + one button per row
+  - Left column: employee list with search + filter
   - Right column: editor for the currently-selected employee
 
-Only one editor renders at a time — widget registration stays constant
-regardless of total employee count. Scales to 200+ employees cleanly.
-
 A "Multi-select for bulk approve" toggle in the employee list switches
-the row interaction from "click to drill" to "check to include in bulk
-batch". When on, the bulk-assign panel above the list becomes the active
-workspace: define a role + allocation template, then apply it to every
-checked employee in one transaction. Pattern matches the addon bulk-alias
-flow on the tax preflight page.
+the row interaction:
 
-Performance: the three big render blocks — employee list, bulk panel,
-per-employee editor — are each wrapped in @st.fragment so that
-intra-fragment interactions (search typing, building template lines,
-editing one employee's allocation) only rerun the relevant fragment
-instead of the whole script. Cross-fragment events (toggling multi
-mode, applying a batch, approving an individual) explicitly call
-st.rerun(scope="app") to refresh the other fragments.
+  - Single mode: one button per row (click to drill into the editor).
+  - Multi  mode: a virtualized st.dataframe with native multi-row
+    selection. The bulk-assign panel above the list reads the selection
+    and applies a role + allocation template to every selected
+    employee in one transaction.
+
+The dataframe widget is virtualized — the browser paints only the
+visible rows — so the multi-mode list scales to thousands of employees
+at constant render cost. This replaces an earlier per-row checkbox
+implementation that grew O(n) widget registrations and would freeze
+the page above ~150 employees.
+
+Because the bulk panel renders ABOVE the list visually but needs to
+read the dataframe selection that the list produces, we reserve the
+bulk panel's visual slot via st.empty() up front and fill it AFTER
+the list has rendered (so the bulk panel sees the freshly synced
+bulk_set_key on the same script run, with no one-click lag).
 
 Exports one public function:
     render_review_tab(period, labor_source, reviewer_name)
@@ -69,6 +72,14 @@ def _bulk_multi_key(period, labor_source):
 
 def _bulk_set_key(period, labor_source):
     return f"bulk_selected_set_{period}_{labor_source}"
+
+
+def _emp_dataframe_key(period, labor_source):
+    """Widget key for the multi-mode employee selection dataframe.
+    Exposed as a helper so the bulk-apply path can reset the widget
+    state after a successful apply (otherwise stale selection rows
+    re-populate bulk_set_key on the next render)."""
+    return f"emp_dataframe_{period}_{labor_source}"
 
 
 def _empty_line() -> dict:
@@ -119,7 +130,7 @@ def _clear_state(period: str, labor_source: str, employee: str):
 
 
 def _row_label(row: pd.Series, show_amounts: bool = False) -> str:
-    """Compact single-line label for the row button."""
+    """Compact single-line label for the single-mode row button."""
     name = str(row['employee_name'])
     cost = _dollar_or_hidden(row['total_labor_cost'], show_amounts)
     reviewed = bool(row['reviewed']) if pd.notna(row['reviewed']) else False
@@ -132,9 +143,8 @@ def _row_label(row: pd.Series, show_amounts: bool = False) -> str:
 
 def _render_row_button(row: pd.Series, period: str, labor_source: str,
                        show_amounts: bool, currently_selected):
-    """Single-mode row renderer. Click selects the employee for the editor
-    in the right-hand column — that lives in a separate fragment, so we
-    force an app-scoped rerun to make the editor update."""
+    """Single-mode row renderer. Click selects the employee for the
+    editor in the right-hand column."""
     name = row['employee_name']
     is_selected = (name == currently_selected)
     btn_key = f"row_btn_{period}_{labor_source}_{name}"
@@ -145,53 +155,22 @@ def _render_row_button(row: pd.Series, period: str, labor_source: str,
         use_container_width=True,
     ):
         st.session_state[_selected_key(period, labor_source)] = name
-        st.rerun(scope="app")  # editor lives in another fragment
-
-
-def _render_row_checkbox(row: pd.Series, period: str, labor_source: str,
-                          show_amounts: bool, bulk_set_key: str):
-    """Multi-select row renderer used when bulk-approve mode is on.
-
-    The checkbox state is mirrored into st.session_state[bulk_set_key]
-    (a set of employee_name strings). Caller is responsible for filtering
-    out approved rows — this function does not check reviewed status.
-
-    A change here forces an app-scoped rerun so the bulk panel above the
-    list (in another fragment) updates its 'N checked' header and the
-    Apply button label/disabled state."""
-    name = row['employee_name']
-    cur_set = st.session_state.get(bulk_set_key, set())
-    is_checked = name in cur_set
-    chk_key = f"row_chk_{period}_{labor_source}_{name}"
-
-    new_checked = st.checkbox(
-        _row_label(row, show_amounts),
-        value=is_checked,
-        key=chk_key,
-    )
-    if new_checked != is_checked:
-        if new_checked:
-            cur_set = cur_set | {name}
-        else:
-            cur_set = cur_set - {name}
-        st.session_state[bulk_set_key] = cur_set
-        st.rerun(scope="app")  # bulk panel header reads from this set
+        st.rerun()
 
 
 # -------------------------------------------------------------
-# Left column — employee list  (FRAGMENT)
+# Left column — employee list
 # -------------------------------------------------------------
 
-@st.fragment
 def _render_employee_list(period: str, labor_source: str, employees: pd.DataFrame, show_amounts: bool = False):
-    """Renders the filterable employee list as its own fragment.
+    """Renders the filterable employee list.
 
-    Intra-fragment interactions (search typing, filter radio, scrolling)
-    only rerun this function — the bulk panel above and the editor on
-    the right stay untouched. Interactions that DO need a cross-fragment
-    update (multi toggle, bulk select-all controls, individual row
-    checkbox/click) explicitly call st.rerun(scope="app") to refresh
-    the other fragments.
+    Single mode: button per row (existing fast path, unchanged).
+    Multi  mode: virtualized st.dataframe with native multi-row selection.
+                 Selection is synced into bulk_set_key on every render
+                 so the bulk panel (rendered AFTER this function via the
+                 placeholder pattern in render_review_tab) sees fresh
+                 state with no one-click lag.
     """
     multi_key    = _bulk_multi_key(period, labor_source)
     bulk_set_key = _bulk_set_key(period, labor_source)
@@ -203,24 +182,24 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
 
     period_committed = wla.is_period_committed(period)
 
-    # Mode toggle — change requires app-scoped rerun so the bulk panel
-    # (other fragment) flips between collapsed expander and full panel.
+    # --- Mode toggle ---
     prior_multi = st.session_state.get(multi_key, False)
     multi = st.checkbox(
         "Multi-select for bulk approve",
         value=prior_multi,
         key=f"multi_toggle_widget_{period}_{labor_source}",
         help=(
-            "Check multiple employees and apply the same role + allocation "
-            "template to all at once via the bulk panel above the list."
+            "Select multiple employees in the table below and apply the "
+            "same role + allocation template to all at once via the bulk "
+            "panel above the list."
         ),
         disabled=period_committed,
     )
     st.session_state[multi_key] = multi
     if multi != prior_multi:
-        st.rerun(scope="app")
+        st.rerun()
 
-    # Filters — pure list-fragment concerns, auto-rerun stays scoped here.
+    # --- Filters ---
     search_term = st.text_input(
         "Search",
         key=f"search_{period}_{labor_source}",
@@ -246,57 +225,111 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
     elif filter_choice == "Approved":
         df = df[df['reviewed'].fillna(False) == True]
 
-    n_selected = len(st.session_state.get(bulk_set_key, set()))
-    if multi:
-        st.caption(f"Showing {len(df)} of {len(employees)}  ·  **{n_selected}** checked")
-    else:
-        st.caption(f"Showing {len(df)} of {len(employees)}")
-
     if df.empty:
+        st.caption(f"Showing 0 of {len(employees)}")
         st.info("No employees match the current filter.")
+        if multi and st.session_state.get(bulk_set_key):
+            st.session_state[bulk_set_key] = set()
         return
 
-    # Multi-mode bulk selection controls. These mutate the shared
-    # bulk_set_key, which the bulk panel reads — needs app-scoped rerun.
+    # =============================================================
+    # MULTI MODE — single virtualized dataframe
+    # =============================================================
     if multi:
-        unreviewed_visible = df[~df['reviewed'].fillna(False)]
-        n_visible_unrev = len(unreviewed_visible)
+        is_reviewed = df['reviewed'].fillna(False) == True
+        unreviewed = df[~is_reviewed].copy().reset_index(drop=True)
+        n_approved_in_filter = int(is_reviewed.sum())
 
-        bc1, bc2, bc3 = st.columns(3)
-        with bc1:
-            if st.button(
-                f"Select visible ({n_visible_unrev})",
-                key=f"sel_all_visible_{period}_{labor_source}",
-                use_container_width=True,
-                disabled=n_visible_unrev == 0,
-                help="Add every unreviewed employee currently visible to the bulk batch.",
-            ):
-                cur = st.session_state.get(bulk_set_key, set())
-                cur |= set(unreviewed_visible['employee_name'])
-                st.session_state[bulk_set_key] = cur
-                st.rerun(scope="app")
-        with bc2:
-            if st.button(
-                "Uncheck visible",
-                key=f"clear_visible_{period}_{labor_source}",
-                use_container_width=True,
-                disabled=n_selected == 0,
-                help="Remove visible employees from the bulk batch.",
-            ):
-                cur = st.session_state.get(bulk_set_key, set())
-                cur -= set(df['employee_name'])
-                st.session_state[bulk_set_key] = cur
-                st.rerun(scope="app")
-        with bc3:
-            if st.button(
-                "Clear all",
-                key=f"clear_all_{period}_{labor_source}",
-                use_container_width=True,
-                disabled=n_selected == 0,
-                help="Empty the bulk batch.",
-            ):
+        n_selected_now = len(st.session_state.get(bulk_set_key, set()))
+        st.caption(
+            f"Showing {len(unreviewed)} unreviewed of {len(employees)} total  "
+            f"·  **{n_selected_now}** selected"
+            + (f"  ·  {n_approved_in_filter} approved hidden" if n_approved_in_filter else "")
+        )
+
+        if unreviewed.empty:
+            st.info(
+                "No unreviewed employees match the current filter. "
+                "Switch to single mode (uncheck the toggle above) to view "
+                "and edit approved employees."
+            )
+            if st.session_state.get(bulk_set_key):
                 st.session_state[bulk_set_key] = set()
-                st.rerun(scope="app")
+            return
+
+        # Build display dataframe.
+        display_df = pd.DataFrame({
+            'Employee': unreviewed['employee_name'].values,
+            'Type': unreviewed['is_new_employee']
+                        .fillna(False)
+                        .map({True: 'New hire', False: 'Returning'})
+                        .values,
+            'UKG Role': unreviewed.get('ukg_role', pd.Series([''] * len(unreviewed))).fillna('').values,
+            'Cost': [
+                _dollar_or_hidden(v, show_amounts)
+                for v in unreviewed['total_labor_cost'].values
+            ],
+        })
+
+        df_key = _emp_dataframe_key(period, labor_source)
+
+        event = st.dataframe(
+            display_df,
+            use_container_width=True,
+            height=520,
+            hide_index=True,
+            on_select='rerun',
+            selection_mode='multi-row',
+            key=df_key,
+            column_config={
+                'Employee': st.column_config.TextColumn('Employee', width='medium'),
+                'Type':     st.column_config.TextColumn('Type', width='small'),
+                'UKG Role': st.column_config.TextColumn('UKG Role'),
+                'Cost':     st.column_config.TextColumn('Cost', width='small'),
+            },
+        )
+
+        # Sync dataframe selection -> bulk_set_key.
+        # event.selection.rows are positional indices into display_df,
+        # which has the same row order as unreviewed (we reset_index above).
+        selected_indices: list = []
+        if event is not None and getattr(event, 'selection', None) is not None:
+            selected_indices = list(getattr(event.selection, 'rows', []) or [])
+
+        selected_names = {
+            unreviewed.iloc[i]['employee_name']
+            for i in selected_indices
+            if 0 <= i < len(unreviewed)
+        }
+
+        # Always overwrite — the dataframe widget is the source of truth
+        # in multi mode. The bulk panel renders next via the placeholder
+        # pattern in render_review_tab and will see the fresh value on
+        # this same script run.
+        st.session_state[bulk_set_key] = selected_names
+
+        # Convenience: clear all selections (resets the dataframe widget).
+        if selected_names:
+            if st.button(
+                "Clear selection",
+                key=f"clear_sel_btn_{period}_{labor_source}",
+                use_container_width=True,
+            ):
+                if df_key in st.session_state:
+                    del st.session_state[df_key]
+                st.session_state[bulk_set_key] = set()
+                st.rerun()
+        else:
+            st.caption(
+                "Tip: click the header checkbox in the table to select all visible rows."
+            )
+
+        return
+
+    # =============================================================
+    # SINGLE MODE — button per row, three sections (unchanged path)
+    # =============================================================
+    st.caption(f"Showing {len(df)} of {len(employees)}")
 
     is_new      = df['is_new_employee'].fillna(False) == True
     is_reviewed = df['reviewed'].fillna(False) == True
@@ -309,42 +342,25 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
         if not new_hires_pending.empty:
             st.markdown(f"**New hires — pending approval ({len(new_hires_pending)})** — no prior allocation")
             for _, row in new_hires_pending.iterrows():
-                if multi:
-                    _render_row_checkbox(row, period, labor_source, show_amounts, bulk_set_key)
-                else:
-                    _render_row_button(row, period, labor_source, show_amounts, currently_selected)
+                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
             st.markdown("")
 
         if not returning_unreviewed.empty:
             st.markdown(f"**Returning — pending approval ({len(returning_unreviewed)})**")
             for _, row in returning_unreviewed.iterrows():
-                if multi:
-                    _render_row_checkbox(row, period, labor_source, show_amounts, bulk_set_key)
-                else:
-                    _render_row_button(row, period, labor_source, show_amounts, currently_selected)
+                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
             st.markdown("")
 
         if not all_approved.empty:
             st.markdown(f"**Approved ({len(all_approved)})**")
             for _, row in all_approved.iterrows():
-                if multi:
-                    # Approved employees are out of scope for bulk apply —
-                    # render as static greyed labels so the user still sees
-                    # progress against headcount but can't accidentally
-                    # overwrite an approved allocation in a bulk batch.
-                    st.markdown(
-                        f"<div style='padding:4px 8px;color:#888;font-size:0.85em'>{_row_label(row, show_amounts)}</div>",
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    _render_row_button(row, period, labor_source, show_amounts, currently_selected)
+                _render_row_button(row, period, labor_source, show_amounts, currently_selected)
 
 
 # -------------------------------------------------------------
-# Bulk assign + approve panel  (FRAGMENT)
+# Bulk assign + approve panel
 # -------------------------------------------------------------
 
-@st.fragment
 def _render_bulk_assign_panel(
     period: str, labor_source: str,
     employees: pd.DataFrame, reviewer_name: str,
@@ -352,18 +368,11 @@ def _render_bulk_assign_panel(
     """Bulk-apply a role + allocation template to many unreviewed employees.
 
     Two render states:
-      - Multi-select OFF: collapsed expander with a hint about turning on
-        multi-select mode in the employee list below.
-      - Multi-select ON: full panel with role selector, line builder, and an
-        Apply button that reads the checked employees from session state.
-
-    Same line contract as the per-employee editor — supports direct_program
-    lines, cost_center lines, percentage splits, and program restrictions.
-    Lines must sum to 100% before the apply button enables.
-
-    Fragment-scoped: building lines, adding/removing lines, and editing
-    template widgets only rerun this panel. The Apply button on success
-    forces an app-scoped rerun so the list and KPIs reflect new approvals.
+      - Multi-select OFF: collapsed expander with a hint.
+      - Multi-select ON: full panel reading the selection from
+        bulk_set_key (which the list populated from the dataframe
+        widget on this same render via the placeholder pattern in
+        render_review_tab).
     """
     if wla.is_period_committed(period):
         return
@@ -379,7 +388,7 @@ def _render_bulk_assign_panel(
         with st.expander("Bulk assign and approve", expanded=False):
             st.caption(
                 "Turn on **Multi-select for bulk approve** in the employee list "
-                "below to start. Check the employees you want, define a role + "
+                "below to start. Select the employees you want, define a role + "
                 "allocation template here, then apply it to all of them in one "
                 "transaction."
             )
@@ -399,9 +408,9 @@ def _render_bulk_assign_panel(
         if n_selected == 0:
             st.markdown("### Bulk assign and approve")
             st.caption(
-                "No employees checked yet — define the template here, then check "
-                "rows in the list below. The Apply button enables once you have "
-                "a valid template + at least one employee."
+                "No employees selected yet — define the template here, then "
+                "select rows in the list below. The Apply button enables once "
+                "you have a valid template + at least one employee."
             )
         else:
             preview = sorted(selected_set)[:5]
@@ -409,7 +418,7 @@ def _render_bulk_assign_panel(
             if n_selected > 5:
                 preview_str += f" + {n_selected - 5} more"
             plural = "s" if n_selected != 1 else ""
-            st.markdown(f"### Bulk assign and approve — {n_selected} employee{plural} checked")
+            st.markdown(f"### Bulk assign and approve — {n_selected} employee{plural} selected")
             st.caption(preview_str)
 
         st.markdown("")
@@ -522,7 +531,6 @@ def _render_bulk_assign_panel(
                 lines[i]['allocation_pct'] = pct / 100.0
 
             with col_rm:
-                # Fragment-scoped rerun — only the bulk panel's lines change.
                 if st.button("Remove", key=rm_k, help="Remove this line"):
                     lines.pop(i)
                     st.session_state[lines_k] = lines
@@ -535,7 +543,6 @@ def _render_bulk_assign_panel(
 
         col_add, col_total = st.columns([1, 3])
         with col_add:
-            # Fragment-scoped rerun — only the bulk panel's lines change.
             if st.button(
                 "+ Add line",
                 key=f"bulk_add_line_{period}_{labor_source}",
@@ -561,8 +568,8 @@ def _render_bulk_assign_panel(
         )
 
         apply_label = (
-            f"Apply to {n_selected} checked and approve"
-            if n_selected > 0 else "Apply to checked and approve"
+            f"Apply to {n_selected} selected and approve"
+            if n_selected > 0 else "Apply to selected and approve"
         )
 
         if st.button(
@@ -592,33 +599,26 @@ def _render_bulk_assign_panel(
                         )
                 else:
                     st.success(msg)
-                # Clear the checked set so the same template doesn't re-apply
-                # by accident on the next batch. Leave multi mode on and
-                # leave the role + lines template alone so the user can keep
-                # batching with a tweaked role.
+                # Clear the selection set AND the dataframe widget state
+                # so the same template doesn't re-apply by accident on the
+                # next batch. Leave multi mode + the role + lines template
+                # alone so the user can keep batching with a tweaked role.
                 st.session_state[bulk_set_key] = set()
-                # App-scoped rerun — list + KPIs need to reflect new approvals.
-                st.rerun(scope="app")
+                df_key = _emp_dataframe_key(period, labor_source)
+                if df_key in st.session_state:
+                    del st.session_state[df_key]
+                st.rerun()
             except ValueError as e:
                 st.error(str(e))
 
 
 # -------------------------------------------------------------
-# Right column — editor body  (FRAGMENT)
+# Right column — editor body
 # -------------------------------------------------------------
 
-@st.fragment
 def _render_editor(period: str, labor_source: str, employee: str, reviewer_name: str,
                    current_row: pd.Series, show_amounts: bool = False):
-    """Renders the editor for the selected employee as its own fragment.
-
-    Per-line widget edits (role selectbox, line type, target, percentage,
-    restrictions) only rerun this panel. Approve/Unapprove forces an
-    app-scoped rerun so the list and KPIs reflect the new state.
-    """
-    # Gate: if the period's allocation is already committed, edits would silently
-    # invalidate the locked snapshot. Show a read-only summary and a clear
-    # instruction to unlock first.
+    """Renders the editor for the selected employee."""
     if wla.is_period_committed(period):
         reviewed = bool(current_row['reviewed']) if pd.notna(current_row['reviewed']) else False
         status_badge = "Approved" if reviewed else "Not allocated"
@@ -632,7 +632,6 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
             "stg_labor_applied and the profitability MV. "
             "Unlock the period from the Allocation tab before making changes."
         )
-        # Read-only display of the current allocation, if any
         current = wla.get_employee_allocation(period, employee, labor_source)
         if current and current.get('lines'):
             st.markdown(f"**Role:** {current['role_name']}")
@@ -645,8 +644,7 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
                     "%":           f"{float(ln['allocation_pct']) * 100:.2f}%",
                     "Restrictions": ", ".join(ln.get('program_restrictions') or []) or "—",
                 })
-            import pandas as _pd
-            st.dataframe(_pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
         else:
             st.caption("No allocation on file for this employee.")
         return
@@ -657,19 +655,16 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
     lines_k  = _state_key(period, labor_source, employee, 'lines')
     source_k = _state_key(period, labor_source, employee, 'carry_source')
 
-    # Header — name + cost + status
     reviewed = bool(current_row['reviewed']) if pd.notna(current_row['reviewed']) else False
-    status_badge = "✓ Approved" if reviewed else "⚠ Not allocated"
+    status_badge = "Approved" if reviewed else "Not allocated"
     st.markdown(
             f"### {employee}  \n"
             f"{_dollar_or_hidden(current_row['total_labor_cost'], show_amounts)}  ·  {status_badge}"
         )
 
-    # Carry-forward notice
     if st.session_state.get(source_k):
         st.info(f"Carried forward from {st.session_state[source_k]} — review and approve.")
 
-    # UKG context
     ukg_prog = str(current_row.get('ukg_program') or '')
     ukg_role = str(current_row.get('ukg_role') or '')
     if ukg_prog or ukg_role:
@@ -677,7 +672,6 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
 
     st.markdown("")
 
-    # Role dropdown
     roles_df = wla.get_available_roles()
     role_options = [""] + roles_df['role_name'].tolist()
     current_role = st.session_state.get(role_k, "")
@@ -690,7 +684,6 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
     )
     st.session_state[role_k] = selected_role
 
-    # Role cost_type hint
     if selected_role:
         role_row = roles_df[roles_df['role_name'] == selected_role]
         if not role_row.empty:
@@ -712,7 +705,6 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
 
     lines = st.session_state.get(lines_k, [])
 
-    # Render each line
     for i, line in enumerate(lines):
         line_type_k = _state_key(period, labor_source, employee, f'type_{i}')
         tp_k        = _state_key(period, labor_source, employee, f'tp_{i}')
@@ -798,21 +790,18 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
             lines[i]['allocation_pct'] = pct / 100.0
 
         with col_rm:
-            # Fragment-scoped — only the editor's lines change.
-            if st.button("✕", key=rm_k, help="Remove this line"):
+            if st.button("Remove", key=rm_k, help="Remove this line"):
                 lines.pop(i)
                 st.session_state[lines_k] = lines
                 st.rerun()
 
     st.session_state[lines_k] = lines
 
-    # Total + add line
     total = sum(float(ln.get('allocation_pct', 0)) for ln in lines)
     is_100 = abs(total - 1.0) < 1e-6
 
     col_add, col_total = st.columns([1, 3])
     with col_add:
-        # Fragment-scoped — only the editor's lines change.
         if st.button(
             "+ Add line",
             key=_state_key(period, labor_source, employee, 'add_line'),
@@ -826,8 +815,6 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
         else:
             st.warning(f"Total: {total*100:.2f}% — must equal 100% to approve")
 
-    # Approve / Unapprove — both are cross-fragment events (list + KPIs need
-    # to reflect the new reviewed state) so they force an app-scoped rerun.
     col_approve, col_unapprove, _ = st.columns([1, 1, 2])
 
     with col_approve:
@@ -849,7 +836,7 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
                         period, employee, labor_source, reviewer_name,
                     )
                     _clear_state(period, labor_source, employee)
-                    st.rerun(scope="app")
+                    st.rerun()
                 except ValueError as e:
                     st.error(str(e))
 
@@ -862,7 +849,7 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
         ):
             wla.unmark_employee_reviewed(period, employee, labor_source)
             _clear_state(period, labor_source, employee)
-            st.rerun(scope="app")
+            st.rerun()
 
 
 # -------------------------------------------------------------
@@ -872,10 +859,17 @@ def _render_editor(period: str, labor_source: str, employee: str, reviewer_name:
 def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_amounts: bool = False):
     """Main review tab. labor_source is 'direct' or 'temp'.
 
-    Top-level (KPIs, carry-forward bulk button) is NOT a fragment — those
-    bits are cheap to render and need to update on every approval anyway.
-    The three heavy panels — bulk assign, employee list, per-employee editor
-    — each live in their own fragment for scoped reruns. See module docstring.
+    Layout order:
+      1. KPIs (top-level)
+      2. Carry-forward + approve quick button
+      3. Bulk panel slot (RESERVED via st.empty, filled later)
+      4. List + Editor (two-column drill-down)
+      5. Bulk panel content actually rendered into the slot from step 3
+
+    Why the placeholder: in multi mode the bulk panel needs to read
+    bulk_set_key AFTER the list has synced it from the dataframe
+    selection. Reserving the visual slot up front lets us render the
+    bulk panel content last while still showing it above the list.
     """
     if labor_source not in ('direct', 'temp'):
         st.error(f"Invalid labor_source: {labor_source!r}")
@@ -908,10 +902,7 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
     pct_done = reviewed_count / total_employees if total_employees else 0
     st.progress(pct_done, text=f"{reviewed_count} of {total_employees} approved ({pct_done:.0%})")
 
-    # Bulk approve carried-forward employees (one-click; separate from
-    # the template-based bulk panel below). Lives at top level (not in
-    # a fragment) so the existing st.rerun() forces a full app rerun
-    # which is what we want — list and KPIs both refresh.
+    # --- Carry-forward + approve quick button ---
     if not wla.is_period_committed(period):
         eligible_mask = (
             (~employees['is_new_employee'].fillna(False))
@@ -956,49 +947,45 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
                     "individual review."
                 )
 
-    # Bulk assign + approve (FRAGMENT) — collapsed expander when multi mode
-    # is off, full bordered panel when on. See _render_bulk_assign_panel.
-    _render_bulk_assign_panel(period, labor_source, employees, reviewer_name)
+    # --- Reserve the bulk panel slot. Filled AFTER the list so the
+    # bulk panel reads fresh bulk_set_key on the same script run.
+    bulk_panel_slot = st.empty()
 
     st.markdown("")
 
-    # --- Drill-down layout ---
+    # --- List + Editor ---
     col_list, col_editor = st.columns([2, 3], gap="medium")
 
     with col_list:
-        # FRAGMENT — search/filter/scrolling stay scoped here.
         _render_employee_list(period, labor_source, employees, show_amounts)
 
     with col_editor:
-        # When multi-select mode is on, the right-hand drill-down is
-        # superseded by the bulk panel above. Show a clear hint instead
-        # of the editor — same pattern as the preflight addon review tab.
         multi_key = _bulk_multi_key(period, labor_source)
         if st.session_state.get(multi_key, False):
             st.info(
                 "Multi-select mode is on. Use the **Bulk assign and approve** "
                 "panel above to apply a role + allocation template to all "
-                "checked employees at once. Switch off **Multi-select for "
+                "selected employees at once. Switch off **Multi-select for "
                 "bulk approve** in the employee list to drill into a single "
                 "employee."
             )
-            return
+        else:
+            sel_k = _selected_key(period, labor_source)
+            selected = st.session_state.get(sel_k)
 
-        sel_k = _selected_key(period, labor_source)
-        selected = st.session_state.get(sel_k)
+            if not selected:
+                st.info("← Pick an employee from the list to start allocating.")
+            else:
+                row_match = employees[employees['employee_name'] == selected]
+                if row_match.empty:
+                    st.warning(
+                        f"'{selected}' is not in the current employee list. "
+                        "They may have been filtered out or removed from UKG for this period."
+                    )
+                else:
+                    _render_editor(period, labor_source, selected, reviewer_name, row_match.iloc[0], show_amounts)
 
-        if not selected:
-            st.info("← Pick an employee from the list to start allocating.")
-            return
-
-        row_match = employees[employees['employee_name'] == selected]
-        if row_match.empty:
-            st.warning(
-                f"'{selected}' is not in the current employee list. "
-                "They may have been filtered out or removed from UKG for this period."
-            )
-            return
-
-        # FRAGMENT — line editing stays scoped here, approve/unapprove
-        # forces app-scoped rerun.
-        _render_editor(period, labor_source, selected, reviewer_name, row_match.iloc[0], show_amounts)
+    # --- Render bulk panel into the reserved slot. By now, the list
+    # has run and bulk_set_key reflects the dataframe selection.
+    with bulk_panel_slot.container():
+        _render_bulk_assign_panel(period, labor_source, employees, reviewer_name)
