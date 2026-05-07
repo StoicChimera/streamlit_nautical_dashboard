@@ -265,7 +265,7 @@ def get_approved_cogs_pools_weekly(period: str) -> pd.DataFrame:
     (weekly drivers); period-level rows have iso_week = None.
     """
     try:
-        emp_alloc = wlc.build_employee_allocations(period, _activity_dfs(period), get_revenue_by_program(period))
+        emp_alloc = _cached_employee_alloc(period)
     except Exception:
         return pd.DataFrame(columns=["iso_week", "effective_bucket", "labor_type", "labor_pool"])
 
@@ -498,7 +498,7 @@ def get_approved_cogs_pools(period: str) -> pd.DataFrame:
     Now sources from the new fanned-out allocation result.
     """
     try:
-        emp_alloc = wlc.build_employee_allocations(period, _activity_dfs(period), get_revenue_by_program(period))
+        emp_alloc = _cached_employee_alloc(period)
     except Exception:
         return pd.DataFrame(columns=["effective_bucket", "labor_type", "labor_pool"])
 
@@ -2172,6 +2172,41 @@ def _activity_dfs(period: str) -> dict[str, pd.DataFrame]:
     }
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_employee_alloc(period: str) -> pd.DataFrame:
+    """
+    Cached wrapper around wlc.build_employee_allocations.
+
+    The Allocation tab calls this work four times across get_approved_cogs_pools,
+    get_approved_cogs_pools_weekly, build_approved_employee_overview, and
+    build_employee_heuristic_allocations. Without caching, the heavy pandas
+    compute runs four times per render. With caching keyed on period only,
+    the first caller pays the cost and the rest hit the cache for the next 60s.
+
+    The internal _activity_dfs and get_revenue_by_program calls are themselves
+    cached, so the wrapper does not redundantly fetch input data.
+    """
+    return wlc.build_employee_allocations(
+        period,
+        _activity_dfs(period),
+        get_revenue_by_program(period),
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_employee_alloc_with_warnings(period: str):
+    """
+    Tuple-returning variant for callers that need the (result, warnings) pair.
+    Kept separate so the cache slot does not collide with the no-warnings call.
+    """
+    return wlc.build_employee_allocations(
+        period,
+        _activity_dfs(period),
+        get_revenue_by_program(period),
+        return_warnings=True,
+    )
+
+
 def compute_cogs_allocation(pools_df: pd.DataFrame, activity: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
     Deprecated under 1b.3 — returns empty DataFrame.
@@ -2193,7 +2228,7 @@ def compute_sga_allocation(sga_pool: float, revenue_df: pd.DataFrame) -> pd.Data
 
 def build_approved_employee_overview(period: str, cost_type_filter: str = "All") -> tuple[pd.DataFrame, pd.DataFrame]:
     """Reads from new employee allocation table. Groups by cost center."""
-    emp_alloc = wlc.build_employee_allocations(period, _activity_dfs(period), get_revenue_by_program(period))
+    emp_alloc = _cached_employee_alloc(period)
     if emp_alloc.empty:
         return pd.DataFrame(columns=["Program","Employees","Approved Labor","Sources"]), pd.DataFrame()
 
@@ -2315,16 +2350,22 @@ def build_employee_heuristic_allocations(
     cost_type_filter: str = "All",
     return_warnings: bool = False,
 ):
-    """Thin wrapper around the new Phase 1b.3 engine."""
+    """
+    Thin wrapper around the new Phase 1b.3 engine. Now reads from the
+    cached _cached_employee_alloc / _cached_employee_alloc_with_warnings
+    wrappers so all four call sites in this module share one compute.
+
+    The activity and revenue_df parameters are accepted for backward-compat
+    with the existing call signature but are unused — the cached wrappers
+    compute their own (and read those from their own cache slots).
+    """
     if return_warnings:
-        result, warnings = wlc.build_employee_allocations(
-            period, activity, revenue_df, return_warnings=True
-        )
+        result, warnings = _cached_employee_alloc_with_warnings(period)
         if cost_type_filter in ("COGS", "SGA") and not result.empty:
             result = result[result["cost_type"] == cost_type_filter].copy()
         return result, warnings
 
-    result = wlc.build_employee_allocations(period, activity, revenue_df)
+    result = _cached_employee_alloc(period)
     if result.empty or cost_type_filter == "All":
         return result
     return result[result["cost_type"] == cost_type_filter].copy() if cost_type_filter in ("COGS", "SGA") else result
