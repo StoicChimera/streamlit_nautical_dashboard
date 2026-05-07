@@ -35,6 +35,7 @@ Exports one public function:
 
 import pandas as pd
 import streamlit as st
+import time as _time
 
 from . import wip_labor_allocation as wla
 
@@ -894,8 +895,6 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
     if labor_source not in ('direct', 'temp'):
         st.error(f"Invalid labor_source: {labor_source!r}")
         return
-
-    import time as _time
 
     _t0 = _time.time()
     employees = wla.list_employees_for_review(period, labor_source)
