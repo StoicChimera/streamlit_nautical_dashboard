@@ -71,20 +71,32 @@ engine = create_engine(_CONN, pool_pre_ping=True)
 
 # cost_type for each bucket
 BUCKET_COST_TYPE: dict[str, str] = {
+    # Storage
     "Experiential ADV":         "cogs",
     "OGP ADV - Overwrap":       "cogs",
     "Shared Storage - A Racks": "cogs",
-    "Office/Inventory":         "mixed",   # split computed at runtime
+    "Overwrap Racking":         "cogs",   # NEW: 3mo avg MU, customer ILIKE recess/arrived
+    "Demo Racking":             "cogs",   # NEW: 3mo avg MU, customer ILIKE demo
+    "Walmart Bulk Area":        "cogs",   # NEW: 3mo avg MU, customer ILIKE walmart
+
+    # Shared
+    "Office/Inventory":         "mixed",  # split computed at runtime
     "Shared/Unassigned":        "sga",
+
+    # Production
     "OGP ADV":                  "cogs",
     "Demo ADV":                 "cogs",
     "E-Comm":                   "cogs",
-    "Ad-Hoc":                   "cogs",
     "OverWrap":                 "cogs",
-    "Demo - ADV - Inbound":     "cogs",
-    "OGP - ADV - Inbound":      "cogs",
-    "Demo - ADV - Outbound":    "cogs",
-    "OGP - ADV - Outbound":     "cogs",
+    "Gaylords":                 "cogs",   # NEW: ow units, customer ILIKE retailer set
+
+    # Dock - Outbound
+    "AMT/GP Bulk and Outbound": "cogs",   # NEW: shipments where reference ILIKE %v6%
+    "E-Comm Dock Outbound":     "cogs",   # NEW: shipments for ecomm config customers
+
+    # Deprecated buckets removed: Demo - ADV - Inbound, OGP - ADV - Inbound,
+    # Demo - ADV - Outbound, OGP - ADV - Outbound. Historical periods retain
+    # data in stg_warehouse_allocation; new periods will not seed or compute.
 }
 
 ALL_BUCKETS = list(BUCKET_COST_TYPE.keys())
@@ -648,6 +660,239 @@ def _get_demo_programs(period: str) -> set[str]:
 
 
 # =====================================================
+# Helper: trailing-3-month period range
+# =====================================================
+
+def _three_periods_back(month_start: date) -> list[str]:
+    """
+    Returns [n-2, n-1, n] as YYYY-MM strings. Used for trailing 3-month
+    average drivers (Overwrap Racking, Demo Racking, Walmart Bulk Area).
+    """
+    y, m = month_start.year, month_start.month
+    out = []
+    for offset in (-2, -1, 0):
+        nm = m + offset
+        ny = y
+        while nm <= 0:
+            nm += 12
+            ny -= 1
+        out.append(f"{ny:04d}-{nm:02d}")
+    return out
+
+
+# =====================================================
+# Driver: 3-month avg movable units, pattern-matched customer
+# Used for Overwrap Racking, Demo Racking, Walmart Bulk Area.
+# =====================================================
+
+def _get_inventory_3mo_avg(
+    month_start: date,
+    customer_patterns: list[str],
+) -> pd.DataFrame:
+    """
+    Per-customer 3-month average of movable-unit count, restricted to
+    customers whose raw customer_clean ILIKE any of the supplied substring
+    patterns (case-insensitive, wrapped with % wildcards).
+
+    Average method:
+      1. For each (customer, accrual_period, snap_date), count distinct MUs
+         (or fall back to sum_on_hand_qty if MU labels are missing).
+      2. For each (customer, accrual_period), average across snapshots.
+      3. Across the 3 trailing months, average those monthly averages.
+
+    Pool customers (alias.exclude=TRUE) are excluded — these buckets bill
+    matching customers directly with no experiential redistribution.
+    """
+    periods = _three_periods_back(month_start)
+    if not customer_patterns:
+        return pd.DataFrame(columns=["customer", "units"])
+
+    pattern_params = {f"pat_{i}": f"%{p}%" for i, p in enumerate(customer_patterns)}
+    pattern_clauses = " OR ".join(
+        f"s.customer_clean ILIKE :pat_{i}" for i in range(len(customer_patterns))
+    )
+
+    sql = f"""
+        WITH snapshots AS (
+            SELECT
+                s.accrual_period,
+                CASE
+                    WHEN s.customer_clean ILIKE '%LT-STG%'
+                      OR s.customer_clean ILIKE '%LT STG%'
+                      OR s.customer_clean ILIKE 'Life Time%'
+                      OR s.customer_clean ILIKE 'LifeTime%'
+                      OR s.customer_clean ILIKE 'FINISHED PALLETS LT%'
+                        THEN 'Life Time'
+                    ELSE COALESCE(a.canonical_name, s.customer_clean)
+                END AS customer,
+                COALESCE(a.exclude, FALSE) AS exclude,
+                CAST(s.as_of_ts AS TIMESTAMP)::date AS snap_date,
+                CASE
+                    WHEN COUNT(DISTINCT NULLIF(TRIM(s.movable_unit_label_1), '')) > 0
+                        THEN COUNT(DISTINCT NULLIF(TRIM(s.movable_unit_label_1), ''))::numeric
+                    ELSE COALESCE(SUM(s.sum_on_hand_qty), 0)::numeric
+                END AS mu_count
+            FROM stg_extensiv_stock_status s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.customer_clean)
+                AND a.active = TRUE
+            WHERE s.accrual_period = ANY(:periods)
+              AND NULLIF(TRIM(s.customer_clean), '') IS NOT NULL
+              AND NULLIF(TRIM(s.as_of_ts), '') IS NOT NULL
+              AND ({pattern_clauses})
+            GROUP BY 1, 2, 3, 4
+        ),
+        per_customer_month AS (
+            SELECT customer, accrual_period, AVG(mu_count) AS month_avg
+            FROM snapshots
+            WHERE exclude = FALSE
+              AND LOWER(customer) NOT LIKE '%nautical%'
+            GROUP BY 1, 2
+            HAVING AVG(mu_count) > 0
+        )
+        SELECT
+            customer,
+            ROUND(AVG(month_avg)::numeric, 2) AS units
+        FROM per_customer_month
+        GROUP BY 1
+        HAVING AVG(month_avg) > 0
+        ORDER BY units DESC
+    """
+
+    return pd.read_sql(
+        text(sql),
+        engine,
+        params={"periods": periods, **pattern_params},
+    )
+
+
+# =====================================================
+# Driver: AMT/GP shipments — reference field includes 'v6'
+# =====================================================
+
+def _get_amt_gp_shipments(period: str) -> pd.DataFrame:
+    """
+    Shipments where the reference field contains 'v6' (case-insensitive).
+
+    VERIFY: column name `reference_num` is a placeholder. Confirm the actual
+    column on stg_extensiv_shipments and update the WHERE clause if needed.
+    Common alternatives: reference_no, customer_reference, reference_id.
+    """
+    return pd.read_sql(
+        text("""
+            SELECT
+                COALESCE(a.canonical_name, s.customer_report_raw) AS customer,
+                COUNT(DISTINCT s.transaction_id)                   AS units
+            FROM stg_extensiv_shipments s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.customer_report_raw)
+                AND a.active = TRUE
+            WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
+              AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
+              AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
+              AND s.transaction_type_raw NOT ILIKE '%return%'
+              AND s.reference_no ILIKE '%v6%'
+              AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
+                  = TO_DATE(:period, 'YYYY-MM')
+              AND COALESCE(a.exclude, FALSE) = FALSE
+            GROUP BY 1
+            HAVING COUNT(DISTINCT s.transaction_id) > 0
+            ORDER BY units DESC
+        """),
+        engine,
+        params={"period": period},
+    )
+
+
+# =====================================================
+# Driver: filtered overwrap units (Gaylords)
+# =====================================================
+
+def _get_overwrap_units_filtered(
+    period: str,
+    customer_patterns: list[str],
+) -> pd.DataFrame:
+    """
+    Sum stg_smartsheet_overwrap.units_produced filtered to customers whose
+    raw customer field ILIKE any of the given substrings.
+    """
+    if not customer_patterns:
+        return pd.DataFrame(columns=["customer", "units"])
+
+    pattern_params = {f"pat_{i}": f"%{p}%" for i, p in enumerate(customer_patterns)}
+    pattern_clauses = " OR ".join(
+        f"s.customer ILIKE :pat_{i}" for i in range(len(customer_patterns))
+    )
+
+    sql = f"""
+        SELECT
+            COALESCE(a.canonical_name, s.customer) AS customer,
+            SUM(s.units_produced)                  AS units
+        FROM stg_smartsheet_overwrap s
+        LEFT JOIN dim_customer_alias a
+            ON LOWER(a.alias) = LOWER(s.customer) AND a.active = TRUE
+        WHERE s.accrual_month = :period
+          AND s.units_produced > 0
+          AND s.date_finished IS NOT NULL
+          AND COALESCE(a.exclude, FALSE) = FALSE
+          AND ({pattern_clauses})
+        GROUP BY 1
+        HAVING SUM(s.units_produced) > 0
+        ORDER BY units DESC
+    """
+
+    return pd.read_sql(
+        text(sql),
+        engine,
+        params={"period": period, **pattern_params},
+    )
+
+
+# =====================================================
+# Driver: shipments for E-Comm elected customers
+# =====================================================
+
+def _get_ecomm_shipments(period: str) -> pd.DataFrame:
+    """
+    Shipments for customers present in stg_labor_ecomm_period_config
+    (active=TRUE) for this period. Used for the E-Comm Dock Outbound bucket.
+
+    Customer match is on the alias-normalized name vs. customer_name in
+    the config table.
+    """
+    return pd.read_sql(
+        text("""
+            WITH ecomm_customers AS (
+                SELECT LOWER(TRIM(customer_name)) AS customer_name_lower
+                FROM stg_labor_ecomm_period_config
+                WHERE accrual_period = :period AND active = TRUE
+            )
+            SELECT
+                COALESCE(a.canonical_name, s.customer_report_raw) AS customer,
+                COUNT(DISTINCT s.transaction_id)                   AS units
+            FROM stg_extensiv_shipments s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.customer_report_raw)
+                AND a.active = TRUE
+            WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
+              AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
+              AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
+              AND s.transaction_type_raw NOT ILIKE '%return%'
+              AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
+                  = TO_DATE(:period, 'YYYY-MM')
+              AND COALESCE(a.exclude, FALSE) = FALSE
+              AND LOWER(COALESCE(a.canonical_name, s.customer_report_raw)) IN (
+                  SELECT customer_name_lower FROM ecomm_customers
+              )
+            GROUP BY 1
+            HAVING COUNT(DISTINCT s.transaction_id) > 0
+            ORDER BY units DESC
+        """),
+        engine,
+        params={"period": period},
+    )
+
+# =====================================================
 # Core: allocate a single unit-driven bucket
 # =====================================================
 
@@ -818,19 +1063,28 @@ def save_sqft_inputs(month_start: date, rows: list[dict], updated_by: str) -> No
 def seed_sqft_month(month_start: date) -> None:
     """Initialize sqft grid for a new month with 0 values."""
     buckets = [
+        # Storage
         ("Experiential ADV",         "Storage"),
-        ("OGP ADV - Overwrap",        "Storage"),
-        ("Shared Storage - A Racks",  "Storage"),
-        ("Office/Inventory",          "Shared"),
-        ("Shared/Unassigned",         "Shared"),
-        ("OGP ADV",                   "Production"),
-        ("Demo ADV",                  "Production"),
-        ("E-Comm",                    "Production"),
-        ("OverWrap",                  "Production"),
-        ("Demo - ADV - Inbound",      "Dock - Inbound"),
-        ("OGP - ADV - Inbound",       "Dock - Inbound"),
-        ("Demo - ADV - Outbound",     "Dock - Outbound"),
-        ("OGP - ADV - Outbound",      "Dock - Outbound"),
+        ("OGP ADV - Overwrap",       "Storage"),
+        ("Shared Storage - A Racks", "Storage"),
+        ("Overwrap Racking",         "Storage"),
+        ("Demo Racking",             "Storage"),
+        ("Walmart Bulk Area",        "Storage"),
+
+        # Shared
+        ("Office/Inventory",         "Shared"),
+        ("Shared/Unassigned",        "Shared"),
+
+        # Production
+        ("OGP ADV",                  "Production"),
+        ("Demo ADV",                 "Production"),
+        ("E-Comm",                   "Production"),
+        ("OverWrap",                 "Production"),
+        ("Gaylords",                 "Production"),
+
+        # Dock - Outbound
+        ("AMT/GP Bulk and Outbound", "Dock - Outbound"),
+        ("E-Comm Dock Outbound",     "Dock - Outbound"),
     ]
     with engine.begin() as conn:
         for bucket, category in buckets:
@@ -1080,14 +1334,15 @@ def compute_warehouse_allocation(
     sqft_map = dict(zip(sqft_df["program_bucket"], sqft_df["total_sqft"].astype(float)))
 
     # ---- shared data ----
+    # demo_programs / receipts_df / shipments_df were used by the deprecated
+    # dock-inbound and dock-outbound buckets. The new dock buckets use
+    # dedicated query helpers (_get_amt_gp_shipments, _get_ecomm_shipments)
+    # so the broad shipments_df fetch is no longer needed.
     alias_map        = _get_alias_map()
     revenue_df       = _get_revenue(period)
     exp_programs     = _get_experiential_programs(period)
     ogp_programs     = _get_ogp_programs(period)
-    demo_programs    = _get_demo_programs(period)
     inventory_df     = _get_inventory(period)
-    receipts_df      = _get_receipts(period, alias_map)
-    shipments_df     = _get_shipments(period, alias_map)
     demo_units_df    = _get_demo_units(period, alias_map)
     ogp_units_df     = _get_ogp_units(period, alias_map)
     ow_units_df      = _get_ow_units(period, alias_map)
@@ -1210,47 +1465,78 @@ def compute_warehouse_allocation(
         total_wh_cost, committed_by, committed_at, month_start,
     ))
 
-    # ---- Demo - ADV - Inbound (Dock - Inbound) ----
-    bucket   = "Demo - ADV - Inbound"
-    demo_rec = receipts_df[receipts_df["customer"].str.lower().isin(demo_programs)].copy()
-    if demo_rec.empty:
-        demo_rec = receipts_df.copy()
+    # =================================================
+    # NEW STORAGE BUCKETS — 3-month avg MU, pattern-matched
+    # =================================================
+
+    # ---- Overwrap Racking (Storage) ----
+    # Customer raw name contains 'recess' or 'arrived'
+    bucket = "Overwrap Racking"
+    ow_rack_df = _get_inventory_3mo_avg(month_start, ["recess", "arrived"])
     _record(bucket, _allocate_units(
-        demo_rec, _bucket_cost(bucket), bucket, "Dock - Inbound", "cogs",
-        "Receipts (Demo ADV)", sqft_map.get(bucket, 0), total_sqft,
+        ow_rack_df, _bucket_cost(bucket), bucket, "Storage", "cogs",
+        "MU 3mo Avg (Recess/Arrived)", sqft_map.get(bucket, 0), total_sqft,
         total_wh_cost, committed_by, committed_at, month_start,
     ))
 
-    # ---- OGP - ADV - Inbound (Dock - Inbound) ----
-    bucket  = "OGP - ADV - Inbound"
-    ogp_rec = receipts_df[receipts_df["customer"].str.lower().isin(ogp_programs)].copy()
-    if ogp_rec.empty:
-        ogp_rec = receipts_df.copy()
+    # ---- Demo Racking (Storage) ----
+    # Customer raw name contains 'demo'
+    bucket = "Demo Racking"
+    demo_rack_df = _get_inventory_3mo_avg(month_start, ["demo"])
     _record(bucket, _allocate_units(
-        ogp_rec, _bucket_cost(bucket), bucket, "Dock - Inbound", "cogs",
-        "Receipts (OGP ADV)", sqft_map.get(bucket, 0), total_sqft,
+        demo_rack_df, _bucket_cost(bucket), bucket, "Storage", "cogs",
+        "MU 3mo Avg (Demo)", sqft_map.get(bucket, 0), total_sqft,
         total_wh_cost, committed_by, committed_at, month_start,
     ))
 
-    # ---- Demo - ADV - Outbound (Dock - Outbound) ----
-    bucket    = "Demo - ADV - Outbound"
-    demo_ship = shipments_df[shipments_df["customer"].str.lower().isin(demo_programs)].copy()
-    if demo_ship.empty:
-        demo_ship = shipments_df.copy()
+    # ---- Walmart Bulk Area (Storage) ----
+    # Customer raw name contains 'walmart'
+    bucket = "Walmart Bulk Area"
+    wm_bulk_df = _get_inventory_3mo_avg(month_start, ["walmart"])
     _record(bucket, _allocate_units(
-        demo_ship, _bucket_cost(bucket), bucket, "Dock - Outbound", "cogs",
-        "Shipments (Demo ADV)", sqft_map.get(bucket, 0), total_sqft,
+        wm_bulk_df, _bucket_cost(bucket), bucket, "Storage", "cogs",
+        "MU 3mo Avg (Walmart)", sqft_map.get(bucket, 0), total_sqft,
         total_wh_cost, committed_by, committed_at, month_start,
     ))
 
-    # ---- OGP - ADV - Outbound (Dock - Outbound) ----
-    bucket   = "OGP - ADV - Outbound"
-    ogp_ship = shipments_df[shipments_df["customer"].str.lower().isin(ogp_programs)].copy()
-    if ogp_ship.empty:
-        ogp_ship = shipments_df.copy()
+    # =================================================
+    # NEW PRODUCTION BUCKET — Gaylords
+    # =================================================
+
+    # ---- Gaylords (Production) ----
+    # Overwrap units_produced from stg_smartsheet_overwrap where the
+    # customer field literally contains 'OGP' or 'other'. The smartsheet
+    # buckets non-OGP retailer flow under the literal value 'other', so
+    # filtering by retailer names individually would miss them.
+    bucket = "Gaylords"
+    gaylords_df = _get_overwrap_units_filtered(period, ["ogp", "other"])
     _record(bucket, _allocate_units(
-        ogp_ship, _bucket_cost(bucket), bucket, "Dock - Outbound", "cogs",
-        "Shipments (OGP ADV)", sqft_map.get(bucket, 0), total_sqft,
+        gaylords_df, _bucket_cost(bucket), bucket, "Production", "cogs",
+        "OW Units (OGP/Other)", sqft_map.get(bucket, 0), total_sqft,
+        total_wh_cost, committed_by, committed_at, month_start,
+    ))
+
+    # =================================================
+    # NEW DOCK - OUTBOUND BUCKETS
+    # =================================================
+
+    # ---- AMT/GP Bulk and Outbound (Dock - Outbound) ----
+    # Shipments where the reference field includes 'v6'
+    bucket = "AMT/GP Bulk and Outbound"
+    amt_gp_df = _get_amt_gp_shipments(period)
+    _record(bucket, _allocate_units(
+        amt_gp_df, _bucket_cost(bucket), bucket, "Dock - Outbound", "cogs",
+        "Shipments (Reference contains v6)", sqft_map.get(bucket, 0), total_sqft,
+        total_wh_cost, committed_by, committed_at, month_start,
+    ))
+
+    # ---- E-Comm Dock Outbound (Dock - Outbound) ----
+    # Shipments for customers present in stg_labor_ecomm_period_config
+    bucket = "E-Comm Dock Outbound"
+    ecomm_ship_df = _get_ecomm_shipments(period)
+    _record(bucket, _allocate_units(
+        ecomm_ship_df, _bucket_cost(bucket), bucket, "Dock - Outbound", "cogs",
+        "Shipments (E-Comm elected)", sqft_map.get(bucket, 0), total_sqft,
         total_wh_cost, committed_by, committed_at, month_start,
     ))
 

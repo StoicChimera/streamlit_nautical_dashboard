@@ -59,19 +59,28 @@ engine = create_engine(SUPABASE_CONN, pool_pre_ping=True)
 # Bucket display order and category grouping
 # =====================================================
 BUCKET_ROWS = [
+    # Storage
     ("Experiential ADV",         "Storage"),
-    ("OGP ADV - Overwrap",        "Storage"),
-    ("Shared Storage - A Racks",  "Storage"),
-    ("Office/Inventory",          "Shared"),
-    ("Shared/Unassigned",         "Shared"),
-    ("OGP ADV",                   "Production"),
-    ("Demo ADV",                  "Production"),
-    ("E-Comm",                    "Production"),
-    ("OverWrap",                  "Production"),
-    ("Demo - ADV - Inbound",      "Dock - Inbound"),
-    ("OGP - ADV - Inbound",       "Dock - Inbound"),
-    ("Demo - ADV - Outbound",     "Dock - Outbound"),
-    ("OGP - ADV - Outbound",      "Dock - Outbound"),
+    ("OGP ADV - Overwrap",       "Storage"),
+    ("Shared Storage - A Racks", "Storage"),
+    ("Overwrap Racking",         "Storage"),
+    ("Demo Racking",             "Storage"),
+    ("Walmart Bulk Area",        "Storage"),
+
+    # Shared
+    ("Office/Inventory",         "Shared"),
+    ("Shared/Unassigned",        "Shared"),
+
+    # Production
+    ("OGP ADV",                  "Production"),
+    ("Demo ADV",                 "Production"),
+    ("E-Comm",                   "Production"),
+    ("OverWrap",                 "Production"),
+    ("Gaylords",                 "Production"),
+
+    # Dock - Outbound
+    ("AMT/GP Bulk and Outbound", "Dock - Outbound"),
+    ("E-Comm Dock Outbound",     "Dock - Outbound"),
 ]
 
 CATEGORY_OPTIONS_DIRECT = ["Storage", "Production", "Dock - Inbound", "Dock - Outbound"]
