@@ -889,6 +889,8 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
     selection. Reserving the visual slot up front lets us render the
     bulk panel content last while still showing it above the list.
     """
+    _t_review_start = _time.time()
+
     if labor_source not in ('direct', 'temp'):
         st.error(f"Invalid labor_source: {labor_source!r}")
         return
@@ -1036,3 +1038,5 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
     # has run and bulk_set_key reflects the dataframe selection.
     with bulk_panel_slot.container():
         _render_bulk_assign_panel(period, labor_source, employees, reviewer_name)
+    
+    st.caption(f"diag — render_review_tab finished in {_time.time() - _t_review_start:.2f}s")
