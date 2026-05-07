@@ -875,7 +875,36 @@ def render_review_tab(period: str, labor_source: str, reviewer_name: str, show_a
         st.error(f"Invalid labor_source: {labor_source!r}")
         return
 
+    import time as _time
+
+    _t0 = _time.time()
     employees = wla.list_employees_for_review(period, labor_source)
+    _t_employees = _time.time() - _t0
+
+    _t1 = _time.time()
+    _committed = wla.is_period_committed(period)
+    _t_committed = _time.time() - _t1
+
+    _t2 = _time.time()
+    _roles_df = wla.get_available_roles()
+    _t_roles = _time.time() - _t2
+
+    _t3 = _time.time()
+    _cc_df = wla.get_available_cost_centers()
+    _t_cc = _time.time() - _t3
+
+    _t4 = _time.time()
+    _all_progs = wla.get_all_revenue_programs()
+    _t_progs = _time.time() - _t4
+
+    st.caption(
+        f"diag — list_employees: {_t_employees:.2f}s ({len(employees)} rows)  ·  "
+        f"is_committed: {_t_committed:.2f}s  ·  "
+        f"roles: {_t_roles:.2f}s  ·  "
+        f"cc: {_t_cc:.2f}s  ·  "
+        f"programs: {_t_progs:.2f}s"
+    )
+
     if employees.empty:
         st.info(f"No {labor_source} labor data for {period}.")
         return
