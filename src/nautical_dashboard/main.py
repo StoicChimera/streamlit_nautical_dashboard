@@ -18,7 +18,7 @@ from nautical_dashboard.app.modules import (
     raw_goods,
     auth_admin,
 )
-import subprocess
+
 from nautical_dashboard.app.modules import auth
 
 st.set_page_config(page_title="Finance Hub", layout="wide")
@@ -40,40 +40,6 @@ PAGES = {
 
 st.sidebar.title("Navigation")
 page = st.sidebar.radio("Go to", list(PAGES.keys()))
-
-# === Sync Button ===
-st.sidebar.markdown("---")
-st.sidebar.subheader("Data Management")
-
-sync_clicked = st.sidebar.button("🔄 Refresh Data")
-
-# Output area at the BOTTOM of the main page so errors are scrollable/copyable
-sync_output = st.container()
-
-if sync_clicked:
-    with st.spinner("Syncing tables and refreshing views..."):
-        sync_script = os.path.join(os.path.dirname(__file__), "tools", "supabase_sync.py")
-        result = subprocess.run(
-            [sys.executable, sync_script],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-    with sync_output:
-        st.markdown("---")
-        st.markdown("### Sync Output")
-        if result.returncode == 0:
-            st.success("Sync complete.")
-            with st.expander("View sync logs", expanded=False):
-                st.code(result.stdout or "[no output]", language="text")
-        else:
-            st.error(f"Sync failed (exit code {result.returncode})")
-            st.markdown("**stderr:**")
-            st.code(result.stderr or "[no stderr]", language="text")
-            if result.stdout:
-                with st.expander("stdout (might have context)", expanded=False):
-                    st.code(result.stdout, language="text")
 
 # === Page Rendering ===
 PAGES[page]()
