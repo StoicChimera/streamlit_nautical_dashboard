@@ -29,6 +29,8 @@ STG_TABLES = [
     "stg_wip_project_expenses",
     "clean_qbo_journal_lines",
     "clean_qbo_invoice_lines",
+    "stg_procurement_express_items",
+    "dim_item",      
 ]
 
 # production schema on local -> public schema on Supabase

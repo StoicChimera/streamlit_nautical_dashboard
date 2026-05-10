@@ -7,7 +7,6 @@ SRC_DIR = os.path.join(ROOT_DIR, "src")
 sys.path.insert(0, SRC_DIR)
 
 import streamlit as st
-
 from nautical_dashboard.app.modules import (
     revenue,
     allocations,
@@ -20,8 +19,6 @@ from nautical_dashboard.app.modules import (
     auth_admin,
 )
 import subprocess
-import os
-
 from nautical_dashboard.app.modules import auth
 
 st.set_page_config(page_title="Finance Hub", layout="wide")
@@ -55,12 +52,12 @@ sync_output = st.container()
 
 if sync_clicked:
     with st.spinner("Syncing tables and refreshing views..."):
-        sync_script = os.path.join(os.path.dirname(__file__), "supabase_sync.py")
+        sync_script = os.path.join(os.path.dirname(__file__), "tools", "supabase_sync.py")
         result = subprocess.run(
-            ["python", sync_script],
+            [sys.executable, sync_script],
             capture_output=True,
             text=True,
-            check=False,   # don't raise — handle return code manually
+            check=False,
         )
 
     with sync_output:
