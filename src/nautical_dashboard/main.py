@@ -17,6 +17,7 @@ from nautical_dashboard.app.modules import (
     wip_freight,
     raw_goods,
     auth_admin,
+    preflight,
 )
 
 from nautical_dashboard.app.modules import auth
@@ -35,6 +36,7 @@ PAGES = {
     "Warehouse Allocations":   allocations.render,
     "WIP Labor":               wip_labor.render,
     "WIP Freight":             wip_freight.render,
+    "Preflight Check":         preflight.render,
     "Auth Admin":              auth_admin.render,
 }
 
