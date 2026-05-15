@@ -218,17 +218,17 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
     # =============================================================
     # MULTI MODE — st.data_editor with checkbox column.
     #
-    # Earlier version pre-populated the Select column from
-    # bulk_set_key on every render. That fought data_editor's
-    # internal delta state and caused the "first click deselects,
-    # second click sticks" bug — the widget's tracking of edits
-    # collided with our overwriting of the underlying column.
+    # display_df is cached in a non-widget session_state key so its
+    # object identity is stable across renders. That alone fixes the
+    # original "first click deselects, second sticks" bug — the bug
+    # was data_editor losing its edit deltas when the input data
+    # was a new pd.DataFrame object every render.
     #
-    # Fix: display_df ALWAYS has Select=False. The widget's
-    # session_state[df_key] holds the deltas (edited_rows) and
-    # is the single source of truth for what's checked. We seed
-    # that state directly from bulk_set_key on filter changes,
-    # and for the Select all / Clear buttons. No more fighting.
+    # For Select all visible / Clear, we update the CACHED data
+    # (rewrite the Select column) and del the widget key to reset
+    # accumulated edit deltas. We never try to set st.session_state
+    # [df_key] directly — data_editor has writes_allowed=False on
+    # that key and raises StreamlitValueAssignmentNotAllowedError.
     # =============================================================
     if multi:
         is_reviewed = df['reviewed'].fillna(False) == True
@@ -251,43 +251,39 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
             return
 
         df_key = _emp_dataframe_key(period, labor_source)
+        cache_key = f"emp_displaydf_cache_{period}_{labor_source}"
 
-        # Seed editor state from bulk_set_key on filter change.
-        # Names in the batch that are visible under the current
-        # filter render as already-checked. Off-screen names stay
-        # in bulk_set_key and are preserved by the sync below.
-        filter_sig = f"{search_term}|{filter_choice}"
+        # Cache sig includes the unreviewed count so the cache
+        # invalidates after Apply (reviewed employees drop out of
+        # the list) or Unapprove (someone re-enters). Filter change
+        # also invalidates.
+        filter_sig = f"{search_term}|{filter_choice}|n={len(unreviewed)}"
         sig_key = f"emp_filter_sig_{period}_{labor_source}"
 
         if st.session_state.get(sig_key) != filter_sig:
-            edited_rows = {
-                idx: {'Select': True}
-                for idx, name in enumerate(unreviewed['employee_name'])
-                if name in prior_selected
-            }
-            st.session_state[df_key] = {
-                'edited_rows': edited_rows,
-                'added_rows': [],
-                'deleted_rows': [],
-            }
+            # (Re)build the cached display_df. Select column is
+            # pre-populated from bulk_set_key for visible names.
+            st.session_state[cache_key] = pd.DataFrame({
+                'Select':   unreviewed['employee_name'].isin(prior_selected).values,
+                'Employee': unreviewed['employee_name'].values,
+                'Type':     unreviewed['is_new_employee']
+                                .fillna(False)
+                                .map({True: 'New hire', False: 'Returning'})
+                                .values,
+                'UKG Role': unreviewed.get('ukg_role', pd.Series([''] * len(unreviewed))).fillna('').values,
+                'Cost':     [
+                    _dollar_or_hidden(v, show_amounts)
+                    for v in unreviewed['total_labor_cost'].values
+                ],
+            })
+            # Reset editor's edit deltas — row positions no longer
+            # correspond to prior edits after the underlying data
+            # changes. Deletion IS allowed; only assignment isn't.
+            if df_key in st.session_state:
+                del st.session_state[df_key]
             st.session_state[sig_key] = filter_sig
 
-        # Underlying data ALWAYS has Select=False. Do not
-        # pre-populate from bulk_set_key here — that's what
-        # caused the original delta-tracking bug.
-        display_df = pd.DataFrame({
-            'Select':   [False] * len(unreviewed),
-            'Employee': unreviewed['employee_name'].values,
-            'Type':     unreviewed['is_new_employee']
-                            .fillna(False)
-                            .map({True: 'New hire', False: 'Returning'})
-                            .values,
-            'UKG Role': unreviewed.get('ukg_role', pd.Series([''] * len(unreviewed))).fillna('').values,
-            'Cost':     [
-                _dollar_or_hidden(v, show_amounts)
-                for v in unreviewed['total_labor_cost'].values
-            ],
-        })
+        display_df = st.session_state[cache_key]
 
         caption_slot = st.empty()
 
@@ -307,8 +303,8 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
             },
         )
 
-        # Sync: edited_df reflects widget's true state (seed + user
-        # toggles). Merge visible truth with off-screen preservation.
+        # Sync visible truth, preserve off-screen names from prior
+        # filter views.
         visible_names = set(unreviewed['employee_name'].astype(str))
         visible_selected = set(edited_df[edited_df['Select']]['Employee'].astype(str))
         preserved_offscreen = prior_selected - visible_names
@@ -326,8 +322,8 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
             cap += f"  ·  {len(preserved_offscreen)} off-screen retained"
         caption_slot.caption(cap)
 
-        # Action buttons — both write directly to the editor's
-        # internal state, then rerun. No display_df manipulation.
+        # Action buttons — modify the CACHED display_df, then reset
+        # the editor's edit deltas via del. We never assign to df_key.
         not_yet_batched = visible_names - visible_selected
         col_select_all, col_clear = st.columns(2)
 
@@ -341,11 +337,11 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
                     "prior filter views stay in the batch."
                 ),
             ):
-                st.session_state[df_key] = {
-                    'edited_rows': {i: {'Select': True} for i in range(len(unreviewed))},
-                    'added_rows': [],
-                    'deleted_rows': [],
-                }
+                new_cached = st.session_state[cache_key].copy()
+                new_cached['Select'] = True
+                st.session_state[cache_key] = new_cached
+                if df_key in st.session_state:
+                    del st.session_state[df_key]
                 st.rerun()
 
         with col_clear:
@@ -354,11 +350,11 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
                 key=f"clear_sel_btn_{period}_{labor_source}",
                 use_container_width=True,
             ):
-                st.session_state[df_key] = {
-                    'edited_rows': {},
-                    'added_rows': [],
-                    'deleted_rows': [],
-                }
+                new_cached = st.session_state[cache_key].copy()
+                new_cached['Select'] = False
+                st.session_state[cache_key] = new_cached
+                if df_key in st.session_state:
+                    del st.session_state[df_key]
                 st.session_state[bulk_set_key] = set()
                 st.rerun()
 
