@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from typing import Optional
+
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
@@ -9,16 +11,65 @@ from sqlalchemy import create_engine, text
 load_dotenv()
 CONN_STRING = os.getenv("SUPABASE_CONN")
 
+LBS_TO_KG = 0.453592
+
 
 @st.cache_resource
 def get_engine():
     return create_engine(CONN_STRING)
 
 
+# =============================================================
+# Helpers
+# =============================================================
+
+def _interpolate_weight(size: float, specs_df: pd.DataFrame) -> Optional[float]:
+    """Linear interpolation between nearest known-weight neighbors.
+
+    Returns None if no left or right neighbor exists. Refuses to
+    extrapolate beyond the bounds of the spec table — the caller
+    is expected to surface that as a 'needs weight' state.
+    """
+    known = specs_df[specs_df['roll_weight_lbs'].notna()].sort_values('size_numeric')
+    if known.empty:
+        return None
+
+    left = known[known['size_numeric'] < size]
+    right = known[known['size_numeric'] > size]
+    if left.empty or right.empty:
+        return None
+
+    l = left.iloc[-1]
+    r = right.iloc[0]
+    l_size, l_wt = float(l['size_numeric']), float(l['roll_weight_lbs'])
+    r_size, r_wt = float(r['size_numeric']), float(r['roll_weight_lbs'])
+    return l_wt + (r_wt - l_wt) * (size - l_size) / (r_size - l_size)
+
+
+def _resolve_weight(size: float, specs_df: pd.DataFrame) -> tuple[Optional[float], bool]:
+    """Returns (weight_lbs, is_interpolated). weight_lbs is None if
+    the size has no stored weight AND no neighbors to interpolate from."""
+    row = specs_df[specs_df['size_numeric'] == size]
+    if not row.empty and pd.notna(row.iloc[0]['roll_weight_lbs']):
+        return float(row.iloc[0]['roll_weight_lbs']), False
+    interp = _interpolate_weight(size, specs_df)
+    if interp is None:
+        return None, False
+    return interp, True
+
+
+def _cost_per_roll(weight_lbs: float, cost_per_kg: float) -> float:
+    return weight_lbs * LBS_TO_KG * cost_per_kg
+
+
+# =============================================================
+# Data access
+# =============================================================
+
 def load_raw_goods(engine, start_date: str, end_date: str) -> pd.DataFrame:
+    """Invoice Detail tab — same as before. Kept for back-compat."""
     return pd.read_sql(
-        text(
-            """
+        text("""
             WITH revenue_by_invoice AS (
                 SELECT
                     customer_full_name                  AS customer,
@@ -56,30 +107,114 @@ def load_raw_goods(engine, start_date: str, end_date: str) -> pd.DataFrame:
                 SUM(total_revenue), SUM(raw_goods_cost), 1
             FROM combined
             ORDER BY sort_order, customer, invoice_num
-            """
-        ),
+        """),
         engine,
         params={"start_date": start_date, "end_date": end_date},
     )
 
 
-def load_allocs(engine) -> pd.DataFrame:
+def load_specs(engine) -> pd.DataFrame:
+    return pd.read_sql(
+        "SELECT size_numeric, roll_weight_lbs, notes FROM dim_bopp_film_specs ORDER BY size_numeric",
+        engine,
+    )
+
+
+def upsert_spec(engine, size: float, weight_lbs: Optional[float], notes: str):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO dim_bopp_film_specs (size_numeric, roll_weight_lbs, notes, updated_at)
+                VALUES (:size, :wt, :notes, NOW())
+                ON CONFLICT (size_numeric) DO UPDATE SET
+                    roll_weight_lbs = EXCLUDED.roll_weight_lbs,
+                    notes = EXCLUDED.notes,
+                    updated_at = NOW()
+            """),
+            {"size": size, "wt": weight_lbs, "notes": notes or None}
+        )
+
+
+def delete_spec(engine, size: float):
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM dim_bopp_film_specs WHERE size_numeric = :size"),
+            {"size": size}
+        )
+
+
+def load_cost(engine) -> float:
+    df = pd.read_sql("SELECT cost_per_kg FROM dim_bopp_cost WHERE id = 1", engine)
+    return float(df.iloc[0]['cost_per_kg']) if not df.empty else 0.0
+
+
+def set_cost(engine, cost_per_kg: float, updated_by: str = ''):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE dim_bopp_cost
+                SET cost_per_kg = :cost,
+                    updated_at = NOW(),
+                    updated_by = NULLIF(:by, '')
+                WHERE id = 1
+            """),
+            {"cost": cost_per_kg, "by": updated_by}
+        )
+
+
+def load_consumption(engine, period: Optional[str] = None) -> pd.DataFrame:
+    if period:
+        return pd.read_sql(
+            text("""
+                SELECT * FROM stg_raw_material_consumption
+                WHERE period = :period
+                ORDER BY created_at DESC
+            """),
+            engine,
+            params={"period": period}
+        )
+    return pd.read_sql(
+        "SELECT * FROM stg_raw_material_consumption ORDER BY period DESC, created_at DESC",
+        engine,
+    )
+
+
+def load_wip(engine) -> pd.DataFrame:
     return pd.read_sql(
         """
-        SELECT id, period, customer_program, customer_parent, amount, notes, updated_at
-        FROM public.dim_raw_material_manual_alloc
-        ORDER BY period DESC, customer_program
+        SELECT * FROM stg_raw_material_consumption
+        WHERE allocation_type = 'wip'
+        ORDER BY (wip_released_period IS NOT NULL),
+                 period DESC,
+                 customer_program
         """,
         engine,
     )
 
 
-def load_programs(engine) -> list[str]:
+def load_period_programs(engine, period: str) -> list[str]:
+    """Programs with revenue in PSD for the period — period candidates."""
+    start = f"{period}-01"
+    df = pd.read_sql(
+        text("""
+            SELECT DISTINCT customer_full_name AS customer_program
+            FROM stg_product_service_detail
+            WHERE contract_completion_date::date >= :start::date
+              AND contract_completion_date::date <  (:start::date + INTERVAL '1 month')
+            ORDER BY customer_full_name
+        """),
+        engine,
+        params={"start": start}
+    )
+    return df['customer_program'].tolist()
+
+
+def load_all_programs(engine) -> list[str]:
     df = pd.read_sql(
         "SELECT DISTINCT customer_program FROM mv_program_profitability ORDER BY customer_program",
         engine,
     )
-    return df["customer_program"].tolist()
+    return df['customer_program'].tolist()
 
 
 def load_parent_map(engine) -> dict[str, str]:
@@ -87,44 +222,135 @@ def load_parent_map(engine) -> dict[str, str]:
         "SELECT DISTINCT customer_program, customer_parent FROM mv_program_profitability",
         engine,
     )
-    return dict(zip(df["customer_program"], df["customer_parent"]))
+    return dict(zip(df['customer_program'], df['customer_parent']))
 
 
-def upsert_alloc(engine, period, program, parent, amount, notes, row_id=None):
+def classify(program: str, period_programs: set[str], program_source: str) -> str:
+    if program_source == 'free_text':
+        return 'wip'
+    if program in period_programs:
+        return 'period'
+    return 'wip'
+
+
+def add_consumption(
+    engine,
+    period: str,
+    program: str,
+    parent: str,
+    size: float,
+    rolls: float,
+    weight_lbs_snap: float,
+    cost_per_kg_snap: float,
+    program_source: str,
+    period_programs: set[str],
+    notes: str = '',
+) -> int:
+    cost_per_roll_snap = _cost_per_roll(weight_lbs_snap, cost_per_kg_snap)
+    total_cost = rolls * cost_per_roll_snap
+    allocation_type = classify(program, period_programs, program_source)
+    review_status = 'pending_review' if program_source == 'free_text' else 'auto'
+
     with engine.begin() as conn:
-        if row_id:
-            conn.execute(
-                text("""
-                    UPDATE public.dim_raw_material_manual_alloc
-                    SET period = :period, customer_program = :program,
-                        customer_parent = :parent, amount = :amount, notes = :notes
-                    WHERE id = :id
-                """),
-                {"period": period, "program": program, "parent": parent,
-                 "amount": amount, "notes": notes, "id": row_id}
-            )
-        else:
-            conn.execute(
-                text("""
-                    INSERT INTO public.dim_raw_material_manual_alloc
-                        (period, customer_program, customer_parent, amount, notes)
-                    VALUES (:period, :program, :parent, :amount, :notes)
-                    ON CONFLICT (period, customer_program, notes)
-                    DO UPDATE SET
-                        amount = EXCLUDED.amount,
-                        customer_parent = EXCLUDED.customer_parent,
-                        updated_at = NOW()
-                """),
-                {"period": period, "program": program, "parent": parent,
-                 "amount": amount, "notes": notes or ""}
-            )
+        result = conn.execute(
+            text("""
+                INSERT INTO stg_raw_material_consumption (
+                    period, customer_program, customer_parent,
+                    size_numeric, rolls_used,
+                    weight_lbs_per_roll_snap, cost_per_kg_snap, cost_per_roll_snap,
+                    total_cost, allocation_type, program_source,
+                    review_status, notes
+                ) VALUES (
+                    :period, :program, :parent,
+                    :size, :rolls,
+                    :wt, :cpk, :cpr,
+                    :total, :alloc, :src,
+                    :rev, :notes
+                )
+                RETURNING id
+            """),
+            {
+                "period": period, "program": program, "parent": parent or None,
+                "size": size, "rolls": rolls,
+                "wt": weight_lbs_snap, "cpk": cost_per_kg_snap, "cpr": cost_per_roll_snap,
+                "total": total_cost, "alloc": allocation_type, "src": program_source,
+                "rev": review_status, "notes": notes or None
+            }
+        )
+        return result.scalar()
 
 
-def delete_alloc(engine, row_id: int):
+def update_consumption(engine, row_id: int, **fields):
+    allowed = {
+        'period', 'customer_program', 'customer_parent', 'allocation_type',
+        'wip_released_period', 'review_status', 'reviewer_name', 'notes'
+    }
+    set_clauses = []
+    params: dict = {"id": row_id}
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        set_clauses.append(f"{k} = :{k}")
+        params[k] = v
+    if not set_clauses:
+        return
+    set_clauses.append("updated_at = NOW()")
     with engine.begin() as conn:
         conn.execute(
-            text("DELETE FROM public.dim_raw_material_manual_alloc WHERE id = :id"),
+            text(f"UPDATE stg_raw_material_consumption SET {', '.join(set_clauses)} WHERE id = :id"),
+            params
+        )
+
+
+def delete_consumption(engine, row_id: int):
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM stg_raw_material_consumption WHERE id = :id"),
             {"id": row_id}
+        )
+
+
+def find_wip_release_candidates(engine) -> pd.DataFrame:
+    """WIP entries whose program has since shown up in PSD with a
+    contract_completion_date >= the consumption period start. The
+    earliest such PSD month is the candidate release period."""
+    return pd.read_sql(
+        """
+        WITH wip_open AS (
+            SELECT id, period, customer_program
+            FROM stg_raw_material_consumption
+            WHERE allocation_type = 'wip'
+              AND wip_released_period IS NULL
+        )
+        SELECT
+            wo.id,
+            wo.period AS consumption_period,
+            wo.customer_program,
+            TO_CHAR(MIN(psd.contract_completion_date::date), 'YYYY-MM') AS candidate_release_period
+        FROM wip_open wo
+        JOIN stg_product_service_detail psd
+          ON psd.customer_full_name = wo.customer_program
+         AND psd.contract_completion_date::date >= (wo.period || '-01')::date
+        GROUP BY wo.id, wo.period, wo.customer_program
+        """,
+        engine,
+    )
+
+
+def release_wip(engine, row_id: int, release_period: str, reviewer: str = ''):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                UPDATE stg_raw_material_consumption
+                SET wip_released_period = :rp,
+                    review_status = 'reviewed',
+                    reviewer_name = COALESCE(NULLIF(:rev, ''), reviewer_name),
+                    updated_at = NOW()
+                WHERE id = :id
+                  AND allocation_type = 'wip'
+                  AND wip_released_period IS NULL
+            """),
+            {"rp": release_period, "rev": reviewer, "id": row_id}
         )
 
 
@@ -134,191 +360,558 @@ def refresh_mvs(engine):
         conn.execute(text("REFRESH MATERIALIZED VIEW mv_program_profitability"))
 
 
-def render():
-    st.title("Raw Material Cost")
+# =============================================================
+# Tab renderers
+# =============================================================
 
-    engine = get_engine()
-
-    tab_invoice, tab_manual = st.tabs(["Invoice Detail", "Manual Allocations"])
-
-    # ── Tab 1: Invoice Detail ───────────────────────────────────────────────
-    with tab_invoice:
-        col_start, col_end = st.columns(2)
-        with col_start:
-            start_date = st.date_input(
-                "Accrual period start",
-                value=pd.Timestamp.today().replace(day=1),
-                key="raw_start",
-            )
-        with col_end:
-            default_end = pd.Timestamp.today().replace(day=1) + pd.DateOffset(months=1)
-            end_date = st.date_input(
-                "Accrual period end (exclusive)",
-                value=default_end,
-                key="raw_end",
-            )
-
-        if st.button("Run", key="btn_raw_run"):
-            with st.spinner("Querying..."):
-                df = load_raw_goods(engine, str(start_date), str(end_date))
-
-            if df.empty:
-                st.warning("No data found for that period.")
-            else:
-                detail = df[df["sort_order"] == 0].drop(columns=["sort_order"])
-                total  = df[df["sort_order"] == 1].drop(columns=["sort_order", "invoice_num", "contract_completion_date"])
-
-                detail["margin_pct"] = (
-                    (detail["total_revenue"] - detail["raw_goods_cost"])
-                    / detail["total_revenue"] * 100
-                )
-
-                if not total.empty:
-                    t = total.iloc[0]
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Total Revenue",       f"${t['total_revenue']:,.2f}")
-                    c2.metric("Total Raw Goods Cost", f"${t['raw_goods_cost']:,.2f}")
-                    c3.metric("Gross Margin",         f"${t['total_revenue'] - t['raw_goods_cost']:,.2f}")
-
-                st.divider()
-
-                st.dataframe(
-                    detail[["customer", "invoice_num", "contract_completion_date",
-                             "total_revenue", "raw_goods_cost", "margin_pct"]],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "customer":                 st.column_config.TextColumn("Customer"),
-                        "invoice_num":              st.column_config.TextColumn("Invoice #"),
-                        "contract_completion_date": st.column_config.DateColumn("Completion Date", format="YYYY-MM-DD"),
-                        "total_revenue":            st.column_config.NumberColumn("Revenue",        format="$%.2f"),
-                        "raw_goods_cost":           st.column_config.NumberColumn("Raw Goods Cost", format="$%.2f"),
-                        "margin_pct":               st.column_config.NumberColumn("Margin %",       format="%.1f%%"),
-                    },
-                )
-
-    # ── Tab 2: Manual Allocations ───────────────────────────────────────────
-    with tab_manual:
-        st.caption(
-            "Manually allocate raw material costs (e.g. BOPP film consumption JEs) "
-            "to specific programs by period. Entries flow into mv_raw_materials_by_program."
+def _render_invoice_detail(engine):
+    col_start, col_end = st.columns(2)
+    with col_start:
+        start_date = st.date_input(
+            "Accrual period start",
+            value=pd.Timestamp.today().replace(day=1),
+            key="raw_start",
+        )
+    with col_end:
+        default_end = pd.Timestamp.today().replace(day=1) + pd.DateOffset(months=1)
+        end_date = st.date_input(
+            "Accrual period end (exclusive)",
+            value=default_end,
+            key="raw_end",
         )
 
-        df_alloc = load_allocs(engine)
-        programs  = load_programs(engine)
-        parent_map = load_parent_map(engine)
+    if not st.button("Run", key="btn_raw_run"):
+        return
 
-        if not df_alloc.empty:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total entries",    len(df_alloc))
-            col2.metric("Total allocated",  f"${df_alloc['amount'].sum():,.2f}")
-            col3.metric("Periods covered",  df_alloc["period"].nunique())
+    with st.spinner("Querying..."):
+        df = load_raw_goods(engine, str(start_date), str(end_date))
 
-            period_filter = st.selectbox(
-                "Filter by period",
-                ["All"] + sorted(df_alloc["period"].unique().tolist(), reverse=True),
-                key="manual_period_filter",
-            )
-            display = df_alloc if period_filter == "All" else df_alloc[df_alloc["period"] == period_filter]
-            display = display.copy()
-            display["amount"] = display["amount"].apply(lambda x: f"${x:,.2f}")
-            st.dataframe(display.drop(columns=["id"]), use_container_width=True, hide_index=True)
+    if df.empty:
+        st.warning("No data found for that period.")
+        return
+
+    detail = df[df["sort_order"] == 0].drop(columns=["sort_order"])
+    total = df[df["sort_order"] == 1].drop(columns=["sort_order", "invoice_num", "contract_completion_date"])
+
+    detail["margin_pct"] = (
+        (detail["total_revenue"] - detail["raw_goods_cost"]) / detail["total_revenue"] * 100
+    )
+
+    if not total.empty:
+        t = total.iloc[0]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Revenue", f"${t['total_revenue']:,.2f}")
+        c2.metric("Total Raw Goods Cost", f"${t['raw_goods_cost']:,.2f}")
+        c3.metric("Gross Margin", f"${t['total_revenue'] - t['raw_goods_cost']:,.2f}")
+
+    st.divider()
+    st.dataframe(
+        detail[["customer", "invoice_num", "contract_completion_date",
+                "total_revenue", "raw_goods_cost", "margin_pct"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "customer":                 st.column_config.TextColumn("Customer"),
+            "invoice_num":              st.column_config.TextColumn("Invoice #"),
+            "contract_completion_date": st.column_config.DateColumn("Completion Date", format="YYYY-MM-DD"),
+            "total_revenue":            st.column_config.NumberColumn("Revenue",        format="$%.2f"),
+            "raw_goods_cost":           st.column_config.NumberColumn("Raw Goods Cost", format="$%.2f"),
+            "margin_pct":               st.column_config.NumberColumn("Margin %",       format="%.1f%%"),
+        },
+    )
+
+
+def _render_film_specs(engine):
+    st.subheader("BOPP cost per kg")
+
+    current_cost = load_cost(engine)
+
+    col_cost, col_save_cost = st.columns([3, 1])
+    with col_cost:
+        new_cost = st.number_input(
+            "Cost per kg (USD)",
+            value=float(current_cost),
+            min_value=0.0,
+            step=0.01,
+            format="%.4f",
+            key="bopp_cost_input",
+        )
+    with col_save_cost:
+        st.markdown("&nbsp;", unsafe_allow_html=True)
+        if st.button("Save cost", key="save_bopp_cost", use_container_width=True):
+            set_cost(engine, float(new_cost))
+            st.success(f"Saved: ${new_cost:.4f}/kg")
+            st.rerun()
+
+    st.caption(
+        "Snapshotted into each consumption entry at entry time. Updates here "
+        "do not retroactively change past consumption."
+    )
+
+    st.divider()
+    st.subheader("Size to roll weight")
+
+    specs = load_specs(engine)
+    cost_for_display = float(new_cost)
+
+    rows = []
+    for _, row in specs.iterrows():
+        size = float(row['size_numeric'])
+        if pd.notna(row['roll_weight_lbs']):
+            weight = float(row['roll_weight_lbs'])
+            source = 'set'
         else:
-            st.info("No manual allocations yet.")
+            interp = _interpolate_weight(size, specs)
+            if interp is None:
+                rows.append({
+                    'Size': size,
+                    'Weight (lbs)': None,
+                    'Source': 'NEEDS WEIGHT',
+                    'Weight (kg)': None,
+                    'Cost/roll': None,
+                    'Notes': row['notes'] or '',
+                })
+                continue
+            weight = interp
+            source = 'interpolated'
 
-        st.subheader("Raw Goods Journal Entries")
+        weight_kg = weight * LBS_TO_KG
+        rows.append({
+            'Size': size,
+            'Weight (lbs)': round(weight, 2),
+            'Source': source,
+            'Weight (kg)': round(weight_kg, 3),
+            'Cost/roll': round(weight_kg * cost_for_display, 4),
+            'Notes': row['notes'] or '',
+        })
 
-        je_period = st.text_input("Period to inspect (YYYY-MM)", value="2026-02", key="je_period")
+    display_df = pd.DataFrame(rows)
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            'Size':         st.column_config.NumberColumn('Size', format="%.1f"),
+            'Weight (lbs)': st.column_config.NumberColumn('Weight (lbs)', format="%.2f"),
+            'Source':       st.column_config.TextColumn('Source', width='small'),
+            'Weight (kg)':  st.column_config.NumberColumn('Weight (kg)', format="%.3f"),
+            'Cost/roll':    st.column_config.NumberColumn('Cost/roll', format="$%.4f"),
+            'Notes':        st.column_config.TextColumn('Notes'),
+        },
+    )
 
-        if st.button("Load JEs", key="btn_load_jes"):
-            df_jes = pd.read_sql(
-                text("""
-                    SELECT num, txn_type, account_name, amount, description
-                    FROM clean_qbo_transaction_splits_flat
-                    WHERE chunk_month = :period
-                    AND txn_type = 'Journal Entry'
-                    AND (LOWER(account_name) LIKE '%raw goods%'
-                    OR LOWER(account_name) LIKE '%50100%')
-                    ORDER BY amount DESC
-                """),
-                engine,
-                params={"period": je_period}
-            )
-            if df_jes.empty:
-                st.info("No raw goods journal entries found for this period.")
-            else:
-                st.metric("Total JE amount", f"${df_jes['amount'].sum():,.2f}")
-                st.dataframe(df_jes, use_container_width=True, hide_index=True)
+    needs = display_df[display_df['Source'] == 'NEEDS WEIGHT']
+    if not needs.empty:
+        st.warning(
+            f"{len(needs)} size(s) have no weight and no neighbors to "
+            "interpolate from. Add weights for surrounding sizes or enter "
+            "a weight for the affected sizes directly below."
+        )
 
-        st.divider()
-        st.subheader("Add entry")
-
-        with st.form("form_add_alloc"):
+    st.divider()
+    with st.expander("Add or edit a size", expanded=False):
+        with st.form("form_spec_upsert"):
             c1, c2 = st.columns(2)
             with c1:
-                new_period = st.text_input("Period (YYYY-MM)", placeholder="2026-02")
+                spec_size = st.number_input("Size", min_value=0.0, step=0.5, format="%.1f")
             with c2:
-                new_program = st.selectbox("Program", programs, key="add_program_sel")
+                spec_weight = st.number_input(
+                    "Weight (lbs)",
+                    min_value=0.0,
+                    step=0.1,
+                    format="%.2f",
+                    help="Enter 0 to store NULL (interpolate at use time).",
+                )
+            spec_notes = st.text_input("Notes (optional)")
 
-            new_parent = parent_map.get(new_program, "")
-            st.caption(f"Parent: {new_parent}")
+            c_save, c_del = st.columns(2)
+            saved = c_save.form_submit_button("Save")
+            deleted = c_del.form_submit_button("Delete this size", type="secondary")
 
-            new_amount = st.number_input("Amount", min_value=0.0, step=0.01, format="%.2f")
-            new_notes  = st.text_input("Notes (e.g. BOPP film Feb consumption JE)")
+            if saved:
+                wt_to_store = spec_weight if spec_weight > 0 else None
+                upsert_spec(engine, spec_size, wt_to_store, spec_notes)
+                st.success(
+                    f"Saved: size {spec_size} -> "
+                    f"{wt_to_store if wt_to_store else 'NULL (interpolate)'}"
+                )
+                st.rerun()
+            if deleted:
+                delete_spec(engine, spec_size)
+                st.warning(f"Deleted size {spec_size}.")
+                st.rerun()
 
-            if st.form_submit_button("Save"):
-                if not new_period or not new_program or new_amount == 0:
-                    st.error("Period, program and amount are required.")
+
+def _render_consumption(engine):
+    st.subheader("Consumption period")
+
+    period = st.text_input(
+        "Period (YYYY-MM)",
+        value=pd.Timestamp.today().strftime("%Y-%m"),
+        key="cons_period",
+    )
+    try:
+        pd.to_datetime(period + "-01")
+    except Exception:
+        st.error("Invalid period format. Use YYYY-MM.")
+        return
+
+    specs = load_specs(engine)
+    cost_per_kg = load_cost(engine)
+    period_programs = load_period_programs(engine, period)
+    all_programs = load_all_programs(engine)
+    parent_map = load_parent_map(engine)
+
+    period_set = set(period_programs)
+    wip_candidates = [p for p in all_programs if p not in period_set]
+
+    st.caption(
+        f"Cost/kg: ${cost_per_kg:.4f}  ·  "
+        f"In-period programs: {len(period_set)}  ·  "
+        f"Other known programs: {len(wip_candidates)}"
+    )
+
+    st.divider()
+    st.subheader("Add entry")
+
+    FREE_TEXT_OPT = "Other (free text)..."
+
+    with st.form("form_consumption_add", clear_on_submit=True):
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            size_options = sorted(specs['size_numeric'].astype(float).tolist())
+            picked_size = st.selectbox(
+                "Size",
+                options=size_options,
+                format_func=lambda x: f"{x:.1f}",
+            )
+        with c2:
+            rolls = st.number_input("Rolls used", min_value=0.0, step=0.5, format="%.2f")
+
+        weight_lbs_snap, is_interp = _resolve_weight(picked_size, specs)
+        if weight_lbs_snap is None:
+            st.error(
+                f"Size {picked_size} has no weight and cannot be interpolated. "
+                "Add a weight in Film Specs first."
+            )
+            cost_per_roll_preview = 0.0
+            total_preview = 0.0
+        else:
+            cost_per_roll_preview = _cost_per_roll(weight_lbs_snap, cost_per_kg)
+            total_preview = rolls * cost_per_roll_preview
+            tag = " (interpolated)" if is_interp else ""
+            st.caption(
+                f"Weight: {weight_lbs_snap:.2f} lbs/roll{tag}  ·  "
+                f"Cost: ${cost_per_roll_preview:.4f}/roll  ·  "
+                f"Total: ${total_preview:.2f}"
+            )
+
+        st.markdown("**Program**")
+        program_options = (
+            [f"[period] {p}" for p in sorted(period_programs)]
+            + [f"[wip-likely] {p}" for p in sorted(wip_candidates)]
+            + [FREE_TEXT_OPT]
+        )
+        picked_program_label = st.selectbox(
+            "Program",
+            options=program_options,
+            key="prog_picker",
+        )
+        free_text_program = ""
+        if picked_program_label == FREE_TEXT_OPT:
+            free_text_program = st.text_input("Free-text program name")
+
+        notes = st.text_input("Notes (optional)")
+
+        submitted = st.form_submit_button("Save consumption", type="primary")
+        if submitted:
+            if weight_lbs_snap is None:
+                st.error("Cannot save without a resolvable weight.")
+            elif rolls <= 0:
+                st.error("Enter a positive rolls used value.")
+            else:
+                if picked_program_label == FREE_TEXT_OPT:
+                    if not free_text_program.strip():
+                        st.error("Enter a program name.")
+                        return
+                    program = free_text_program.strip()
+                    parent = ''
+                    program_source = 'free_text'
                 else:
-                    upsert_alloc(engine, new_period, new_program, new_parent, new_amount, new_notes)
-                    st.success(f"Saved: {new_program} | {new_period} | ${new_amount:,.2f}")
-                    st.rerun()
+                    program = picked_program_label.split("] ", 1)[1]
+                    parent = parent_map.get(program, '')
+                    program_source = (
+                        'product_service_detail'
+                        if picked_program_label.startswith("[period]")
+                        else 'mv_program_profitability'
+                    )
 
-        if not df_alloc.empty:
-            st.divider()
-            st.subheader("Edit or delete")
+                new_id = add_consumption(
+                    engine, period, program, parent,
+                    float(picked_size), float(rolls),
+                    float(weight_lbs_snap), float(cost_per_kg),
+                    program_source, period_set, notes,
+                )
+                classification = "period" if program in period_set else "WIP"
+                st.success(
+                    f"Saved [{new_id}]: {rolls:.2f} rolls of size {picked_size:.1f} "
+                    f"-> {program}  ·  ${total_preview:.2f}  ·  {classification}"
+                )
+                st.rerun()
 
-            row_labels = df_alloc.apply(
-                lambda r: f"[{r['id']}] {r['period']} | {r['customer_program']} | ${r['amount']:,.2f}",
+    st.divider()
+    st.subheader(f"Entries for {period}")
+
+    consumption_df = load_consumption(engine, period)
+
+    if consumption_df.empty:
+        st.info("No consumption entries for this period yet.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entries", len(consumption_df))
+        c2.metric("Total cost", f"${consumption_df['total_cost'].sum():,.2f}")
+        c3.metric(
+            "Period / WIP",
+            f"{(consumption_df['allocation_type'] == 'period').sum()} / "
+            f"{(consumption_df['allocation_type'] == 'wip').sum()}",
+        )
+
+        display_cols = consumption_df[[
+            'id', 'customer_program', 'size_numeric', 'rolls_used',
+            'cost_per_roll_snap', 'total_cost', 'allocation_type',
+            'program_source', 'review_status', 'notes'
+        ]].copy()
+        display_cols.columns = [
+            'ID', 'Program', 'Size', 'Rolls', 'Cost/roll', 'Total',
+            'Type', 'Source', 'Review', 'Notes'
+        ]
+        st.dataframe(
+            display_cols,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'ID':        st.column_config.NumberColumn('ID', width='small'),
+                'Size':      st.column_config.NumberColumn('Size', format="%.1f"),
+                'Rolls':     st.column_config.NumberColumn('Rolls', format="%.2f"),
+                'Cost/roll': st.column_config.NumberColumn('Cost/roll', format="$%.4f"),
+                'Total':     st.column_config.NumberColumn('Total', format="$%.2f"),
+            },
+        )
+
+        with st.expander("Edit or delete an entry", expanded=False):
+            row_labels = consumption_df.apply(
+                lambda r: f"[{r['id']}] {r['customer_program']} | size {r['size_numeric']} | "
+                          f"{r['rolls_used']} rolls | ${r['total_cost']:,.2f}",
                 axis=1,
             ).tolist()
+            sel_label = st.selectbox("Select", row_labels, key="sel_cons_edit")
+            sel_idx = row_labels.index(sel_label)
+            sel_row = consumption_df.iloc[sel_idx]
 
-            sel_label = st.selectbox("Select entry", row_labels, key="sel_alloc_edit")
-            sel_idx   = row_labels.index(sel_label)
-            sel_row   = df_alloc.iloc[sel_idx]
+            edit_program = st.text_input("Program", value=sel_row['customer_program'])
+            edit_notes = st.text_input("Notes", value=sel_row['notes'] or '')
 
-            with st.form("form_edit_alloc"):
-                c1, c2 = st.columns(2)
-                with c1:
-                    edit_period = st.text_input("Period", value=sel_row["period"])
-                with c2:
-                    prog_idx    = programs.index(sel_row["customer_program"]) if sel_row["customer_program"] in programs else 0
-                    edit_program = st.selectbox("Program", programs, index=prog_idx, key="edit_program_sel")
-
-                edit_parent = parent_map.get(edit_program, sel_row["customer_parent"] or "")
-                st.caption(f"Parent: {edit_parent}")
-
-                edit_amount = st.number_input("Amount", value=float(sel_row["amount"]), step=0.01, format="%.2f")
-                edit_notes  = st.text_input("Notes", value=sel_row["notes"] or "")
-
-                c_save, c_del = st.columns(2)
-                save_clicked   = c_save.form_submit_button("Update")
-                delete_clicked = c_del.form_submit_button("Delete", type="secondary")
-
-                if save_clicked:
-                    upsert_alloc(engine, edit_period, edit_program, edit_parent,
-                                 edit_amount, edit_notes, row_id=int(sel_row["id"]))
+            c_save, c_del = st.columns(2)
+            with c_save:
+                if st.button("Update", key="btn_cons_update", use_container_width=True):
+                    update_consumption(
+                        engine, int(sel_row['id']),
+                        customer_program=edit_program,
+                        notes=edit_notes,
+                    )
                     st.success("Updated.")
                     st.rerun()
-
-                if delete_clicked:
-                    delete_alloc(engine, int(sel_row["id"]))
-                    st.warning(f"Deleted entry [{sel_row['id']}].")
+            with c_del:
+                if st.button("Delete", key="btn_cons_delete", type="secondary", use_container_width=True):
+                    delete_consumption(engine, int(sel_row['id']))
+                    st.warning(f"Deleted [{sel_row['id']}].")
                     st.rerun()
 
+    st.divider()
+    if st.button("Refresh MVs", key="refresh_cons_mvs"):
+        with st.spinner("Refreshing..."):
+            refresh_mvs(engine)
+        st.success("MVs refreshed.")
+        st.rerun()
+
+
+def _render_wip(engine):
+    st.subheader("WIP raw material — open and released")
+
+    wip_df = load_wip(engine)
+    if wip_df.empty:
+        st.info("No WIP raw material entries.")
+        return
+
+    open_mask = wip_df['wip_released_period'].isna()
+    open_df = wip_df[open_mask].copy()
+    released_df = wip_df[~open_mask].copy()
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Open WIP entries", len(open_df))
+    c2.metric("Open WIP $", f"${open_df['total_cost'].sum():,.2f}")
+    c3.metric("Released entries", len(released_df))
+
+    st.divider()
+    st.markdown("### Open WIP")
+
+    if open_df.empty:
+        st.caption("No open WIP entries.")
+    else:
+        display_open = open_df[[
+            'id', 'period', 'customer_program', 'size_numeric',
+            'rolls_used', 'total_cost', 'review_status', 'program_source', 'notes'
+        ]].copy()
+        display_open.columns = [
+            'ID', 'Consumed in', 'Program', 'Size', 'Rolls',
+            'Total', 'Review', 'Source', 'Notes'
+        ]
+        st.dataframe(
+            display_open,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'Size':  st.column_config.NumberColumn('Size', format="%.1f"),
+                'Rolls': st.column_config.NumberColumn('Rolls', format="%.2f"),
+                'Total': st.column_config.NumberColumn('Total', format="$%.2f"),
+            },
+        )
+
+        st.markdown("### Release candidates")
+        st.caption(
+            "Open WIP entries whose program has since appeared in "
+            "product_service_detail with a contract_completion_date on or after "
+            "the consumption period. The earliest such month is the candidate "
+            "release period."
+        )
+
+        candidates = find_wip_release_candidates(engine)
+        if candidates.empty:
+            st.info("No release candidates — no open WIP programs have invoiced yet.")
+        else:
+            merged = open_df[['id', 'period', 'customer_program', 'total_cost']].merge(
+                candidates[['id', 'candidate_release_period']],
+                on='id',
+                how='inner',
+            )
+            display_cand = merged.rename(columns={
+                'id': 'ID',
+                'period': 'Consumed in',
+                'customer_program': 'Program',
+                'total_cost': 'Total',
+                'candidate_release_period': 'Release to',
+            })
+            st.dataframe(
+                display_cand,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    'Total': st.column_config.NumberColumn('Total', format="$%.2f"),
+                },
+            )
+
+            if st.button(
+                f"Release all {len(merged)} candidates",
+                key="btn_release_all_wip",
+                type="primary",
+                use_container_width=True,
+            ):
+                for _, r in merged.iterrows():
+                    release_wip(engine, int(r['id']), str(r['candidate_release_period']))
+                st.success(f"Released {len(merged)} entries.")
+                st.rerun()
+
+        with st.expander("Manual override for a specific entry", expanded=False):
+            row_labels = open_df.apply(
+                lambda r: f"[{r['id']}] {r['period']} | {r['customer_program']} | ${r['total_cost']:,.2f}",
+                axis=1,
+            ).tolist()
+            sel_label = st.selectbox("Entry", row_labels, key="sel_wip_manual")
+            sel_idx = row_labels.index(sel_label)
+            sel_row = open_df.iloc[sel_idx]
+
+            override_program = st.text_input(
+                "Reclassify program (leave empty to keep current)",
+                value="",
+                key="wip_override_program",
+            )
+            override_release = st.text_input(
+                "Release to period (YYYY-MM, empty = stay open)",
+                value="",
+                key="wip_override_release",
+            )
+
+            c_apply, c_to_period = st.columns(2)
+            with c_apply:
+                if st.button("Apply overrides", key="btn_wip_apply", use_container_width=True):
+                    updates: dict = {}
+                    if override_program.strip():
+                        updates['customer_program'] = override_program.strip()
+                    if override_release.strip():
+                        try:
+                            pd.to_datetime(override_release.strip() + "-01")
+                            updates['wip_released_period'] = override_release.strip()
+                            updates['review_status'] = 'reviewed'
+                        except Exception:
+                            st.error("Invalid release period.")
+                            return
+                    if updates:
+                        update_consumption(engine, int(sel_row['id']), **updates)
+                        st.success("Updated.")
+                        st.rerun()
+            with c_to_period:
+                if st.button(
+                    "Reclassify as period cost",
+                    key="btn_wip_to_period",
+                    use_container_width=True,
+                    help="Treats this WIP entry as period cost in the consumption period. "
+                         "Use when WIP classification was wrong at entry."
+                ):
+                    update_consumption(
+                        engine, int(sel_row['id']),
+                        allocation_type='period',
+                        review_status='reviewed',
+                    )
+                    st.success("Reclassified to period.")
+                    st.rerun()
+
+    if not released_df.empty:
         st.divider()
-        if st.button("Refresh MVs", key="refresh_raw_mvs"):
-            with st.spinner("Refreshing..."):
-                refresh_mvs(engine)
-            st.success("MVs refreshed.")
-            st.rerun()
+        st.markdown("### Released WIP")
+        display_rel = released_df[[
+            'id', 'period', 'wip_released_period', 'customer_program',
+            'total_cost', 'reviewer_name', 'notes'
+        ]].copy()
+        display_rel.columns = [
+            'ID', 'Consumed in', 'Released to', 'Program', 'Total', 'Reviewer', 'Notes'
+        ]
+        st.dataframe(
+            display_rel,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'Total': st.column_config.NumberColumn('Total', format="$%.2f"),
+            },
+        )
+
+
+# =============================================================
+# Public entry
+# =============================================================
+
+def render():
+    st.title("Raw Material Cost")
+    engine = get_engine()
+
+    tab_invoice, tab_specs, tab_consumption, tab_wip = st.tabs([
+        "Invoice Detail", "Film Specs", "Consumption", "WIP",
+    ])
+
+    with tab_invoice:
+        _render_invoice_detail(engine)
+    with tab_specs:
+        _render_film_specs(engine)
+    with tab_consumption:
+        _render_consumption(engine)
+    with tab_wip:
+        _render_wip(engine)
