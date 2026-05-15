@@ -69,11 +69,9 @@ def _get_shipments_by_iso_week(period: str, include_v6: bool) -> pd.DataFrame:
             AND a.active = TRUE
         WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
           AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
-          AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
           AND s.transaction_type_raw NOT ILIKE '%return%'
           AND {ref_filter}
-          AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
-              = TO_DATE(:period, 'YYYY-MM')
+          AND s.accrual_period = :period
           AND COALESCE(a.exclude, FALSE) = FALSE
         GROUP BY 1, 2
         HAVING COUNT(DISTINCT s.transaction_id) > 0
@@ -98,10 +96,8 @@ def _get_receipts_by_iso_week(period: str, include_v6: bool) -> pd.DataFrame:
             AND a.active = TRUE
         WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
           AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
-          AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
           AND {ref_filter}
-          AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
-              = TO_DATE(:period, 'YYYY-MM')
+          AND s.accrual_period = :period
           AND COALESCE(a.exclude, FALSE) = FALSE
         GROUP BY 1, 2
         HAVING COUNT(DISTINCT s.transaction_id) > 0
@@ -157,12 +153,10 @@ def _get_receipts_period(period: str, include_v6: bool) -> pd.DataFrame:
                 LEFT JOIN dim_customer_alias a
                     ON LOWER(a.alias) = LOWER(s.customer_report_raw)
                    AND a.active = TRUE
-                WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
-                  AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
-                  AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
-                  AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
-                      = TO_DATE(:period, 'YYYY-MM')
-                GROUP BY 1, 2
+               WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
+                AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
+                AND s.accrual_period = :period
+               GROUP BY 1, 2
             ),
             advexp_pool AS (
                 SELECT COALESCE(SUM(units), 0) AS pool
@@ -259,14 +253,7 @@ def _get_container_unload_period(period: str) -> pd.DataFrame:
 
 
 def _get_ecomm_orders_period(period: str) -> pd.DataFrame:
-    """Non-v6 parcel orders scoped to elected E-Commerce programs only.
-
-    Mirrors _get_shipments_period(include_v6=False) but inner-joins
-    stg_labor_ecomm_period_config so non-elected customers (Life Time,
-    JLB, Lipton, etc.) are dropped. This is the driver for the
-    E-Commerce Picking cost center, which is distinct from the broader
-    Shipping Parcel cost center that uses the unfiltered shipments query.
-    """
+    """Non-v6 parcel orders scoped to elected E-Commerce programs only."""
     sql = text("""
         SELECT
             COALESCE(a.canonical_name, s.customer_report_raw) AS customer,
@@ -281,11 +268,9 @@ def _get_ecomm_orders_period(period: str) -> pd.DataFrame:
            AND e.active = TRUE
         WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
           AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
-          AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
           AND s.transaction_type_raw NOT ILIKE '%return%'
           AND (s.reference_no IS NULL OR s.reference_no NOT ILIKE '%v6%')
-          AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
-              = TO_DATE(:period, 'YYYY-MM')
+          AND s.accrual_period = :period
           AND COALESCE(a.exclude, FALSE) = FALSE
         GROUP BY 1
         HAVING COUNT(DISTINCT s.transaction_id) > 0

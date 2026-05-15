@@ -786,9 +786,7 @@ def get_receiving_units(period: str) -> pd.DataFrame:
             AND a.active = TRUE
         WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
           AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
-          AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
-          AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
-              = TO_DATE(:period, 'YYYY-MM')
+          AND s.accrual_period = :period
           AND COALESCE(a.exclude, FALSE) = FALSE
         GROUP BY 1
         HAVING COUNT(DISTINCT s.transaction_id) > 0
@@ -811,10 +809,8 @@ def get_shipment_units(period: str) -> pd.DataFrame:
             AND a.active = TRUE
         WHERE NULLIF(TRIM(s.customer_report_raw), '') IS NOT NULL
           AND NULLIF(TRIM(s.transaction_id),      '') IS NOT NULL
-          AND NULLIF(TRIM(s.report_start_raw),    '') IS NOT NULL
           AND s.transaction_type_raw NOT ILIKE '%return%'
-          AND DATE_TRUNC('month', TO_DATE(NULLIF(TRIM(s.report_start_raw), ''), 'MM/DD/YYYY'))
-              = TO_DATE(:period, 'YYYY-MM')
+          AND s.accrual_period = :period
           AND COALESCE(a.exclude, FALSE) = FALSE
         GROUP BY 1
         HAVING COUNT(DISTINCT s.transaction_id) > 0
