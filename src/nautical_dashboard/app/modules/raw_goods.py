@@ -195,16 +195,17 @@ def load_wip(engine) -> pd.DataFrame:
 def load_period_programs(engine, period: str) -> list[str]:
     """Programs with revenue in PSD for the period — period candidates."""
     start = f"{period}-01"
+    end = (pd.to_datetime(start) + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
     df = pd.read_sql(
         text("""
             SELECT DISTINCT customer_full_name AS customer_program
             FROM stg_product_service_detail
-            WHERE contract_completion_date::date >= :start::date
-              AND contract_completion_date::date <  (:start::date + INTERVAL '1 month')
+            WHERE contract_completion_date::date >= :start
+              AND contract_completion_date::date <  :end
             ORDER BY customer_full_name
         """),
         engine,
-        params={"start": start}
+        params={"start": start, "end": end},
     )
     return df['customer_program'].tolist()
 
