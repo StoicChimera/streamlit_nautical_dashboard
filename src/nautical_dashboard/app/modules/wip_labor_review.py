@@ -216,18 +216,25 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
         return
 
     # =============================================================
-    # MULTI MODE — virtualized data_editor with Select checkbox column
+    # MULTI MODE — st.dataframe with native multi-row selection.
     #
-    # Why data_editor instead of st.dataframe:
-    #   st.dataframe stores selection as positional row indices, which
-    #   become stale the moment the underlying data changes (search box,
-    #   filter radio, etc.). That caused selections to disappear when
-    #   the user typed a new search term.
+    # Was using st.data_editor with a Select checkbox column. That
+    # had a bug where the widget would drop the in-flight click any
+    # time the underlying DataFrame was rebuilt with a different
+    # Select column population (which we did on every render to
+    # reflect bulk_set_key). User-visible symptom: every selection
+    # after the first needed two clicks to stick, and sort reset to
+    # employee name on each click.
     #
-    #   data_editor's checkbox column is bidirectional — we pre-populate
-    #   Select=True for any row whose Employee is already in bulk_set_key,
-    #   so prior selections stay visually checked across any filter change.
-    #   Sync writes back the Select column merged with off-screen names.
+    # st.dataframe with selection_mode='multi-row' keeps selection
+    # inside the widget itself, so our state machine isn't fighting
+    # it. Sort persists because display_df is stable across renders.
+    #
+    # Sync model: delta-based. We track what the dataframe SHOWED
+    # selected last render. Any change since then is a user-driven
+    # click — added or removed. This lets programmatic additions
+    # (the "Select all visible" button) survive subsequent renders
+    # instead of getting wiped by an empty dataframe selection.
     # =============================================================
     if multi:
         is_reviewed = df['reviewed'].fillna(False) == True
@@ -236,8 +243,6 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
 
         prior_selected = st.session_state.get(bulk_set_key, set())
 
-        # Caption uses a placeholder so we can update the count AFTER syncing
-        # the data_editor result back into bulk_set_key on this same render.
         caption_slot = st.empty()
 
         if unreviewed.empty:
@@ -254,24 +259,21 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
             return
 
         df_key = _emp_dataframe_key(period, labor_source)
+        last_visible_key = f"last_visible_selected_{period}_{labor_source}"
 
-        # When the filter changes, the data_editor's widget-state deltas are
-        # keyed against the OLD data and would apply to wrong rows of the
-        # new data. Reset the widget state on filter change. bulk_set_key
-        # is preserved separately and re-pre-populates the Select column
-        # from prior_selected, so user-visible selections survive.
+        # Reset widget state on filter change. Prior selections are
+        # preserved in bulk_set_key (off-screen retention); only the
+        # dataframe's transient widget state needs to drop.
         filter_sig = f"{search_term}|{filter_choice}"
         sig_key = f"emp_filter_sig_{period}_{labor_source}"
         if st.session_state.get(sig_key) != filter_sig:
-            if df_key in st.session_state:
-                del st.session_state[df_key]
+            for k in (df_key, last_visible_key):
+                if k in st.session_state:
+                    del st.session_state[k]
             st.session_state[sig_key] = filter_sig
 
-        # Pre-populate Select column from bulk_set_key — this is what makes
-        # selections survive search changes. Any employee in bulk_set_key
-        # who is also in the current filtered view will render checked.
+        # No Select column. Native multi-row selection handles it.
         display_df = pd.DataFrame({
-            'Select':   unreviewed['employee_name'].isin(prior_selected).values,
             'Employee': unreviewed['employee_name'].values,
             'Type':     unreviewed['is_new_employee']
                             .fillna(False)
@@ -284,15 +286,15 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
             ],
         })
 
-        edited_df = st.data_editor(
+        event = st.dataframe(
             display_df,
             use_container_width=True,
             height=520,
             hide_index=True,
+            on_select='rerun',
+            selection_mode='multi-row',
             key=df_key,
-            disabled=['Employee', 'Type', 'UKG Role', 'Cost'],  # only Select is editable
             column_config={
-                'Select':   st.column_config.CheckboxColumn('Select', default=False, width='small'),
                 'Employee': st.column_config.TextColumn('Employee', width='medium'),
                 'Type':     st.column_config.TextColumn('Type', width='small'),
                 'UKG Role': st.column_config.TextColumn('UKG Role'),
@@ -300,39 +302,81 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
             },
         )
 
-        # Sync edited_df back to bulk_set_key with off-screen merge:
-        #   - For currently visible rows, the Select column is authoritative
-        #     (user can check/uncheck).
-        #   - For names previously selected but filtered out of the current
-        #     view (off-screen), preserve them in bulk_set_key. This is
-        #     why typing a search no longer drops your prior selections.
-        visible_names = set(unreviewed['employee_name'].astype(str))
-        visible_selected = set(edited_df[edited_df['Select']]['Employee'].astype(str))
-        preserved_offscreen = prior_selected - visible_names
-        st.session_state[bulk_set_key] = preserved_offscreen | visible_selected
+        selected_idx: list = []
+        if event is not None and getattr(event, 'selection', None) is not None:
+            selected_idx = list(getattr(event.selection, 'rows', []) or [])
 
-        # Now we can update the caption with the current accurate count.
-        n_after = len(st.session_state[bulk_set_key])
-        caption_slot.caption(
-            f"Showing {len(unreviewed)} unreviewed of {len(employees)} total  "
-            f"·  **{n_after}** selected"
-            + (f"  ·  {n_approved_in_filter} approved hidden" if n_approved_in_filter else "")
+        visible_selected = (
+            set(unreviewed.iloc[selected_idx]['employee_name'].astype(str))
+            if selected_idx else set()
         )
 
-        # Clear button — resets both bulk_set_key and the editor widget.
-        if n_after:
-            if st.button(
+        # Delta-based sync. Compare current dataframe selection
+        # against what it had last render. Net add/remove apply to
+        # the persistent batch (bulk_set_key). "Select all visible"
+        # adds names directly to bulk_set_key without touching
+        # dataframe selection — those won't show as highlighted
+        # rows but stay counted in the batch.
+        last_visible_selected = st.session_state.get(last_visible_key, set())
+        added = visible_selected - last_visible_selected
+        removed = last_visible_selected - visible_selected
+
+        new_batch = (prior_selected | added) - removed
+        st.session_state[bulk_set_key] = new_batch
+        st.session_state[last_visible_key] = visible_selected
+
+        visible_names = set(unreviewed['employee_name'].astype(str))
+        preserved_offscreen = new_batch - visible_names
+        n_after = len(new_batch)
+
+        cap = (
+            f"Showing {len(unreviewed)} unreviewed of {len(employees)} total  "
+            f"·  **{n_after}** selected"
+        )
+        if n_approved_in_filter:
+            cap += f"  ·  {n_approved_in_filter} approved hidden"
+        if preserved_offscreen:
+            cap += f"  ·  {len(preserved_offscreen)} off-screen retained"
+        caption_slot.caption(cap)
+
+        # Action buttons row
+        not_yet_batched = visible_names - new_batch
+        col_select_all, col_clear = st.columns(2)
+
+        with col_select_all:
+            if not_yet_batched and st.button(
+                f"Select all {len(not_yet_batched)} visible",
+                key=f"select_all_visible_btn_{period}_{labor_source}",
+                use_container_width=True,
+                help=(
+                    "Adds every visible row to the batch. Useful for "
+                    "knocking out a whole group at once — e.g. search "
+                    "by customer name, then click this button."
+                ),
+            ):
+                st.session_state[bulk_set_key] = new_batch | visible_names
+                st.rerun()
+
+        with col_clear:
+            if n_after and st.button(
                 f"Clear selection ({n_after})",
                 key=f"clear_sel_btn_{period}_{labor_source}",
                 use_container_width=True,
             ):
-                if df_key in st.session_state:
-                    del st.session_state[df_key]
+                for k in (df_key, last_visible_key):
+                    if k in st.session_state:
+                        del st.session_state[k]
                 st.session_state[bulk_set_key] = set()
                 st.rerun()
-        else:
+
+        if not n_after and not not_yet_batched:
+            st.caption("All visible rows are already in the batch.")
+        elif not n_after:
             st.caption(
-                "Tip: check the Select column on rows to add them to the bulk batch."
+                "Click rows to add them to the batch, or use the "
+                "Select all button above. Streamlit does not support "
+                "shift-click range select in dataframes — filter the "
+                "list first, then bulk-add."
             )
 
         return
