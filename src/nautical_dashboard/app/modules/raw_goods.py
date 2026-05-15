@@ -575,8 +575,43 @@ def _render_consumption(engine):
     st.divider()
     st.subheader("Add entry")
 
-    FREE_TEXT_OPT = "Other (free text)..."
+    # Build program metadata for source classification on save.
+    # In-period programs take priority for source tagging if a name
+    # appears in both lists.
+    program_meta: dict = {}
+    for p in period_programs:
+        program_meta[p] = ('product_service_detail', parent_map.get(p, ''))
+    for p in wip_candidates:
+        if p not in program_meta:
+            program_meta[p] = ('mv_program_profitability', parent_map.get(p, ''))
 
+    OTHER_OPT = "Other..."
+    program_options = sorted(program_meta.keys()) + [OTHER_OPT]
+
+    # Picker is OUTSIDE the form so changing it triggers a rerun.
+    # If it were inside, the conditional "Program name" text input
+    # below wouldn't render until after submit (forms only rerun on
+    # submit_button, not on widget change).
+    picked = st.selectbox(
+        "Program",
+        options=program_options,
+        key="prog_picker",
+        help=(
+            "Pick a program from the list. Choose 'Other...' to type "
+            "a program name not yet in the system — the entry will "
+            "land in WIP for review."
+        ),
+    )
+
+    other_name = ""
+    if picked == OTHER_OPT:
+        other_name = st.text_input(
+            "Program name",
+            placeholder="Type the program name",
+            key="other_program_name",
+        )
+
+    # Atomic submit for the rest of the entry
     with st.form("form_consumption_add", clear_on_submit=True):
         c1, c2 = st.columns([1, 2])
         with c1:
@@ -607,58 +642,114 @@ def _render_consumption(engine):
                 f"Total: ${total_preview:.2f}"
             )
 
-        st.markdown("**Program**")
-        program_options = (
-            [f"[period] {p}" for p in sorted(period_programs)]
-            + [f"[wip-likely] {p}" for p in sorted(wip_candidates)]
-            + [FREE_TEXT_OPT]
-        )
-        picked_program_label = st.selectbox(
-            "Program",
-            options=program_options,
-            key="prog_picker",
-        )
-        free_text_program = ""
-        if picked_program_label == FREE_TEXT_OPT:
-            free_text_program = st.text_input("Free-text program name")
-
         notes = st.text_input("Notes (optional)")
 
         submitted = st.form_submit_button("Save consumption", type="primary")
-        if submitted:
-            if weight_lbs_snap is None:
-                st.error("Cannot save without a resolvable weight.")
-            elif rolls <= 0:
-                st.error("Enter a positive rolls used value.")
-            else:
-                if picked_program_label == FREE_TEXT_OPT:
-                    if not free_text_program.strip():
-                        st.error("Enter a program name.")
-                        return
-                    program = free_text_program.strip()
-                    parent = ''
-                    program_source = 'free_text'
-                else:
-                    program = picked_program_label.split("] ", 1)[1]
-                    parent = parent_map.get(program, '')
-                    program_source = (
-                        'product_service_detail'
-                        if picked_program_label.startswith("[period]")
-                        else 'mv_program_profitability'
-                    )
 
-                new_id = add_consumption(
-                    engine, period, program, parent,
-                    float(picked_size), float(rolls),
-                    float(weight_lbs_snap), float(cost_per_kg),
-                    program_source, period_set, notes,
-                )
-                classification = "period" if program in period_set else "WIP"
-                st.success(
-                    f"Saved [{new_id}]: {rolls:.2f} rolls of size {picked_size:.1f} "
-                    f"-> {program}  ·  ${total_preview:.2f}  ·  {classification}"
-                )
-                st.rerun()
+    if submitted:
+        if weight_lbs_snap is None:
+            st.error("Cannot save without a resolvable weight.")
+        elif rolls <= 0:
+            st.error("Enter a positive rolls used value.")
+        else:
+            if picked == OTHER_OPT:
+                if not other_name.strip():
+                    st.error("Enter a program name in the 'Program name' field above.")
+                    return
+                program = other_name.strip()
+                parent = ''
+                program_source = 'free_text'
+            else:
+                program = picked
+                program_source, parent = program_meta[picked]
+
+            new_id = add_consumption(
+                engine, period, program, parent,
+                float(picked_size), float(rolls),
+                float(weight_lbs_snap), float(cost_per_kg),
+                program_source, period_set, notes,
+            )
+            classification = "period" if program in period_set else "WIP"
+            st.success(
+                f"Saved [{new_id}]: {rolls:.2f} rolls of size {picked_size:.1f} "
+                f"-> {program}  ·  ${total_preview:.2f}  ·  {classification}"
+            )
+            st.rerun()
+
+    st.divider()
+    st.subheader(f"Entries for {period}")
+
+    consumption_df = load_consumption(engine, period)
+
+    if consumption_df.empty:
+        st.info("No consumption entries for this period yet.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Entries", len(consumption_df))
+        c2.metric("Total cost", f"${consumption_df['total_cost'].sum():,.2f}")
+        c3.metric(
+            "Period / WIP",
+            f"{(consumption_df['allocation_type'] == 'period').sum()} / "
+            f"{(consumption_df['allocation_type'] == 'wip').sum()}",
+        )
+
+        display_cols = consumption_df[[
+            'id', 'customer_program', 'size_numeric', 'rolls_used',
+            'cost_per_roll_snap', 'total_cost', 'allocation_type',
+            'program_source', 'review_status', 'notes'
+        ]].copy()
+        display_cols.columns = [
+            'ID', 'Program', 'Size', 'Rolls', 'Cost/roll', 'Total',
+            'Type', 'Source', 'Review', 'Notes'
+        ]
+        st.dataframe(
+            display_cols,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'ID':        st.column_config.NumberColumn('ID', width='small'),
+                'Size':      st.column_config.NumberColumn('Size', format="%.1f"),
+                'Rolls':     st.column_config.NumberColumn('Rolls', format="%.2f"),
+                'Cost/roll': st.column_config.NumberColumn('Cost/roll', format="$%.4f"),
+                'Total':     st.column_config.NumberColumn('Total', format="$%.2f"),
+            },
+        )
+
+        with st.expander("Edit or delete an entry", expanded=False):
+            row_labels = consumption_df.apply(
+                lambda r: f"[{r['id']}] {r['customer_program']} | size {r['size_numeric']} | "
+                          f"{r['rolls_used']} rolls | ${r['total_cost']:,.2f}",
+                axis=1,
+            ).tolist()
+            sel_label = st.selectbox("Select", row_labels, key="sel_cons_edit")
+            sel_idx = row_labels.index(sel_label)
+            sel_row = consumption_df.iloc[sel_idx]
+
+            edit_program = st.text_input("Program", value=sel_row['customer_program'])
+            edit_notes = st.text_input("Notes", value=sel_row['notes'] or '')
+
+            c_save, c_del = st.columns(2)
+            with c_save:
+                if st.button("Update", key="btn_cons_update", use_container_width=True):
+                    update_consumption(
+                        engine, int(sel_row['id']),
+                        customer_program=edit_program,
+                        notes=edit_notes,
+                    )
+                    st.success("Updated.")
+                    st.rerun()
+            with c_del:
+                if st.button("Delete", key="btn_cons_delete", type="secondary", use_container_width=True):
+                    delete_consumption(engine, int(sel_row['id']))
+                    st.warning(f"Deleted [{sel_row['id']}].")
+                    st.rerun()
+
+    st.divider()
+    if st.button("Refresh MVs", key="refresh_cons_mvs"):
+        with st.spinner("Refreshing..."):
+            refresh_mvs(engine)
+        st.success("MVs refreshed.")
+        st.rerun()
 
     st.divider()
     st.subheader(f"Entries for {period}")
