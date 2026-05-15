@@ -216,19 +216,19 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
         return
 
     # =============================================================
-    # MULTI MODE — st.multiselect for picking, st.dataframe for viewing.
+    # MULTI MODE — st.data_editor with checkbox column.
     #
-    # Earlier attempts used st.data_editor (Select checkbox column)
-    # and then st.dataframe (selection_mode='multi-row'). Both lost
-    # selection state across reruns — checkbox edits got dropped by
-    # data_editor when display_df was rebuilt; dataframe selection
-    # unhighlighted on rerun and offered no API to programmatically
-    # restore it.
+    # Earlier version pre-populated the Select column from
+    # bulk_set_key on every render. That fought data_editor's
+    # internal delta state and caused the "first click deselects,
+    # second click sticks" bug — the widget's tracking of edits
+    # collided with our overwriting of the underlying column.
     #
-    # st.multiselect doesn't have either problem. Its value is plain
-    # session state, settable from outside the widget, with a search
-    # box built in. The dataframe becomes a read-only reference for
-    # cost/role context.
+    # Fix: display_df ALWAYS has Select=False. The widget's
+    # session_state[df_key] holds the deltas (edited_rows) and
+    # is the single source of truth for what's checked. We seed
+    # that state directly from bulk_set_key on filter changes,
+    # and for the Select all / Clear buttons. No more fighting.
     # =============================================================
     if multi:
         is_reviewed = df['reviewed'].fillna(False) == True
@@ -250,58 +250,85 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
             )
             return
 
-        # Build options as "Name [NEW]  —  UKG Role" so the dropdown
-        # carries enough context to pick without cross-referencing.
-        visible_names = list(unreviewed['employee_name'].astype(str))
-        option_to_name: dict = {}
-        options: list = []
-        for _, row in unreviewed.iterrows():
-            name = str(row['employee_name'])
-            role = str(row.get('ukg_role', '') or '').strip()
-            is_new = bool(row.get('is_new_employee', False))
-            tag = ' [NEW]' if is_new else ''
-            label = f"{name}{tag}  —  {role}" if role else f"{name}{tag}"
-            options.append(label)
-            option_to_name[label] = name
+        df_key = _emp_dataframe_key(period, labor_source)
 
-        ms_key = f"emp_multiselect_{period}_{labor_source}"
-
-        # On filter change, re-seed the multiselect from bulk_set_key.
-        # Anything in the batch that's also visible under the new
-        # filter shows up as already-selected. Off-screen names stay
-        # in bulk_set_key but don't render as chips.
+        # Seed editor state from bulk_set_key on filter change.
+        # Names in the batch that are visible under the current
+        # filter render as already-checked. Off-screen names stay
+        # in bulk_set_key and are preserved by the sync below.
         filter_sig = f"{search_term}|{filter_choice}"
         sig_key = f"emp_filter_sig_{period}_{labor_source}"
+
         if st.session_state.get(sig_key) != filter_sig:
-            st.session_state[ms_key] = [
-                label for label, name in option_to_name.items()
+            edited_rows = {
+                idx: {'Select': True}
+                for idx, name in enumerate(unreviewed['employee_name'])
                 if name in prior_selected
-            ]
+            }
+            st.session_state[df_key] = {
+                'edited_rows': edited_rows,
+                'added_rows': [],
+                'deleted_rows': [],
+            }
             st.session_state[sig_key] = filter_sig
 
-        selected_options = st.multiselect(
-            f"Select employees for bulk apply ({len(options)} visible)",
-            options=options,
-            key=ms_key,
-            placeholder="Type to search, click to add. Click the X on a chip to remove.",
+        # Underlying data ALWAYS has Select=False. Do not
+        # pre-populate from bulk_set_key here — that's what
+        # caused the original delta-tracking bug.
+        display_df = pd.DataFrame({
+            'Select':   [False] * len(unreviewed),
+            'Employee': unreviewed['employee_name'].values,
+            'Type':     unreviewed['is_new_employee']
+                            .fillna(False)
+                            .map({True: 'New hire', False: 'Returning'})
+                            .values,
+            'UKG Role': unreviewed.get('ukg_role', pd.Series([''] * len(unreviewed))).fillna('').values,
+            'Cost':     [
+                _dollar_or_hidden(v, show_amounts)
+                for v in unreviewed['total_labor_cost'].values
+            ],
+        })
+
+        caption_slot = st.empty()
+
+        edited_df = st.data_editor(
+            display_df,
+            use_container_width=True,
+            height=520,
+            hide_index=True,
+            key=df_key,
+            disabled=['Employee', 'Type', 'UKG Role', 'Cost'],
+            column_config={
+                'Select':   st.column_config.CheckboxColumn('Select', default=False, width='small'),
+                'Employee': st.column_config.TextColumn('Employee', width='medium'),
+                'Type':     st.column_config.TextColumn('Type', width='small'),
+                'UKG Role': st.column_config.TextColumn('UKG Role'),
+                'Cost':     st.column_config.TextColumn('Cost', width='small'),
+            },
         )
 
-        visible_selected = {option_to_name[l] for l in selected_options}
-        visible_names_set = set(visible_names)
-        preserved_offscreen = prior_selected - visible_names_set
+        # Sync: edited_df reflects widget's true state (seed + user
+        # toggles). Merge visible truth with off-screen preservation.
+        visible_names = set(unreviewed['employee_name'].astype(str))
+        visible_selected = set(edited_df[edited_df['Select']]['Employee'].astype(str))
+        preserved_offscreen = prior_selected - visible_names
         st.session_state[bulk_set_key] = preserved_offscreen | visible_selected
 
         n_after = len(st.session_state[bulk_set_key])
 
-        cap = f"**{n_after}** in batch"
-        if preserved_offscreen:
-            cap += f"  ·  {len(preserved_offscreen)} off-screen retained"
+        cap = (
+            f"Showing {len(unreviewed)} unreviewed of {len(employees)} total  "
+            f"·  **{n_after}** selected"
+        )
         if n_approved_in_filter:
             cap += f"  ·  {n_approved_in_filter} approved hidden"
-        st.caption(cap)
+        if preserved_offscreen:
+            cap += f"  ·  {len(preserved_offscreen)} off-screen retained"
+        caption_slot.caption(cap)
 
-        # Action buttons
-        not_yet_batched = visible_names_set - visible_selected
+        # Action buttons — both write directly to the editor's
+        # internal state, then rerun. No display_df manipulation.
+        not_yet_batched = visible_names - visible_selected
         col_select_all, col_clear = st.columns(2)
 
         with col_select_all:
@@ -310,44 +337,30 @@ def _render_employee_list(period: str, labor_source: str, employees: pd.DataFram
                 key=f"select_all_visible_btn_{period}_{labor_source}",
                 use_container_width=True,
                 help=(
-                    "Adds every name in the current filter view to the "
-                    "multiselect. Off-screen names from prior filters "
-                    "stay in the batch."
+                    "Checks every visible row. Off-screen names from "
+                    "prior filter views stay in the batch."
                 ),
             ):
-                st.session_state[ms_key] = options
+                st.session_state[df_key] = {
+                    'edited_rows': {i: {'Select': True} for i in range(len(unreviewed))},
+                    'added_rows': [],
+                    'deleted_rows': [],
+                }
                 st.rerun()
 
         with col_clear:
             if n_after and st.button(
-                f"Clear batch ({n_after})",
+                f"Clear selection ({n_after})",
                 key=f"clear_sel_btn_{period}_{labor_source}",
                 use_container_width=True,
             ):
-                st.session_state[ms_key] = []
+                st.session_state[df_key] = {
+                    'edited_rows': {},
+                    'added_rows': [],
+                    'deleted_rows': [],
+                }
                 st.session_state[bulk_set_key] = set()
                 st.rerun()
-
-        # Reference table — read-only, no selection. Lets the user
-        # see cost / type / role at a glance while picking from the
-        # multiselect above.
-        st.caption("Reference (read-only)")
-        display_df = pd.DataFrame({
-            'Employee': unreviewed['employee_name'].values,
-            'Type':     unreviewed['is_new_employee']
-                            .fillna(False)
-                            .map({True: 'New hire', False: 'Returning'})
-                            .values,
-            'UKG Role': unreviewed.get('ukg_role', pd.Series([''] * len(unreviewed))).fillna('').values,
-            'Cost':     [_dollar_or_hidden(v, show_amounts) for v in unreviewed['total_labor_cost'].values],
-        })
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            height=300,
-            hide_index=True,
-            key=f"ref_table_{period}_{labor_source}",
-        )
 
         return
 
