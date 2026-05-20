@@ -902,14 +902,31 @@ def _render_warehouse_wip_tab(month_start: date, reviewer: str) -> None:
                     f"·  Writes to stg_warehouse_wip_applied  "
                     f"·  MV will reflect on next refresh."
                 )
-        st.markdown("---")
+    else:
+        # Check if there's outstanding WIP at all
+        any_outstanding = get_warehouse_wip_all_periods()
+        if not any_outstanding.empty:
+            outstanding_total = float(any_outstanding["warehouse_cost"].sum())
+            st.info(
+                f"Total outstanding warehouse WIP across all periods: {_dollar(outstanding_total)}. "
+                f"None of these programs have revenue in {month_start:%Y-%m}, so nothing is "
+                "applicable right now. WIP will surface here in future periods when the "
+                "corresponding programs invoice."
+            )
+
+    st.markdown("---")
 
     # =========================================================================
     # CURRENT PERIOD WIP
     # =========================================================================
     st.markdown(
-        f'<h4 style="color:{SECTION_COLOR};">Current Period — {month_start:%Y-%m}</h4>',
-        unsafe_allow_html=True,
+    f'<h4 style="color:{SECTION_COLOR};">New WIP Generated — {month_start:%Y-%m}</h4>',
+    unsafe_allow_html=True,
+    )
+    st.caption(
+        "Warehouse cost from this period's commit that landed on programs with no "
+        "revenue this period. These amounts will sit on the balance sheet until "
+        "those programs invoice in a future period."
     )
 
     if not is_committed(month_start):
@@ -944,10 +961,14 @@ def _render_warehouse_wip_tab(month_start: date, reviewer: str) -> None:
     # =========================================================================
     # ALL PERIODS OUTSTANDING
     # =========================================================================
-    st.markdown("---")
     st.markdown(
-        f'<h4 style="color:{SECTION_COLOR};">Outstanding Warehouse WIP — All Periods</h4>',
-        unsafe_allow_html=True,
+    f'<h4 style="color:{SECTION_COLOR};">Outstanding Warehouse WIP Balance — All Periods</h4>',
+    unsafe_allow_html=True,
+    )
+    st.caption(
+        "Total unapplied warehouse WIP across all periods. "
+        "A row stays here until its program has revenue in some future period, "
+        "at which point it surfaces above as applicable to that period."
     )
 
     all_wip = get_warehouse_wip_all_periods()
