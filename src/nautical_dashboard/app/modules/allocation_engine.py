@@ -1184,10 +1184,6 @@ def get_warehouse_wip(month_start: date) -> pd.DataFrame:
 
 
 def get_prior_warehouse_wip_applicable(month_start: date) -> pd.DataFrame:
-    """
-    Prior period warehouse WIP that now has revenue in the current period
-    and has not already been applied.
-    """
     return pd.read_sql(
         text("""
             SELECT
@@ -1212,7 +1208,7 @@ def get_prior_warehouse_wip_applicable(month_start: date) -> pd.DataFrame:
               AND NOT EXISTS (
                   SELECT 1 FROM stg_warehouse_wip_applied wwa
                   WHERE wwa.accrual_period = TO_CHAR(:m, 'YYYY-MM')
-                    AND wwa.origin_period  = TO_CHAR(wa.month_start, 'YYYY-MM')
+                    AND wwa.origin_period    = wa.month_start::text
                     AND wwa.customer_program = wa.customer_program
                     AND wwa.program_bucket   = wa.program_bucket
               )
@@ -1225,7 +1221,6 @@ def get_prior_warehouse_wip_applicable(month_start: date) -> pd.DataFrame:
 
 
 def get_warehouse_wip_all_periods() -> pd.DataFrame:
-    """Outstanding warehouse WIP across all periods."""
     return pd.read_sql(
         text("""
             SELECT
@@ -1242,7 +1237,7 @@ def get_warehouse_wip_all_periods() -> pd.DataFrame:
             )
             AND NOT EXISTS (
                 SELECT 1 FROM stg_warehouse_wip_applied wwa
-                WHERE wwa.origin_period    = TO_CHAR(wa.month_start, 'YYYY-MM')
+                WHERE wwa.origin_period    = wa.month_start::text
                   AND wwa.customer_program = wa.customer_program
                   AND wwa.program_bucket   = wa.program_bucket
             )
