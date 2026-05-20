@@ -376,7 +376,7 @@ def _render_invoice_detail(engine):
     with col_end:
         default_end = pd.Timestamp.today().replace(day=1) + pd.DateOffset(months=1)
         end_date = st.date_input(
-            "Accrual period end (exclusive)",
+            "Accrual period end (1st of NEXT month — exclusive)",
             value=default_end,
             key="raw_end",
         )
@@ -763,12 +763,12 @@ def _render_by_program(engine):
     try:
         period_start = pd.to_datetime(period + "-01")
         period_end = (period_start + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
-        period_start = period_start.strftime("%Y-%m-%d")
+        period_start_str = period_start.strftime("%Y-%m-%d")
     except Exception:
         st.error("Invalid period format. Use YYYY-MM.")
         return
 
-    # Invoice-based: QBO splits joined to PSD by invoice_num
+    # Invoice-based: dedupe PSD to one row per (program, invoice) BEFORE joining costs
     invoice_df = pd.read_sql(
         text("""
             WITH invoice_costs AS (
@@ -781,10 +781,31 @@ def _render_by_program(engine):
                 WHERE LOWER(account_name) LIKE '%raw goods%'
                    OR LOWER(account_name) LIKE '%cost of goods%'
                 GROUP BY num, description, account_name
-            )
-            SELECT
-                COALESCE(
-                    a.canonical_name,
+            ),
+            invoice_programs AS (
+                SELECT
+                    COALESCE(
+                        a.canonical_name,
+                        CASE
+                            WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
+                                THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
+                            WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
+                                THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
+                            ELSE TRIM(psd.customer_full_name)
+                        END
+                    ) AS customer_program,
+                    psd.invoice_num,
+                    MIN(psd.contract_completion_date::date) AS completion_date
+                FROM stg_product_service_detail psd
+                LEFT JOIN (
+                    SELECT DISTINCT ON (LOWER(alias)) 
+                        LOWER(alias) AS alias_lower, 
+                        canonical_name,
+                        exclude
+                    FROM dim_customer_alias
+                    WHERE active = TRUE
+                    ORDER BY LOWER(alias), canonical_name
+                ) a ON a.alias_lower = LOWER(
                     CASE
                         WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
                             THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
@@ -792,32 +813,27 @@ def _render_by_program(engine):
                             THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
                         ELSE TRIM(psd.customer_full_name)
                     END
-                ) AS customer_program,
-                psd.invoice_num,
-                psd.contract_completion_date::date AS completion_date,
+                )
+                WHERE psd.contract_completion_date::date >= :start
+                  AND psd.contract_completion_date::date <  :end
+                  AND COALESCE(a.exclude, FALSE) = FALSE
+                GROUP BY 1, 2
+            )
+            SELECT
+                ip.customer_program,
+                ip.invoice_num,
+                ip.completion_date,
                 ic.account_name,
                 ic.description,
                 ic.cost
-            FROM stg_product_service_detail psd
-            JOIN invoice_costs ic ON ic.invoice_num = psd.invoice_num
-            LEFT JOIN dim_customer_alias a ON LOWER(a.alias) = LOWER(
-                CASE
-                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
-                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
-                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
-                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
-                    ELSE TRIM(psd.customer_full_name)
-                END
-            ) AND a.active = TRUE
-            WHERE psd.contract_completion_date::date >= :start
-              AND psd.contract_completion_date::date <  :end
-              AND COALESCE(a.exclude, FALSE) = FALSE
+            FROM invoice_programs ip
+            JOIN invoice_costs ic ON ic.invoice_num = ip.invoice_num
         """),
         engine,
-        params={"start": period_start, "end": period_end},
+        params={"start": period_start_str, "end": period_end},
     )
 
-    # Manual consumption: stg_raw_material_consumption
+    # Manual consumption — unchanged
     manual_df = pd.read_sql(
         text("""
             SELECT
@@ -829,9 +845,7 @@ def _render_by_program(engine):
                 notes,
                 created_at
             FROM stg_raw_material_consumption
-            WHERE allocation_type = 'period'
-               OR (allocation_type = 'wip' AND wip_released_period IS NOT NULL)
-            AND (
+            WHERE (
                 (allocation_type = 'period' AND period = :period)
                 OR (allocation_type = 'wip' AND wip_released_period = :period)
             )
