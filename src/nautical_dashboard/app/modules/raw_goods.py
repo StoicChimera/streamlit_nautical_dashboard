@@ -546,16 +546,42 @@ def _render_film_specs(engine):
 def _render_consumption(engine):
     st.subheader("Consumption period")
 
-    period = st.text_input(
-        "Period (YYYY-MM)",
-        value=pd.Timestamp.today().strftime("%Y-%m"),
-        key="cons_period",
+    # Pull periods that have any raw goods activity (invoice-based or manual)
+    periods_df = pd.read_sql(
+        text("""
+            SELECT DISTINCT period FROM (
+                SELECT TO_CHAR(psd.contract_completion_date::date, 'YYYY-MM') AS period
+                FROM stg_product_service_detail psd
+                JOIN clean_qbo_transaction_splits_flat tx ON tx.num = psd.invoice_num
+                WHERE psd.contract_completion_date IS NOT NULL
+                AND (LOWER(tx.account_name) LIKE '%raw goods%' 
+                    OR LOWER(tx.account_name) LIKE '%cost of goods%')
+                UNION
+                SELECT period FROM stg_raw_material_consumption
+                WHERE period IS NOT NULL
+            ) p
+            ORDER BY period DESC
+        """),
+        engine,
     )
-    try:
-        pd.to_datetime(period + "-01")
-    except Exception:
-        st.error("Invalid period format. Use YYYY-MM.")
+    available_periods = periods_df["period"].tolist()
+
+    if not available_periods:
+        st.warning("No raw goods data found.")
         return
+
+    current_month = pd.Timestamp.today().strftime("%Y-%m")
+    default_idx = available_periods.index(current_month) if current_month in available_periods else 0
+
+    period = st.selectbox(
+        "Period",
+        options=available_periods,
+        index=default_idx,
+        key="by_program_period",
+    )
+    period_start = pd.to_datetime(period + "-01")
+    period_end = (period_start + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
+    period_start_str = period_start.strftime("%Y-%m-%d")
 
     specs = load_specs(engine)
     cost_per_kg = load_cost(engine)
