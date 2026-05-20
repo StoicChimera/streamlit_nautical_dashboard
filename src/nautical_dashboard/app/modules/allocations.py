@@ -791,10 +791,24 @@ def _render_committed_results(month_start: date) -> None:
             )
 
     # Unlock
-    st.markdown("---")
-    if st.button("Unlock and Recommit", key="btn_unlock_wh", type="secondary"):
-        unlock_allocation(month_start)
-        st.rerun()
+    period_str = month_start.strftime("%Y-%m")
+    applied_count = pd.read_sql(
+        text("SELECT COUNT(*) AS n FROM stg_warehouse_wip_applied WHERE accrual_period = :p"),
+        engine, params={"p": period_str},
+    )["n"].iloc[0]
+
+    unlock_warning = (
+        f"This will clear the committed allocation AND {int(applied_count)} "
+        f"prior-period WIP application(s) that were applied to {period_str}."
+        if applied_count > 0
+        else "This will clear the committed allocation."
+    )
+
+    with st.expander("Unlock and Recommit", expanded=False):
+        st.warning(unlock_warning)
+        if st.button("Confirm Unlock", key="btn_unlock_wh_confirm", type="secondary"):
+            unlock_allocation(month_start)
+            _bust_cache_and_rerun()
 
 
 def _render_warehouse_wip_tab(month_start: date, reviewer: str) -> None:

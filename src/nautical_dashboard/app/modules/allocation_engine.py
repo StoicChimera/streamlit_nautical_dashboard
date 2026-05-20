@@ -1150,10 +1150,18 @@ def is_committed(month_start: date) -> bool:
 
 
 def unlock_allocation(month_start: date) -> None:
+    period = _period(month_start)
     with engine.begin() as conn:
         conn.execute(
             text("DELETE FROM stg_warehouse_allocation WHERE month_start = :m"),
             {"m": month_start},
+        )
+        # Also clear any WIP applications written FOR this period (current period
+        # consuming prior WIP). These were tied to this period's commit and
+        # should not survive an unlock.
+        conn.execute(
+            text("DELETE FROM stg_warehouse_wip_applied WHERE accrual_period = :p"),
+            {"p": period},
         )
 
 
@@ -1194,7 +1202,7 @@ def get_prior_warehouse_wip_applicable(month_start: date) -> pd.DataFrame:
                 wa.cost_type,
                 SUM(wa.allocation_amount)                     AS warehouse_cost
             FROM stg_warehouse_allocation wa
-            WHERE wa.month_start != :m
+            WHERE wa.month_start < :m
               AND NOT EXISTS (
                   SELECT 1 FROM mv_program_profitability mv
                   WHERE mv.month_start = wa.month_start
