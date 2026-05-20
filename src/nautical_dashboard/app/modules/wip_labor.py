@@ -3162,7 +3162,7 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
     # =========================================================================
     # NOTHING TO ALLOCATE GUARD
     # =========================================================================
-    if cogs_alloc.empty and sga_alloc.empty:
+    if employee_alloc_df.empty:
         st.info("No approved labor to allocate for this period.")
         return
 
