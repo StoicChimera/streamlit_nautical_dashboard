@@ -29,6 +29,7 @@ from nautical_dashboard.app.modules import auth
 
 from nautical_dashboard.app.modules.allocation_engine import (
     ALL_BUCKETS,
+    _consolidate_program,
     copy_sqft_forward,
     get_committed_allocation,
     get_prior_warehouse_wip_applicable,
@@ -409,7 +410,7 @@ def _compute_direct_footprint_rows(
         amount = round(total_wh_cost * pct, 2)
         rows.append({
             "month_start":       month_start,
-            "customer_program":  str(r["program_name"]),
+            "customer_program":  _consolidate_program(str(r["program_name"])),
             "program_bucket":    f"Direct - {r['category']}",
             "category":          str(r["category"]),
             "cost_type":         "cogs",

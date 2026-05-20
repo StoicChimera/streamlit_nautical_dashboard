@@ -65,6 +65,42 @@ if not _CONN:
 
 engine = create_engine(_CONN, pool_pre_ping=True)
 
+
+# =====================================================
+# Program name consolidation
+# Must match the WHEN logic in mv_program_profitability.
+# Applied to every customer name before writing allocation rows.
+# =====================================================
+
+def _consolidate_program(name: str) -> str:
+    if not name:
+        return name
+    n = str(name).strip()
+    nl = n.lower()
+
+    # Recess
+    if nl.startswith("recess") or "recess-" in nl:
+        return "Recess"
+
+    # Arrived Co
+    if "arrived co" in nl or "arrco-" in nl:
+        return "Arrived Co"
+
+    # Advanced Media Technologies rollup
+    if n in (
+        "Advanced Media Technologies",
+        "SMARTLOCK - Advanced Media Technology",
+        "Plume - Advanced Media Technology",
+    ):
+        return "Advanced Media Technologies"
+
+    # LogIQ rollup
+    if n in ("LogIQ", "LogIQ Sage"):
+        return "LogIQ"
+
+    return n
+
+
 # =====================================================
 # Bucket definitions
 # =====================================================
@@ -897,19 +933,10 @@ def _get_ecomm_shipments(period: str) -> pd.DataFrame:
 # =====================================================
 
 def _allocate_units(
-    driver_df: pd.DataFrame,
-    bucket_cost: float,
-    bucket_name: str,
-    category: str,
-    cost_type: str,
-    driver_label: str,
-    bucket_sqft: float,
-    total_sqft: float,
-    total_wh_cost: float,
-    committed_by: str,
-    committed_at: str,
-    month_start: date,
-) -> list[dict]:
+    driver_df, bucket_cost, bucket_name, category, cost_type,
+    driver_label, bucket_sqft, total_sqft, total_wh_cost,
+    committed_by, committed_at, month_start,
+):
     rows = []
     if driver_df.empty or driver_df["units"].sum() == 0:
         return rows
@@ -919,6 +946,10 @@ def _allocate_units(
     driver_df = driver_df[driver_df["units"] > 0].copy()
     if driver_df.empty:
         return rows
+
+    # Consolidate program names BEFORE computing weights so rollups share weight
+    driver_df["customer"] = driver_df["customer"].apply(_consolidate_program)
+    driver_df = driver_df.groupby("customer", as_index=False)["units"].sum()
 
     total_units = float(driver_df["units"].sum())
 
@@ -948,18 +979,10 @@ def _allocate_units(
 
 
 def _allocate_revenue(
-    revenue_df: pd.DataFrame,
-    bucket_cost: float,
-    bucket_name: str,
-    category: str,
-    cost_type: str,
-    bucket_sqft: float,
-    total_sqft: float,
-    total_wh_cost: float,
-    committed_by: str,
-    committed_at: str,
-    month_start: date,
-) -> list[dict]:
+    revenue_df, bucket_cost, bucket_name, category, cost_type,
+    bucket_sqft, total_sqft, total_wh_cost,
+    committed_by, committed_at, month_start,
+):
     rows = []
     if revenue_df.empty:
         return rows
@@ -969,6 +992,10 @@ def _allocate_revenue(
     df = df[df["revenue"] > 0].copy()
     if df.empty:
         return rows
+
+    # Consolidate before computing weights
+    df["customer_program"] = df["customer_program"].apply(_consolidate_program)
+    df = df.groupby("customer_program", as_index=False)["revenue"].sum()
 
     total_rev = float(df["revenue"].sum())
 
