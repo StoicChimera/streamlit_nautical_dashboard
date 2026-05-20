@@ -922,7 +922,7 @@ def _render_by_program(engine):
                 psd.invoice_num,
                 psd.contract_completion_date::date AS completion_date,
                 psd.product_service,
-                psd.description,
+                psd.line_description AS description,
                 psd.qty,
                 psd.amount AS revenue
             FROM stg_product_service_detail psd
