@@ -185,19 +185,18 @@ def probe_manual_steps(period_start: date) -> pd.DataFrame:
             "label": "container unload entry/entries",
         },
         {
-            "id": "freight_assigned",
-            "name": "Freight assigned and approved",
+            "id": "freight_signed_off",
+            "name": "Freight reviewed and signed off",
             "category": "trigger",
             "depends_on": [],
             "sql": """
                 SELECT COUNT(*) AS n
-                FROM mv_wip_fulfillment_freight
-                WHERE match_status = 'unmatched'
-                AND bill_date < :n
+                FROM dim_freight_period_signoff
+                WHERE accrual_period = :period_str
             """,
-            "params": {"n": next_period},
-            "done_when": "no_rows",
-            "label": "unmatched freight line(s) ≤ period end",
+            "params": {"period_str": period_str},
+            "done_when": "has_rows",
+            "label": "freight sign-off recorded for period",
         },
         {
             "id": "warehouse_allocations",
@@ -224,20 +223,6 @@ def probe_manual_steps(period_start: date) -> pd.DataFrame:
             """,
             "params": {"period_str": period_str},
             "label": "labor allocation row(s) locked",
-        },
-        {
-            "id": "prior_wip_reviewed",
-            "name": "Prior period WIP reviewed",
-            "category": "dependent",
-            "depends_on": [],
-            "sql": """
-                SELECT COUNT(*) AS n
-                FROM data_source_sync_log
-                WHERE source_name = 'wip_balance_review'
-                  AND period = :prior_str
-            """,
-            "params": {"prior_str": prior_str},
-            "label": f"review marker(s) for {prior_str}",
         },
     ]
 

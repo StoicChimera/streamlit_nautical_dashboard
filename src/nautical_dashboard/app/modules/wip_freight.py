@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from . import auth
 
 load_dotenv()
 
@@ -224,6 +225,46 @@ def refresh_mv(engine):
         conn.execute(text("REFRESH MATERIALIZED VIEW mv_wip_fulfillment_freight"))
 
 
+def upsert_freight_signoff(engine, accrual_period, signed_off_by, notes,
+                            unmatched_count, unmatched_total):
+    with engine.begin() as conn:
+        conn.execute(
+            text("""
+                INSERT INTO public.dim_freight_period_signoff
+                    (accrual_period, signed_off_by, notes,
+                     unmatched_count, unmatched_total)
+                VALUES
+                    (:period, :by, :notes, :cnt, :total)
+                ON CONFLICT (accrual_period) DO UPDATE SET
+                    signed_off_by   = EXCLUDED.signed_off_by,
+                    signed_off_at   = NOW(),
+                    notes           = EXCLUDED.notes,
+                    unmatched_count = EXCLUDED.unmatched_count,
+                    unmatched_total = EXCLUDED.unmatched_total;
+            """),
+            {
+                "period": accrual_period,
+                "by":     signed_off_by,
+                "notes":  notes or None,
+                "cnt":    int(unmatched_count),
+                "total":  float(unmatched_total),
+            },
+        )
+
+
+def load_freight_signoff(engine, accrual_period: str):
+    df = pd.read_sql(
+        text("""
+            SELECT accrual_period, signed_off_by, signed_off_at,
+                   notes, unmatched_count, unmatched_total
+            FROM dim_freight_period_signoff
+            WHERE accrual_period = :period
+        """),
+        engine,
+        params={"period": accrual_period},
+    )
+    return df.iloc[0].to_dict() if not df.empty else None
+
 # ---------------------------------------------------------------------------
 # render()
 # ---------------------------------------------------------------------------
@@ -284,6 +325,60 @@ def render():
             st.rerun()
 
         df_unmatched = load_unmatched(engine)
+
+        # -----------------------------------------------------------------
+        # Period sign-off section
+        # -----------------------------------------------------------------
+        st.divider()
+        st.markdown("#### Period Sign-Off")
+        st.caption(
+            "Attest that you've reviewed all unmatched freight for a period "
+            "and accept that the remaining lines are legitimate WIP awaiting "
+            "future revenue. Required for preflight to clear."
+        )
+
+        user = auth.current_user()
+        reviewer_name = user["name"]
+
+        col_p, col_n = st.columns([2, 6])
+        with col_p:
+            signoff_period = st.date_input(
+                "Period",
+                value=date.today().replace(day=1),
+                key="freight_signoff_period",
+            )
+        with col_n:
+            signoff_notes = st.text_input(
+                "Notes (optional)",
+                key="freight_signoff_notes",
+            )
+
+        period_str = signoff_period.strftime("%Y-%m")
+        existing_signoff = load_freight_signoff(engine, period_str)
+
+        if existing_signoff:
+            st.success(
+                f"Signed off for {period_str} by **{existing_signoff['signed_off_by']}** "
+                f"at {existing_signoff['signed_off_at']}  ·  "
+                f"{existing_signoff['unmatched_count']} unmatched line(s) at sign-off  ·  "
+                f"${float(existing_signoff['unmatched_total']):,.2f} total"
+            )
+            if existing_signoff.get("notes"):
+                st.caption(f"Notes: {existing_signoff['notes']}")
+
+        if st.button("Sign Off Freight for Period", type="primary", key="btn_freight_signoff"):
+            upsert_freight_signoff(
+                engine,
+                accrual_period=period_str,
+                signed_off_by=reviewer_name,
+                notes=signoff_notes,
+                unmatched_count=len(df_unmatched),
+                unmatched_total=float(df_unmatched["amount"].sum()) if not df_unmatched.empty else 0.0,
+            )
+            st.success(f"Freight signed off for {period_str} by {reviewer_name}.")
+            st.rerun()
+
+        st.divider()
 
         if df_unmatched.empty:
             st.success("No unmatched lines — all freight is period-matched.")
