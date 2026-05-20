@@ -863,6 +863,48 @@ def _render_by_program(engine):
         params={"period": period},
     )
 
+    # Revenue per program for the period — same alias/split logic as invoice_programs
+    revenue_df = pd.read_sql(
+        text("""
+            SELECT
+                COALESCE(
+                    a.canonical_name,
+                    CASE
+                        WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
+                            THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
+                        WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
+                            THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
+                        ELSE TRIM(psd.customer_full_name)
+                    END
+                ) AS customer_program,
+                SUM(psd.amount) AS revenue
+            FROM stg_product_service_detail psd
+            LEFT JOIN (
+                SELECT DISTINCT ON (LOWER(alias))
+                    LOWER(alias) AS alias_lower,
+                    canonical_name,
+                    exclude
+                FROM dim_customer_alias
+                WHERE active = TRUE
+                ORDER BY LOWER(alias), canonical_name
+            ) a ON a.alias_lower = LOWER(
+                CASE
+                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
+                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
+                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
+                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
+                    ELSE TRIM(psd.customer_full_name)
+                END
+            )
+            WHERE psd.contract_completion_date::date >= :start
+              AND psd.contract_completion_date::date <  :end
+              AND COALESCE(a.exclude, FALSE) = FALSE
+            GROUP BY 1
+        """),
+        engine,
+        params={"start": period_start_str, "end": period_end},
+    )
+    revenue_map = dict(zip(revenue_df["customer_program"], revenue_df["revenue"])) if not revenue_df.empty else {}
     invoice_total = float(invoice_df["cost"].sum()) if not invoice_df.empty else 0.0
     manual_total  = float(manual_df["total_cost"].sum()) if not manual_df.empty else 0.0
     total         = invoice_total + manual_total
@@ -909,8 +951,11 @@ def _render_by_program(engine):
     st.markdown("---")
     st.markdown("#### Summary")
     display = summary.copy()
-    for col in ["Invoice", "Manual", "Total"]:
+    for col in ["Revenue", "Invoice", "Manual", "Cost", "Margin $"]:
         display[col] = display[col].map(lambda x: f"${x:,.2f}")
+    display["Margin %"] = display["Margin %"].map(
+        lambda x: f"{x:.1f}%" if x is not None and pd.notna(x) else "—"
+    )
     st.dataframe(display, use_container_width=True, hide_index=True)
 
     st.markdown("---")
@@ -918,7 +963,15 @@ def _render_by_program(engine):
 
     for _, row in summary.iterrows():
         prog = row["Program"]
-        with st.expander(f"**{prog}** — ${row['Total']:,.2f}", expanded=False):
+        margin_label = (
+            f"{row['Margin %']:.1f}%" 
+            if row["Margin %"] is not None and pd.notna(row["Margin %"]) 
+            else "no rev"
+        )
+        with st.expander(
+            f"**{prog}** — Revenue ${row['Revenue']:,.2f} · Cost ${row['Cost']:,.2f} · Margin {margin_label}",
+            expanded=False,
+        ):
             inv_sub = invoice_df[invoice_df["customer_program"] == prog] if not invoice_df.empty else pd.DataFrame()
             man_sub = manual_df[manual_df["customer_program"] == prog] if not manual_df.empty else pd.DataFrame()
 
