@@ -937,16 +937,23 @@ def _render_by_program(engine):
         man_sub = manual_df[manual_df["customer_program"] == prog] if not manual_df.empty else pd.DataFrame()
         inv_amt = float(inv_sub["cost"].sum()) if not inv_sub.empty else 0.0
         man_amt = float(man_sub["total_cost"].sum()) if not man_sub.empty else 0.0
+        cost_total = inv_amt + man_amt
+        revenue = float(revenue_map.get(prog, 0.0))
+        margin_dollars = revenue - cost_total
+        margin_pct = (margin_dollars / revenue * 100) if revenue > 0 else None
         by_program.append({
             "Program":      prog,
+            "Revenue":      revenue,
             "Invoice":      inv_amt,
             "Manual":       man_amt,
-            "Total":        inv_amt + man_amt,
+            "Cost":         cost_total,
+            "Margin $":     margin_dollars,
+            "Margin %":     margin_pct,
             "Invoices":     inv_sub["invoice_num"].nunique() if not inv_sub.empty else 0,
             "Manual Lines": len(man_sub),
         })
 
-    summary = pd.DataFrame(by_program).sort_values("Total", ascending=False)
+    summary = pd.DataFrame(by_program).sort_values("Cost", ascending=False)
 
     st.markdown("---")
     st.markdown("#### Summary")
