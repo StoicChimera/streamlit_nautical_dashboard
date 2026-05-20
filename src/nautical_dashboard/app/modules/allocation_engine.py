@@ -1228,9 +1228,17 @@ def get_prior_warehouse_wip_applicable(month_start: date) -> pd.DataFrame:
     )
 
 
-def get_warehouse_wip_all_periods() -> pd.DataFrame:
+def get_warehouse_wip_all_periods(as_of_month: date | None = None) -> pd.DataFrame:
+    """Outstanding warehouse WIP across all periods up to and including as_of_month.
+    If as_of_month is None, returns all periods (legacy behavior)."""
+    where_clause = ""
+    params: dict = {}
+    if as_of_month is not None:
+        where_clause = "AND wa.month_start <= :as_of"
+        params["as_of"] = as_of_month
+
     return pd.read_sql(
-        text("""
+        text(f"""
             SELECT
                 TO_CHAR(wa.month_start, 'YYYY-MM')            AS accrual_period,
                 wa.customer_program,
@@ -1249,10 +1257,12 @@ def get_warehouse_wip_all_periods() -> pd.DataFrame:
                   AND wwa.customer_program = wa.customer_program
                   AND wwa.program_bucket   = wa.program_bucket
             )
+            {where_clause}
             GROUP BY 1, 2, 3, 4
             ORDER BY 1, warehouse_cost DESC
         """),
         engine,
+        params=params,
     )
 
 

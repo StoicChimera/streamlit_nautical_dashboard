@@ -904,7 +904,7 @@ def _render_warehouse_wip_tab(month_start: date, reviewer: str) -> None:
                 )
     else:
         # Check if there's outstanding WIP at all
-        any_outstanding = get_warehouse_wip_all_periods()
+        any_outstanding = get_warehouse_wip_all_periods(as_of_month=month_start)
         if not any_outstanding.empty:
             outstanding_total = float(any_outstanding["warehouse_cost"].sum())
             st.info(
@@ -971,7 +971,7 @@ def _render_warehouse_wip_tab(month_start: date, reviewer: str) -> None:
         "at which point it surfaces above as applicable to that period."
     )
 
-    all_wip = get_warehouse_wip_all_periods()
+    all_wip = get_warehouse_wip_all_periods(as_of_month=month_start)
     if all_wip.empty:
         st.info("No outstanding warehouse WIP across any period.")
         return
