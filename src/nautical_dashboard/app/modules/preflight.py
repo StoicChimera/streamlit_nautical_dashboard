@@ -74,6 +74,24 @@ def _period_options() -> list[date]:
     return list(reversed(out))
 
 
+def _status_pill(status: str) -> str:
+    colors = {
+        "fresh":     ("#0b5a25", "#c8e6c9"),
+        "stale":     ("#92400e", "#fed7aa"),
+        "never":     ("#374151", "#e5e7eb"),
+        "done":      ("#0b5a25", "#c8e6c9"),
+        "pending":   ("#92400e", "#fed7aa"),
+        "configure": ("#374151", "#e5e7eb"),
+        "blocked":   ("#9ca3af", "#f3f4f6"),  # grey on light grey
+    }
+    fg, bg = colors.get(status.lower(), ("#374151", "#e5e7eb"))
+    return (
+        f'<span style="background:{bg};color:{fg};padding:3px 10px;'
+        f'border-radius:10px;font-size:0.72rem;font-weight:700;'
+        f'letter-spacing:0.04em;text-transform:uppercase;'
+        f'{"opacity:0.7;" if status == "blocked" else ""}">{status}</span>'
+    )
+
 # ---------------------------------------------------------------------------
 # Data loaders
 # ---------------------------------------------------------------------------
@@ -101,105 +119,181 @@ def load_freshness() -> pd.DataFrame:
 
 def probe_manual_steps(period_start: date) -> pd.DataFrame:
     """
-    SQL probes for the 5 manual period-close steps.
+    Two-pass probe runner with dependency-aware blocking.
 
-    Each probe runs in its own try/except. Probe failures show as 'configure'
-    status without breaking the page so SQL can be refined later when actual
-    schema names are confirmed.
+    Pass 1: run every probe, collect raw done/pending/configure status.
+    Pass 2: for dependent steps, if any depends_on is not 'done', flip to 'blocked'.
     """
     next_period = _next_month(period_start)
-    prior_period_str = _prior_month(period_start).strftime("%Y-%m")
-    base_params = {"p": period_start, "n": next_period}
+    period_str  = period_start.strftime("%Y-%m")
+    prior_str   = _prior_month(period_start).strftime("%Y-%m")
 
-    probes = [
-        (
-            "OW Film usage JE entered",
-            """
+    # Each probe declares: id, name, category, depends_on, sql, params, done_when
+    # done_when: 'has_rows' (default) → done when n > 0
+    #            'no_rows'             → done when n == 0 (used for unmatched-counters)
+    steps = [
+        {
+            "id": "ow_film_je",
+            "name": "OW Film usage JE entered",
+            "category": "trigger",
+            "depends_on": [],
+            "sql": """
                 SELECT COUNT(*) AS n
                 FROM clean_qbo_journal_lines
                 WHERE txn_date >= :p AND txn_date < :n
-                  AND (
-                       memo ILIKE '%OW Film%'
-                    OR description ILIKE '%overwrap%'
-                    OR account_name ILIKE '%OW Film%'
-                  )
+                  AND (description ILIKE '%overwrap%'
+                    OR description ILIKE '%OW film%'
+                    OR account_name ILIKE '%OW Film%')
             """,
-            base_params,
-            "JE line(s) referencing OW Film/overwrap in period",
-        ),
-        (
-            "E-Commerce programs flagged for period",
-            """
+            "params": {"p": period_start, "n": next_period},
+            "label": "JE line(s) referencing OW Film/overwrap",
+        },
+        {
+            "id": "ecomm_programs",
+            "name": "E-Commerce programs flagged",
+            "category": "trigger",
+            "depends_on": [],
+            "sql": """
                 SELECT COUNT(*) AS n
-                FROM stg_smartsheet_demo
-                WHERE date >= :p AND date < :n
-                  AND (
-                       channel ILIKE '%ecom%'
-                    OR channel ILIKE '%e-commerce%'
-                  )
+                FROM stg_labor_ecomm_period_config
+                WHERE accrual_period = :period_str AND active = TRUE
             """,
-            base_params,
-            "demo row(s) flagged as e-commerce in period",
-        ),
-        (
-            "Receiving returns processed",
-            """
+            "params": {"period_str": period_str},
+            "label": "E-Commerce program(s) elected",
+        },
+        {
+            "id": "receiving_returns",
+            "name": "Receiving returns recorded",
+            "category": "trigger",
+            "depends_on": [],
+            "sql": """
                 SELECT COUNT(*) AS n
-                FROM stg_extensiv_receipts
-                WHERE received_date >= :p AND received_date < :n
-                  AND COALESCE(receipt_type, '') ILIKE '%return%'
+                FROM stg_labor_receiving_returns
+                WHERE accrual_period = :period_str
             """,
-            base_params,
-            "return-type receipt(s) in period",
-        ),
-        (
-            "Container unloads logged",
-            """
+            "params": {"period_str": period_str},
+            "label": "return entry/entries recorded",
+        },
+        {
+            "id": "container_unloads",
+            "name": "Container unloads logged",
+            "category": "trigger",
+            "depends_on": [],
+            "sql": """
                 SELECT COUNT(*) AS n
-                FROM stg_labor_temp
-                WHERE accrual_period = TO_CHAR(CAST(:p AS date), 'YYYY-MM')
-                  AND (
-                       job_code ILIKE '%container%'
-                    OR job_code ILIKE '%unload%'
-                  )
+                FROM stg_labor_container_unload
+                WHERE accrual_period = :period_str
             """,
-            base_params,
-            "container/unload labor entry(s) in period",
-        ),
-        (
-            "Prior period WIP reviewed",
-            """
+            "params": {"period_str": period_str},
+            "label": "container unload entry/entries",
+        },
+        {
+            "id": "freight_assigned",
+            "name": "Freight assigned and approved",
+            "category": "trigger",
+            "depends_on": [],
+            "sql": """
+                SELECT COUNT(*) AS n
+                FROM mv_wip_fulfillment_freight
+                WHERE bill_date >= :p AND bill_date < :n
+                  AND match_status = 'unmatched'
+            """,
+            "params": {"p": period_start, "n": next_period},
+            "done_when": "no_rows",
+            "label": "unmatched freight line(s) remaining",
+        },
+        {
+            "id": "warehouse_allocations",
+            "name": "Warehouse allocations committed",
+            "category": "dependent",
+            "depends_on": ["ecomm_programs", "receiving_returns", "container_unloads"],
+            "sql": """
+                SELECT COUNT(*) AS n
+                FROM stg_warehouse_allocation
+                WHERE month_start = :p
+            """,
+            "params": {"p": period_start},
+            "label": "warehouse allocation row(s) committed",
+        },
+        {
+            "id": "labor_committed",
+            "name": "Labor allocation committed",
+            "category": "dependent",
+            "depends_on": ["ecomm_programs", "receiving_returns", "container_unloads"],
+            "sql": """
+                SELECT COUNT(*) AS n
+                FROM stg_labor_allocation
+                WHERE accrual_period = :period_str AND locked = TRUE
+            """,
+            "params": {"period_str": period_str},
+            "label": "labor allocation row(s) locked",
+        },
+        {
+            "id": "prior_wip_reviewed",
+            "name": "Prior period WIP reviewed",
+            "category": "dependent",
+            "depends_on": [],
+            "sql": """
                 SELECT COUNT(*) AS n
                 FROM data_source_sync_log
                 WHERE source_name = 'wip_balance_review'
-                  AND period = :prior_period
+                  AND period = :prior_str
             """,
-            {"prior_period": prior_period_str},
-            f"review marker(s) recorded for {prior_period_str}",
-        ),
+            "params": {"prior_str": prior_str},
+            "label": f"review marker(s) for {prior_str}",
+        },
     ]
 
-    rows: list[dict] = []
-    for step_name, sql, params, detail_label in probes:
+    # --- Pass 1: run each probe ---
+    raw_results: dict[str, dict] = {}
+    for step in steps:
         try:
             with engine.connect() as conn:
-                row = conn.execute(text(sql), params).first()
+                row = conn.execute(text(step["sql"]), step["params"]).first()
             n = int(row.n) if row else 0
-            rows.append({
-                "step": step_name,
-                "status": "done" if n > 0 else "pending",
-                "detail": f"{n} {detail_label}",
-            })
+            done_when = step.get("done_when", "has_rows")
+            is_done = (n > 0) if done_when == "has_rows" else (n == 0)
+            raw_results[step["id"]] = {
+                "status": "done" if is_done else "pending",
+                "detail": f"{n} {step['label']}",
+            }
         except Exception as e:
             err = str(e).splitlines()[0][:140]
-            rows.append({
-                "step": step_name,
+            raw_results[step["id"]] = {
                 "status": "configure",
                 "detail": f"probe needs schema adjustment: {err}",
-            })
+            }
+
+    # --- Pass 2: mark dependent steps as blocked if any dependency not done ---
+    rows: list[dict] = []
+    for step in steps:
+        result = raw_results[step["id"]]
+        blockers = [
+            dep for dep in step["depends_on"]
+            if raw_results.get(dep, {}).get("status") != "done"
+        ]
+        if blockers and result["status"] != "done":
+            # Already-done dependents stay done — don't retro-block them.
+            blocker_names = ", ".join(
+                next(s["name"] for s in steps if s["id"] == b)
+                for b in blockers
+            )
+            result = {
+                "status": "blocked",
+                "detail": f"blocked by: {blocker_names}",
+            }
+        depends_label = (
+            ", ".join(next(s["name"] for s in steps if s["id"] == d) for d in step["depends_on"])
+            if step["depends_on"] else "—"
+        )
+        rows.append({
+            "step": step["name"],
+            "status": result["status"],
+            "detail": result["detail"],
+            "depends_on": depends_label,
+        })
 
     return pd.DataFrame(rows)
-
 
 # ---------------------------------------------------------------------------
 # Render
@@ -246,7 +340,7 @@ def _render_freshness_panel() -> None:
             load_freshness.clear()
             st.rerun()
     st.caption(f"_Loaded: {datetime.now(pytz.timezone('US/Mountain')).strftime('%I:%M:%S %p MT')}_")
-    
+
     st.caption(
         "Every ETL writes to data_source_sync_log on success. "
         "Anything stale means rerun that source before relying on downstream numbers."
@@ -297,8 +391,8 @@ def _render_freshness_panel() -> None:
 def _render_manual_steps_panel(period_start: date, period_label: str) -> None:
     st.subheader(f"Period-Close Manual Steps - {period_label}")
     st.caption(
-        "Probe queries check whether each manual close step has been performed. "
-        "'Configure' means the probe SQL needs schema adjustment for your data model."
+        "Probe queries check whether each period-close step is complete. "
+        "Dependent steps are greyed out when their triggers are still pending."
     )
 
     df = probe_manual_steps(period_start)
@@ -308,17 +402,23 @@ def _render_manual_steps_panel(period_start: date, period_label: str) -> None:
 
     done_n      = int((df["status"] == "done").sum())
     pending_n   = int((df["status"] == "pending").sum())
+    blocked_n   = int((df["status"] == "blocked").sum())
     configure_n = int((df["status"] == "configure").sum())
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Total Steps", len(df))
     c2.metric("Done", done_n)
     c3.metric("Pending", pending_n)
-    c4.metric("Configure", configure_n)
+    c4.metric("Blocked", blocked_n)
+    c5.metric("Configure", configure_n)
 
     out = df.copy()
     out["Status"] = out["status"].apply(_status_pill)
-    out = out.rename(columns={"step": "Step", "detail": "Detail"})[["Step", "Status", "Detail"]]
+    out = out.rename(columns={
+        "step": "Step",
+        "detail": "Detail",
+        "depends_on": "Depends On",
+    })[["Step", "Status", "Detail", "Depends On"]]
 
     st.markdown(
         out.to_html(escape=False, index=False, classes="preflight-tbl"),
