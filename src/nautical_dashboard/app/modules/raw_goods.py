@@ -752,8 +752,184 @@ def _render_consumption(engine):
         st.rerun()
 
 
+def _render_by_program(engine):
+    st.subheader("Raw Goods by Program")
+
+    period = st.text_input(
+        "Period (YYYY-MM)",
+        value=pd.Timestamp.today().strftime("%Y-%m"),
+        key="by_program_period",
+    )
+    try:
+        period_start = pd.to_datetime(period + "-01")
+        period_end = (period_start + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
+        period_start = period_start.strftime("%Y-%m-%d")
+    except Exception:
+        st.error("Invalid period format. Use YYYY-MM.")
+        return
+
+    # Invoice-based: QBO splits joined to PSD by invoice_num
+    invoice_df = pd.read_sql(
+        text("""
+            WITH invoice_costs AS (
+                SELECT
+                    num AS invoice_num,
+                    description,
+                    account_name,
+                    SUM(CAST(amount AS NUMERIC)) AS cost
+                FROM clean_qbo_transaction_splits_flat
+                WHERE LOWER(account_name) LIKE '%raw goods%'
+                   OR LOWER(account_name) LIKE '%cost of goods%'
+                GROUP BY num, description, account_name
+            )
+            SELECT
+                COALESCE(
+                    a.canonical_name,
+                    CASE
+                        WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
+                            THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
+                        WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
+                            THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
+                        ELSE TRIM(psd.customer_full_name)
+                    END
+                ) AS customer_program,
+                psd.invoice_num,
+                psd.contract_completion_date::date AS completion_date,
+                ic.account_name,
+                ic.description,
+                ic.cost
+            FROM stg_product_service_detail psd
+            JOIN invoice_costs ic ON ic.invoice_num = psd.invoice_num
+            LEFT JOIN dim_customer_alias a ON LOWER(a.alias) = LOWER(
+                CASE
+                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
+                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
+                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
+                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
+                    ELSE TRIM(psd.customer_full_name)
+                END
+            ) AND a.active = TRUE
+            WHERE psd.contract_completion_date::date >= :start
+              AND psd.contract_completion_date::date <  :end
+              AND COALESCE(a.exclude, FALSE) = FALSE
+        """),
+        engine,
+        params={"start": period_start, "end": period_end},
+    )
+
+    # Manual consumption: stg_raw_material_consumption
+    manual_df = pd.read_sql(
+        text("""
+            SELECT
+                customer_program,
+                size_numeric,
+                rolls_used,
+                total_cost,
+                allocation_type,
+                notes,
+                created_at
+            FROM stg_raw_material_consumption
+            WHERE allocation_type = 'period'
+               OR (allocation_type = 'wip' AND wip_released_period IS NOT NULL)
+            AND (
+                (allocation_type = 'period' AND period = :period)
+                OR (allocation_type = 'wip' AND wip_released_period = :period)
+            )
+        """),
+        engine,
+        params={"period": period},
+    )
+
+    invoice_total = float(invoice_df["cost"].sum()) if not invoice_df.empty else 0.0
+    manual_total  = float(manual_df["total_cost"].sum()) if not manual_df.empty else 0.0
+    total         = invoice_total + manual_total
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Raw Goods",     f"${total:,.2f}")
+    c2.metric("Invoice-Based (QBO)", f"${invoice_total:,.2f}")
+    c3.metric("Manual Consumption",  f"${manual_total:,.2f}")
+    c4.metric("Programs", 
+              len(set(invoice_df["customer_program"].tolist() if not invoice_df.empty else []) | 
+                  set(manual_df["customer_program"].tolist() if not manual_df.empty else [])))
+
+    if total == 0:
+        st.info(f"No raw goods cost found for {period}.")
+        return
+
+    # Build program-level summary
+    by_program = []
+    all_programs = set()
+    if not invoice_df.empty:
+        all_programs.update(invoice_df["customer_program"].dropna().tolist())
+    if not manual_df.empty:
+        all_programs.update(manual_df["customer_program"].dropna().tolist())
+
+    for prog in all_programs:
+        inv_sub = invoice_df[invoice_df["customer_program"] == prog] if not invoice_df.empty else pd.DataFrame()
+        man_sub = manual_df[manual_df["customer_program"] == prog] if not manual_df.empty else pd.DataFrame()
+        inv_amt = float(inv_sub["cost"].sum()) if not inv_sub.empty else 0.0
+        man_amt = float(man_sub["total_cost"].sum()) if not man_sub.empty else 0.0
+        by_program.append({
+            "Program":    prog,
+            "Invoice":    inv_amt,
+            "Manual":     man_amt,
+            "Total":      inv_amt + man_amt,
+            "Invoices":   inv_sub["invoice_num"].nunique() if not inv_sub.empty else 0,
+            "Manual Lines": len(man_sub),
+        })
+
+    summary = pd.DataFrame(by_program).sort_values("Total", ascending=False)
+
+    st.markdown("---")
+    st.markdown("#### Summary")
+    display = summary.copy()
+    for col in ["Invoice", "Manual", "Total"]:
+        display[col] = display[col].map(lambda x: f"${x:,.2f}")
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("#### Program Detail")
+
+    for _, row in summary.iterrows():
+        prog = row["Program"]
+        with st.expander(f"**{prog}** — ${row['Total']:,.2f}", expanded=False):
+            inv_sub = invoice_df[invoice_df["customer_program"] == prog] if not invoice_df.empty else pd.DataFrame()
+            man_sub = manual_df[manual_df["customer_program"] == prog] if not manual_df.empty else pd.DataFrame()
+
+            if not inv_sub.empty:
+                st.markdown("**Invoice-Based (QBO)**")
+                inv_display = inv_sub.copy()
+                inv_display["cost"] = inv_display["cost"].map(lambda x: f"${float(x):,.2f}")
+                inv_display = inv_display.rename(columns={
+                    "invoice_num": "Invoice",
+                    "completion_date": "Completion",
+                    "account_name": "Account",
+                    "description": "Description",
+                    "cost": "Cost",
+                })[["Invoice", "Completion", "Account", "Description", "Cost"]]
+                st.dataframe(inv_display, use_container_width=True, hide_index=True)
+
+            if not man_sub.empty:
+                st.markdown("**Manual Consumption (BOPP)**")
+                man_display = man_sub.copy()
+                man_display["total_cost"] = man_display["total_cost"].map(lambda x: f"${float(x):,.2f}")
+                man_display = man_display.rename(columns={
+                    "size_numeric": "Size",
+                    "rolls_used":   "Rolls",
+                    "total_cost":   "Cost",
+                    "notes":        "Notes",
+                })[["Size", "Rolls", "Cost", "Notes"]]
+                st.dataframe(man_display, use_container_width=True, hide_index=True)
+
+
 def _render_wip(engine):
-    st.subheader("WIP raw material — open and released")
+    st.subheader("WIP Raw Material — Open and Released")
+    st.caption(
+        "WIP entries are auto-created from the Consumption tab when a BOPP entry "
+        "is for a program with no revenue in the period. They sit here until that "
+        "program invoices, at which point you release them to the invoice period. "
+        "QBO invoice-based raw goods don't appear here — they tie to revenue automatically."
+    )
 
     wip_df = load_wip(engine)
     if wip_df.empty:
@@ -920,8 +1096,8 @@ def render():
     st.title("Raw Material Cost")
     engine = get_engine()
 
-    tab_invoice, tab_specs, tab_consumption, tab_wip = st.tabs([
-        "Invoice Detail", "Film Specs", "Consumption", "WIP",
+    tab_invoice, tab_specs, tab_consumption, tab_program, tab_wip = st.tabs([
+        "Invoice Detail", "Film Specs", "Consumption", "By Program", "WIP",
     ])
 
     with tab_invoice:
@@ -930,5 +1106,7 @@ def render():
         _render_film_specs(engine)
     with tab_consumption:
         _render_consumption(engine)
+    with tab_program:
+        _render_by_program(engine)
     with tab_wip:
         _render_wip(engine)
