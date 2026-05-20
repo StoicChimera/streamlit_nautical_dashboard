@@ -904,6 +904,54 @@ def _render_by_program(engine):
         engine,
         params={"start": period_start_str, "end": period_end},
     )
+
+    # PSD line detail per invoice for the period — used in expander
+    psd_lines_df = pd.read_sql(
+        text("""
+            SELECT
+                COALESCE(
+                    a.canonical_name,
+                    CASE
+                        WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
+                            THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
+                        WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
+                            THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
+                        ELSE TRIM(psd.customer_full_name)
+                    END
+                ) AS customer_program,
+                psd.invoice_num,
+                psd.contract_completion_date::date AS completion_date,
+                psd.product_service,
+                psd.description,
+                psd.qty,
+                psd.amount AS revenue
+            FROM stg_product_service_detail psd
+            LEFT JOIN (
+                SELECT DISTINCT ON (LOWER(alias))
+                    LOWER(alias) AS alias_lower,
+                    canonical_name,
+                    exclude
+                FROM dim_customer_alias
+                WHERE active = TRUE
+                ORDER BY LOWER(alias), canonical_name
+            ) a ON a.alias_lower = LOWER(
+                CASE
+                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3)) != ''
+                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 3))
+                    WHEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2)) != ''
+                        THEN TRIM(SPLIT_PART(psd.customer_full_name, ':', 2))
+                    ELSE TRIM(psd.customer_full_name)
+                END
+            )
+            WHERE psd.contract_completion_date::date >= :start
+              AND psd.contract_completion_date::date <  :end
+              AND COALESCE(a.exclude, FALSE) = FALSE
+            ORDER BY psd.invoice_num
+        """),
+        engine,
+        params={"start": period_start_str, "end": period_end},
+    )
+
     revenue_map = dict(zip(revenue_df["customer_program"], revenue_df["revenue"])) if not revenue_df.empty else {}
     invoice_total = float(invoice_df["cost"].sum()) if not invoice_df.empty else 0.0
     manual_total  = float(manual_df["total_cost"].sum()) if not manual_df.empty else 0.0
@@ -981,9 +1029,24 @@ def _render_by_program(engine):
         ):
             inv_sub = invoice_df[invoice_df["customer_program"] == prog] if not invoice_df.empty else pd.DataFrame()
             man_sub = manual_df[manual_df["customer_program"] == prog] if not manual_df.empty else pd.DataFrame()
+            psd_sub = psd_lines_df[psd_lines_df["customer_program"] == prog] if not psd_lines_df.empty else pd.DataFrame()
+
+            if not psd_sub.empty:
+                st.markdown("**Revenue Lines (PSD)**")
+                psd_display = psd_sub.copy()
+                psd_display["revenue"] = psd_display["revenue"].map(lambda x: f"${float(x):,.2f}")
+                psd_display = psd_display.rename(columns={
+                    "invoice_num":      "Invoice",
+                    "completion_date":  "Completion",
+                    "product_service":  "Item",
+                    "description":      "Description",
+                    "qty":              "Qty",
+                    "revenue":          "Revenue",
+                })[["Invoice", "Completion", "Item", "Description", "Qty", "Revenue"]]
+                st.dataframe(psd_display, use_container_width=True, hide_index=True)
 
             if not inv_sub.empty:
-                st.markdown("**Invoice-Based (QBO)**")
+                st.markdown("**Cost Lines (QBO)**")
                 inv_display = inv_sub.copy()
                 inv_display["cost"] = inv_display["cost"].map(lambda x: f"${float(x):,.2f}")
                 inv_display = inv_display.rename(columns={
