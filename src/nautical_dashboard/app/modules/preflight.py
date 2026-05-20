@@ -133,20 +133,17 @@ def probe_manual_steps(period_start: date) -> pd.DataFrame:
     #            'no_rows'             → done when n == 0 (used for unmatched-counters)
     steps = [
         {
-            "id": "ow_film_je",
-            "name": "OW Film usage JE entered",
+            "id": "ow_film_consumption",
+            "name": "OW Film usage recorded",
             "category": "trigger",
             "depends_on": [],
             "sql": """
                 SELECT COUNT(*) AS n
-                FROM clean_qbo_journal_lines
-                WHERE txn_date >= :p AND txn_date < :n
-                  AND (description ILIKE '%overwrap%'
-                    OR description ILIKE '%OW film%'
-                    OR account_name ILIKE '%OW Film%')
+                FROM stg_raw_material_consumption
+                WHERE period = :period_str
             """,
-            "params": {"p": period_start, "n": next_period},
-            "label": "JE line(s) referencing OW Film/overwrap",
+            "params": {"period_str": period_str},
+            "label": "consumption entry/entries recorded",
         },
         {
             "id": "ecomm_programs",
@@ -195,12 +192,12 @@ def probe_manual_steps(period_start: date) -> pd.DataFrame:
             "sql": """
                 SELECT COUNT(*) AS n
                 FROM mv_wip_fulfillment_freight
-                WHERE bill_date >= :p AND bill_date < :n
-                  AND match_status = 'unmatched'
+                WHERE match_status = 'unmatched'
+                AND bill_date < :n
             """,
-            "params": {"p": period_start, "n": next_period},
+            "params": {"n": next_period},
             "done_when": "no_rows",
-            "label": "unmatched freight line(s) remaining",
+            "label": "unmatched freight line(s) ≤ period end",
         },
         {
             "id": "warehouse_allocations",
