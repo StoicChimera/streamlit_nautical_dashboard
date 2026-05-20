@@ -19,7 +19,8 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
-
+from datetime import datetime
+import pytz
 
 # ---------------------------------------------------------------------------
 # Engine
@@ -235,7 +236,17 @@ def render() -> None:
 
 
 def _render_freshness_panel() -> None:
-    st.subheader("Data Source Freshness")
+    col_title, col_refresh = st.columns([4, 1])
+    with col_title:
+        st.subheader("Data Source Freshness")
+    with col_refresh:
+        # Vertical alignment hack so button lines up with the subheader
+        st.write("")
+        if st.button("Refresh data", use_container_width=True):
+            load_freshness.clear()
+            st.rerun()
+    st.caption(f"_Loaded: {datetime.now(pytz.timezone('US/Mountain')).strftime('%I:%M:%S %p MT')}_")
+    
     st.caption(
         "Every ETL writes to data_source_sync_log on success. "
         "Anything stale means rerun that source before relying on downstream numbers."
