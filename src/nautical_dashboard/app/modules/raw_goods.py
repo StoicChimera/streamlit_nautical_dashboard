@@ -24,12 +24,6 @@ def get_engine():
 # =============================================================
 
 def _interpolate_weight(size: float, specs_df: pd.DataFrame) -> Optional[float]:
-    """Linear interpolation between nearest known-weight neighbors.
-
-    Returns None if no left or right neighbor exists. Refuses to
-    extrapolate beyond the bounds of the spec table — the caller
-    is expected to surface that as a 'needs weight' state.
-    """
     known = specs_df[specs_df['roll_weight_lbs'].notna()].sort_values('size_numeric')
     if known.empty:
         return None
@@ -47,8 +41,6 @@ def _interpolate_weight(size: float, specs_df: pd.DataFrame) -> Optional[float]:
 
 
 def _resolve_weight(size: float, specs_df: pd.DataFrame) -> tuple[Optional[float], bool]:
-    """Returns (weight_lbs, is_interpolated). weight_lbs is None if
-    the size has no stored weight AND no neighbors to interpolate from."""
     row = specs_df[specs_df['size_numeric'] == size]
     if not row.empty and pd.notna(row.iloc[0]['roll_weight_lbs']):
         return float(row.iloc[0]['roll_weight_lbs']), False
@@ -67,7 +59,6 @@ def _cost_per_roll(weight_lbs: float, cost_per_kg: float) -> float:
 # =============================================================
 
 def load_raw_goods(engine, start_date: str, end_date: str) -> pd.DataFrame:
-    """Invoice Detail tab — same as before. Kept for back-compat."""
     return pd.read_sql(
         text("""
             WITH revenue_by_invoice AS (
@@ -193,7 +184,6 @@ def load_wip(engine) -> pd.DataFrame:
 
 
 def load_period_programs(engine, period: str) -> list[str]:
-    """Programs with revenue in PSD for the period — period candidates."""
     start = f"{period}-01"
     end = (pd.to_datetime(start) + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
     df = pd.read_sql(
@@ -312,9 +302,6 @@ def delete_consumption(engine, row_id: int):
 
 
 def find_wip_release_candidates(engine) -> pd.DataFrame:
-    """WIP entries whose program has since shown up in PSD with a
-    contract_completion_date >= the consumption period start. The
-    earliest such PSD month is the candidate release period."""
     return pd.read_sql(
         """
         WITH wip_open AS (
@@ -359,6 +346,28 @@ def refresh_mvs(engine):
     with engine.begin() as conn:
         conn.execute(text("REFRESH MATERIALIZED VIEW mv_raw_materials_by_program"))
         conn.execute(text("REFRESH MATERIALIZED VIEW mv_program_profitability"))
+
+
+def _load_available_periods(engine) -> list[str]:
+    """Periods that have any raw goods activity (invoice-based or manual)."""
+    df = pd.read_sql(
+        text("""
+            SELECT DISTINCT period FROM (
+                SELECT TO_CHAR(psd.contract_completion_date::date, 'YYYY-MM') AS period
+                FROM stg_product_service_detail psd
+                JOIN clean_qbo_transaction_splits_flat tx ON tx.num = psd.invoice_num
+                WHERE psd.contract_completion_date IS NOT NULL
+                  AND (LOWER(tx.account_name) LIKE '%raw goods%'
+                       OR LOWER(tx.account_name) LIKE '%cost of goods%')
+                UNION
+                SELECT period FROM stg_raw_material_consumption
+                WHERE period IS NOT NULL
+            ) p
+            ORDER BY period DESC
+        """),
+        engine,
+    )
+    return df["period"].tolist()
 
 
 # =============================================================
@@ -546,26 +555,7 @@ def _render_film_specs(engine):
 def _render_consumption(engine):
     st.subheader("Consumption period")
 
-    # Pull periods that have any raw goods activity (invoice-based or manual)
-    periods_df = pd.read_sql(
-        text("""
-            SELECT DISTINCT period FROM (
-                SELECT TO_CHAR(psd.contract_completion_date::date, 'YYYY-MM') AS period
-                FROM stg_product_service_detail psd
-                JOIN clean_qbo_transaction_splits_flat tx ON tx.num = psd.invoice_num
-                WHERE psd.contract_completion_date IS NOT NULL
-                AND (LOWER(tx.account_name) LIKE '%raw goods%' 
-                    OR LOWER(tx.account_name) LIKE '%cost of goods%')
-                UNION
-                SELECT period FROM stg_raw_material_consumption
-                WHERE period IS NOT NULL
-            ) p
-            ORDER BY period DESC
-        """),
-        engine,
-    )
-    available_periods = periods_df["period"].tolist()
-
+    available_periods = _load_available_periods(engine)
     if not available_periods:
         st.warning("No raw goods data found.")
         return
@@ -577,11 +567,8 @@ def _render_consumption(engine):
         "Period",
         options=available_periods,
         index=default_idx,
-        key="by_program_period",
+        key="cons_period",
     )
-    period_start = pd.to_datetime(period + "-01")
-    period_end = (period_start + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
-    period_start_str = period_start.strftime("%Y-%m-%d")
 
     specs = load_specs(engine)
     cost_per_kg = load_cost(engine)
@@ -601,9 +588,6 @@ def _render_consumption(engine):
     st.divider()
     st.subheader("Add entry")
 
-    # Build program metadata for source classification on save.
-    # In-period programs take priority for source tagging if a name
-    # appears in both lists.
     program_meta: dict = {}
     for p in period_programs:
         program_meta[p] = ('product_service_detail', parent_map.get(p, ''))
@@ -614,10 +598,6 @@ def _render_consumption(engine):
     OTHER_OPT = "Other..."
     program_options = sorted(program_meta.keys()) + [OTHER_OPT]
 
-    # Picker is OUTSIDE the form so changing it triggers a rerun.
-    # If it were inside, the conditional "Program name" text input
-    # below wouldn't render until after submit (forms only rerun on
-    # submit_button, not on widget change).
     picked = st.selectbox(
         "Program",
         options=program_options,
@@ -637,7 +617,6 @@ def _render_consumption(engine):
             key="other_program_name",
         )
 
-    # Atomic submit for the rest of the entry
     with st.form("form_consumption_add", clear_on_submit=True):
         c1, c2 = st.columns([1, 2])
         with c1:
@@ -781,18 +760,23 @@ def _render_consumption(engine):
 def _render_by_program(engine):
     st.subheader("Raw Goods by Program")
 
-    period = st.text_input(
-        "Period (YYYY-MM)",
-        value=pd.Timestamp.today().strftime("%Y-%m"),
+    available_periods = _load_available_periods(engine)
+    if not available_periods:
+        st.warning("No raw goods data found.")
+        return
+
+    current_month = pd.Timestamp.today().strftime("%Y-%m")
+    default_idx = available_periods.index(current_month) if current_month in available_periods else 0
+
+    period = st.selectbox(
+        "Period",
+        options=available_periods,
+        index=default_idx,
         key="by_program_period",
     )
-    try:
-        period_start = pd.to_datetime(period + "-01")
-        period_end = (period_start + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
-        period_start_str = period_start.strftime("%Y-%m-%d")
-    except Exception:
-        st.error("Invalid period format. Use YYYY-MM.")
-        return
+    period_start = pd.to_datetime(period + "-01")
+    period_end = (period_start + pd.DateOffset(months=1)).strftime("%Y-%m-%d")
+    period_start_str = period_start.strftime("%Y-%m-%d")
 
     # Invoice-based: dedupe PSD to one row per (program, invoice) BEFORE joining costs
     invoice_df = pd.read_sql(
@@ -824,8 +808,8 @@ def _render_by_program(engine):
                     MIN(psd.contract_completion_date::date) AS completion_date
                 FROM stg_product_service_detail psd
                 LEFT JOIN (
-                    SELECT DISTINCT ON (LOWER(alias)) 
-                        LOWER(alias) AS alias_lower, 
+                    SELECT DISTINCT ON (LOWER(alias))
+                        LOWER(alias) AS alias_lower,
                         canonical_name,
                         exclude
                     FROM dim_customer_alias
@@ -859,7 +843,6 @@ def _render_by_program(engine):
         params={"start": period_start_str, "end": period_end},
     )
 
-    # Manual consumption — unchanged
     manual_df = pd.read_sql(
         text("""
             SELECT
@@ -887,16 +870,19 @@ def _render_by_program(engine):
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total Raw Goods",     f"${total:,.2f}")
     c2.metric("Invoice-Based (QBO)", f"${invoice_total:,.2f}")
-    c3.metric("Manual Consumption",  f"${manual_total:,.2f}")
-    c4.metric("Programs", 
-              len(set(invoice_df["customer_program"].tolist() if not invoice_df.empty else []) | 
-                  set(manual_df["customer_program"].tolist() if not manual_df.empty else [])))
+    c3.metric("Manual Consumption", f"${manual_total:,.2f}")
+    c4.metric(
+        "Programs",
+        len(
+            set(invoice_df["customer_program"].tolist() if not invoice_df.empty else [])
+            | set(manual_df["customer_program"].tolist() if not manual_df.empty else [])
+        ),
+    )
 
     if total == 0:
         st.info(f"No raw goods cost found for {period}.")
         return
 
-    # Build program-level summary
     by_program = []
     all_programs = set()
     if not invoice_df.empty:
@@ -910,11 +896,11 @@ def _render_by_program(engine):
         inv_amt = float(inv_sub["cost"].sum()) if not inv_sub.empty else 0.0
         man_amt = float(man_sub["total_cost"].sum()) if not man_sub.empty else 0.0
         by_program.append({
-            "Program":    prog,
-            "Invoice":    inv_amt,
-            "Manual":     man_amt,
-            "Total":      inv_amt + man_amt,
-            "Invoices":   inv_sub["invoice_num"].nunique() if not inv_sub.empty else 0,
+            "Program":      prog,
+            "Invoice":      inv_amt,
+            "Manual":       man_amt,
+            "Total":        inv_amt + man_amt,
+            "Invoices":     inv_sub["invoice_num"].nunique() if not inv_sub.empty else 0,
             "Manual Lines": len(man_sub),
         })
 
