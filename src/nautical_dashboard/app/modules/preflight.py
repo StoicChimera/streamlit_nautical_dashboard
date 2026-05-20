@@ -38,24 +38,6 @@ engine = create_engine(SUPABASE_CONN, pool_pre_ping=True)
 # UI helpers
 # ---------------------------------------------------------------------------
 
-def _status_pill(status: str) -> str:
-    """Colored status pill rendered inline as HTML."""
-    colors = {
-        "fresh":     ("#0b5a25", "#c8e6c9"),
-        "stale":     ("#92400e", "#fed7aa"),
-        "never":     ("#374151", "#e5e7eb"),
-        "done":      ("#0b5a25", "#c8e6c9"),
-        "pending":   ("#92400e", "#fed7aa"),
-        "configure": ("#374151", "#e5e7eb"),
-    }
-    fg, bg = colors.get(status.lower(), ("#374151", "#e5e7eb"))
-    return (
-        f'<span style="background:{bg};color:{fg};padding:3px 10px;'
-        f'border-radius:10px;font-size:0.72rem;font-weight:700;'
-        f'letter-spacing:0.04em;text-transform:uppercase;">{status}</span>'
-    )
-
-
 def _next_month(d: date) -> date:
     return date(d.year + 1, 1, 1) if d.month == 12 else date(d.year, d.month + 1, 1)
 
@@ -91,6 +73,59 @@ def _status_pill(status: str) -> str:
         f'letter-spacing:0.04em;text-transform:uppercase;'
         f'{"opacity:0.7;" if status == "blocked" else ""}">{status}</span>'
     )
+
+
+@st.cache_data(ttl=60)
+def load_last_sync():
+    sql = text("""
+        SELECT sync_run_at, status, tables_synced, rows_synced,
+               duration_seconds, triggered_by
+        FROM supabase_sync_log
+        ORDER BY sync_run_at DESC
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        df = pd.read_sql(sql, conn)
+    return df.iloc[0].to_dict() if not df.empty else None
+
+
+def _render_sync_panel():
+    st.subheader("Last Supabase Sync")
+    st.caption(
+        "Every ETL writes to local Postgres only. sync_production_tables() is "
+        "the sole writer to Supabase. If the sync is stale, every panel below "
+        "may be showing data that exists locally but hasn't reached the dashboard yet."
+    )
+
+    sync = load_last_sync()
+    if sync is None:
+        st.error("No sync runs recorded. Run sync_production_tables() before trusting any data below.")
+        return
+
+    sync_time = pd.Timestamp(sync["sync_run_at"])
+    now = pd.Timestamp.now(tz="UTC")
+    age_hours = (now - sync_time).total_seconds() / 3600
+
+    if age_hours < 1:
+        status = "fresh"
+        msg = f"Synced {age_hours*60:.0f} minutes ago"
+    elif age_hours < 6:
+        status = "fresh"
+        msg = f"Synced {age_hours:.1f} hours ago"
+    elif age_hours < 24:
+        status = "stale"
+        msg = f"Synced {age_hours:.1f} hours ago — consider re-running sync"
+    else:
+        status = "never"
+        msg = f"Synced {age_hours/24:.1f} days ago — STALE, re-run sync before trusting dashboard"
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Last Sync", sync_time.strftime("%Y-%m-%d %H:%M"))
+    c2.metric("Status", sync["status"])
+    c3.metric("Tables", int(sync.get("tables_synced") or 0))
+    c4.metric("Rows", f"{int(sync.get('rows_synced') or 0):,}")
+
+    st.markdown(_status_pill(status) + f"  {msg}", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Data loaders
@@ -289,6 +324,9 @@ def render() -> None:
         "Run before trusting profitability, labor allocation, or WIP numbers "
         "for a period. Green means good. Orange means do something."
     )
+
+    _render_sync_panel()
+    st.markdown("---")
 
     options = _period_options()
     labels = [d.strftime("%B %Y") for d in options]
