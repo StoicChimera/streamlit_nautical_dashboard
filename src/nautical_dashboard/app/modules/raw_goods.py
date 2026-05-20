@@ -976,7 +976,7 @@ def _render_by_program(engine):
             else "no rev"
         )
         with st.expander(
-            f"**{prog}** — Revenue ${row['Revenue']:,.2f} · Cost ${row['Cost']:,.2f} · Margin {margin_label}",
+            f"**{prog}** — Revenue \\${row['Revenue']:,.2f} · Cost \\${row['Cost']:,.2f} · Margin {margin_label}",
             expanded=False,
         ):
             inv_sub = invoice_df[invoice_df["customer_program"] == prog] if not invoice_df.empty else pd.DataFrame()
