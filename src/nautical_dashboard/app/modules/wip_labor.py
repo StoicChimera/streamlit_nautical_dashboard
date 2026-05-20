@@ -257,7 +257,7 @@ def get_temp_programs() -> list[str]:
     return df["sbs2_raw"].dropna().tolist()
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_approved_cogs_pools_weekly(period: str) -> pd.DataFrame:
     """
     Weekly labor pool by (iso_week, cost_center, labor_type). For the
@@ -490,7 +490,7 @@ def get_alias_map() -> dict[str, str]:
     return {row["alias"].lower(): row["canonical_name"] for _, row in df.iterrows()}
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_approved_cogs_pools(period: str) -> pd.DataFrame:
     """
     Approved labor pool by (cost_center, labor_source) for COGS lines.
@@ -819,7 +819,7 @@ def get_shipment_units(period: str) -> pd.DataFrame:
     return pd.read_sql(sql, engine, params={"period": period})
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner=False)
 def get_revenue_by_program(period: str) -> pd.DataFrame:
     sql = text("""
         SELECT
@@ -2168,7 +2168,7 @@ def _activity_dfs(period: str) -> dict[str, pd.DataFrame]:
     }
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner="Computing employee allocations...")
 def _cached_employee_alloc(period: str) -> pd.DataFrame:
     """
     Cached wrapper around wlc.build_employee_allocations.
@@ -2189,7 +2189,7 @@ def _cached_employee_alloc(period: str) -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=600, show_spinner="Computing employee allocations...")
 def _cached_employee_alloc_with_warnings(period: str):
     """
     Tuple-returning variant for callers that need the (result, warnings) pair.
@@ -2676,14 +2676,14 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
     # -------------------------------------------------------------------------
     # 2. Load review data
     # -------------------------------------------------------------------------
-    direct_all = get_direct_hire(period)
-    temp_all   = get_temp_labor(period)
-    if cost_type_filter != "All":
-        direct_all = direct_all[direct_all["cost_type"] == cost_type_filter].copy()
-        temp_all   = temp_all[temp_all["cost_type"] == cost_type_filter].copy()
+    direct_emp = wla.list_employees_for_review(period, 'direct')
+    temp_emp   = wla.list_employees_for_review(period, 'temp')
 
-    total_rows    = len(direct_all) + len(temp_all)
-    reviewed_rows = int(direct_all["reviewed"].sum()) + int(temp_all["reviewed"].sum())
+    total_rows    = len(direct_emp) + len(temp_emp)
+    reviewed_rows = (
+        int(direct_emp['reviewed'].fillna(False).sum()) +
+        int(temp_emp['reviewed'].fillna(False).sum())
+    )
     all_reviewed  = (total_rows > 0) and (reviewed_rows == total_rows)
 
     # -------------------------------------------------------------------------
