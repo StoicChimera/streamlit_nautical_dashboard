@@ -236,13 +236,3 @@ def render():
     )
     acct_summary["Total"] = acct_summary["Total"].map(fmt_dollar)
     st.dataframe(acct_summary, use_container_width=True, hide_index=True)
-
-    # Raw transactions
-    with st.expander("Raw transactions"):
-        display_df = detail_df[[
-            "accrual_period", "txn_date", "source", "category",
-            "account_name", "counterparty", "description", "department", "amount"
-        ]].copy()
-        display_df["amount"] = display_df["amount"].map(fmt_dollar)
-        display_df = display_df.sort_values(["accrual_period", "category", "txn_date"])
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
