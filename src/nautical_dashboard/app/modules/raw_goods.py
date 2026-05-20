@@ -926,8 +926,8 @@ def _render_wip(engine):
     st.subheader("WIP Raw Material — Open and Released")
     st.caption(
         "WIP entries are auto-created from the Consumption tab when a BOPP entry "
-        "is for a program with no revenue in the period."
-        "Invoice-based raw goods won't appear here — they tie to revenue automatically."
+        "is for a program with no revenue in the period. "
+        "Invoice-based raw goods won't appear here as they tie to revenue automatically."
     )
 
     wip_df = load_wip(engine)
