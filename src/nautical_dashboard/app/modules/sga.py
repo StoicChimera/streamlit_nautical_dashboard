@@ -117,9 +117,7 @@ def render():
 
     # --- KPIs ---
     monthly_totals = filtered.groupby("accrual_period")["total"].sum()
-    total_spend    = monthly_totals.sum()
     avg_monthly    = monthly_totals.mean()
-    top_category   = filtered.groupby("category")["total"].sum().idxmax()
 
     # MoM change on latest two periods
     if len(monthly_totals) >= 2:
@@ -130,11 +128,9 @@ def render():
     else:
         mom_label = "—"
 
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Total SG&A",       fmt_dollar(total_spend))
-    k2.metric("Avg Monthly",       fmt_dollar(avg_monthly))
-    k3.metric("Largest Category",  top_category)
-    k4.metric("MoM Change",        mom_label)
+    k1, k2 = st.columns(2)
+    k1.metric("Avg Monthly", fmt_dollar(avg_monthly))
+    k2.metric("MoM Change",  mom_label)
 
     st.divider()
 
