@@ -1120,11 +1120,20 @@ def write_production_layers(period: str, committed_by: str):
 
 def run_fifo_matching(period: str, applied_by: str):
     alias_map_df = pd.read_sql(text("""
-        SELECT LOWER(alias) AS alias, canonical_name
+        SELECT alias, LOWER(alias) AS alias_lc, canonical_name
         FROM dim_customer_alias
         WHERE active = TRUE AND exclude = FALSE
     """), engine)
-    alias_map = dict(zip(alias_map_df["alias"], alias_map_df["canonical_name"]))
+    alias_map = dict(zip(alias_map_df["alias_lc"], alias_map_df["canonical_name"]))
+
+    # Reverse map: canonical -> set of raw aliases that resolve to it
+    # Used to bridge invoice (canonical) -> layer (raw) when OW labor was allocated under raw names
+    reverse_alias_map = {}
+    for _, row in alias_map_df.iterrows():
+        canonical = row["canonical_name"]
+        if canonical not in reverse_alias_map:
+            reverse_alias_map[canonical] = set()
+        reverse_alias_map[canonical].add(row["alias"])
 
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1178,11 +1187,17 @@ def run_fifo_matching(period: str, applied_by: str):
             if units_to_apply <= 0:
                 continue
 
-            raw_name      = str(sale["customer_name"]).lower()
-            program_label = alias_map.get(raw_name, str(sale["customer_name"]))
+            raw_name      = str(sale["customer_name"])
+            raw_lc        = raw_name.lower()
+            program_label = alias_map.get(raw_lc, raw_name)
+
+            # Candidate names: invoice raw, its canonical, AND all raw aliases of that canonical
+            # (bridges OW labor allocated under raw names against invoices using canonical names)
+            candidates_lc = {raw_lc, program_label.lower()}
+            candidates_lc.update(a.lower() for a in reverse_alias_map.get(program_label, set()))
 
             eligible = layers[
-                (layers["customer_program"] == program_label) &
+                (layers["customer_program"].str.lower().isin(candidates_lc)) &
                 (layers["output_type"]      == output_type)
             ]
             if cost_center is not None:
