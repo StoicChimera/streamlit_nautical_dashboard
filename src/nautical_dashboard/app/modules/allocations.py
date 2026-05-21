@@ -1013,7 +1013,11 @@ def render():
 
     col_month, col_reviewer, col_spacer = st.columns([2, 2, 4])
     with col_month:
-        picked = st.date_input("Allocation month", value=st.session_state["wh_month_calendar"], key="wh_month_picker")
+        picked = st.date_input(
+            "Allocation month",
+            value=st.session_state["wh_month_calendar"],
+            key="wh_month_picker",
+        )
         month_start = month_floor(picked)
         st.session_state["wh_month_calendar"] = month_start
         st.session_state["wh_controls"]["month_start"] = month_start
@@ -1025,26 +1029,35 @@ def render():
 
     st.markdown("---")
 
-    # Committed state banner
+    # Committed state banner — single is_committed() call, used by banner + tab gating
     committed = is_committed(month_start)
     if committed:
-        st.success(f"Allocation committed for {month_start:%Y-%m}. Scroll to Committed Results to review or unlock.")
+        st.success(
+            f"Allocation committed for {month_start:%Y-%m}. "
+            "Switch to Committed Results to review or unlock."
+        )
     else:
         st.warning(f"Allocation not yet committed for {month_start:%Y-%m}.")
 
-    # Warehouse cost
+    # Warehouse cost (always visible at top — drives the commit section)
     st.markdown("---")
     total_wh_cost = _render_warehouse_cost(month_start)
-
     st.markdown("---")
 
-    tab_setup, tab_results, tab_wip = st.tabs([
-        "Setup",
-        "Committed Results",
-        "Warehouse WIP",
-    ])
+    # Lazy-loaded tabs. st.tabs renders ALL contents on every script run,
+    # so an inactive tab's DB queries still hit on every widget interaction.
+    # st.segmented_control gives the same tab-bar UX but only the active
+    # branch's render function runs.
+    TABS = ["Setup", "Committed Results", "Warehouse WIP"]
+    active_tab = st.segmented_control(
+        "View",
+        options=TABS,
+        default=TABS[0],
+        key=f"wh_active_tab_{month_start}",
+        label_visibility="collapsed",
+    ) or TABS[0]
 
-    with tab_setup:
+    if active_tab == "Setup":
         if not committed:
             _render_shared_sqft(month_start, months)
             st.markdown("---")
@@ -1057,13 +1070,13 @@ def render():
                 "Go to Committed Results to review or unlock."
             )
 
-    with tab_results:
+    elif active_tab == "Committed Results":
         if committed:
             _render_committed_results(month_start)
         else:
             st.info("No committed allocation for this period yet.")
 
-    with tab_wip:
+    elif active_tab == "Warehouse WIP":
         _render_warehouse_wip_tab(month_start, reviewer)
 
 
