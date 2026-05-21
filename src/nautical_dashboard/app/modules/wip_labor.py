@@ -955,10 +955,12 @@ def write_production_layers(period: str, committed_by: str):
     Writes stg_wip_production_layers using pool amounts sourced from
     stg_labor_incurred (the committed truth) and units from smartsheet.
 
-    For each cost_center + customer_program:
+    Per (cost_center, customer_program):
       1. Total pool = SUM(allocated_cost) from stg_labor_incurred
-      2. Distribute pool across ISO weeks proportional to that week's units
-      3. Write one layer row per iso_week per cost_center per customer_program
+      2. Pull units split by (iso_week, output_type) from the appropriate smartsheet
+      3. Pool is fungible across output_types — single cost_per_unit derived from
+         total units across all output_types
+      4. Write one layer row per (iso_week, output_type) per cost_center per program
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -977,10 +979,12 @@ def write_production_layers(period: str, committed_by: str):
     if pools.empty:
         return
 
+    # Demo: single output_type 'kit'
     demo_units = pd.read_sql(text("""
         SELECT
             EXTRACT(WEEK FROM normalized_date::date)::int AS iso_week,
             COALESCE(a.canonical_name, s.customer)        AS customer,
+            'kit'::text                                    AS output_type,
             SUM(number_of_cases_completed)                AS units
         FROM stg_smartsheet_demo s
         LEFT JOIN dim_customer_alias a
@@ -992,10 +996,15 @@ def write_production_layers(period: str, committed_by: str):
         GROUP BY 1, 2
     """), engine, params={"period": period})
 
+    # OGP: split bag vs packout by bag_version
     ogp_units = pd.read_sql(text("""
         SELECT
             EXTRACT(WEEK FROM s.date)::int                AS iso_week,
             COALESCE(a.canonical_name, s.job_name)        AS customer,
+            CASE
+                WHEN s.bag_version ILIKE '%packout%' THEN 'packout'
+                ELSE 'bag'
+            END                                            AS output_type,
             SUM(s.daily_production_complete)              AS units
         FROM stg_smartsheet_ogp s
         LEFT JOIN dim_customer_alias a
@@ -1003,35 +1012,43 @@ def write_production_layers(period: str, committed_by: str):
         WHERE s.accrual_month = :period
           AND s.daily_production_complete > 0
           AND s.date IS NOT NULL
-        GROUP BY 1, 2
+        GROUP BY 1, 2, 3
     """), engine, params={"period": period})
 
+    # OW: split overwrap vs packout by pack_out_job; resolve customer via SQL function
     ow_units = pd.read_sql(text("""
         SELECT
-            EXTRACT(WEEK FROM date_finished)::int         AS iso_week,
-            COALESCE(a.canonical_name, s.customer)        AS customer,
-            SUM(units_produced)                           AS units
+            EXTRACT(WEEK FROM date_finished)::int           AS iso_week,
+            resolve_overwrap_customer(
+                s.customer, s.project_name, s.work_order_number
+            )                                                AS customer,
+            CASE
+                WHEN s.pack_out_job = 'Yes - Pack Out' THEN 'packout'
+                ELSE 'overwrap'
+            END                                              AS output_type,
+            SUM(units_produced)                              AS units
         FROM stg_smartsheet_overwrap s
-        LEFT JOIN dim_customer_alias a
-            ON LOWER(a.alias) = LOWER(s.customer) AND a.active = TRUE
         WHERE accrual_month = :period
           AND units_produced > 0
           AND date_finished IS NOT NULL
-        GROUP BY 1, 2
+          AND resolve_overwrap_customer(
+                s.customer, s.project_name, s.work_order_number
+              ) IS NOT NULL
+        GROUP BY 1, 2, 3
     """), engine, params={"period": period})
 
     units_by_cc = {
-        "Demo": demo_units,
-        "OGP": ogp_units,
+        "Demo":     demo_units,
+        "OGP":      ogp_units,
         "Overwrap": ow_units,
     }
 
     layer_rows = []
 
     for _, pool_row in pools.iterrows():
-        cost_center = str(pool_row["cost_center"])
+        cost_center      = str(pool_row["cost_center"])
         customer_program = str(pool_row["customer_program"])
-        total_pool = float(pool_row["labor_pool"])
+        total_pool       = float(pool_row["labor_pool"])
 
         units_df = units_by_cc.get(cost_center, pd.DataFrame())
         if units_df.empty:
@@ -1044,28 +1061,31 @@ def write_production_layers(period: str, committed_by: str):
         if prog_units.empty:
             continue
 
+        # Labor is fungible — single cost_per_unit across all output_types
         total_units = float(prog_units["units"].sum())
         if total_units == 0:
             continue
 
         for _, unit_row in prog_units.iterrows():
-            iso_week = int(unit_row["iso_week"])
-            units = float(unit_row["units"])
-            weight = units / total_units
-            pool = round(total_pool * weight, 2)
+            iso_week    = int(unit_row["iso_week"])
+            output_type = str(unit_row["output_type"])
+            units       = float(unit_row["units"])
+            weight      = units / total_units
+            pool        = round(total_pool * weight, 2)
 
             layer_rows.append({
-                "accrual_period": period,
-                "iso_week": iso_week,
-                "cost_center": cost_center,
+                "accrual_period":   period,
+                "iso_week":         iso_week,
+                "cost_center":      cost_center,
                 "customer_program": customer_program,
-                "units_produced": units,
-                "labor_pool": pool,
-                "cost_per_unit": round(pool / units, 6) if units > 0 else 0.0,
-                "units_remaining": units,
-                "layer_locked": True,
-                "locked_by": committed_by,
-                "locked_at": now,
+                "output_type":      output_type,
+                "units_produced":   units,
+                "labor_pool":       pool,
+                "cost_per_unit":    round(pool / units, 6) if units > 0 else 0.0,
+                "units_remaining":  units,
+                "layer_locked":     True,
+                "locked_by":        committed_by,
+                "locked_at":        now,
             })
 
     if not layer_rows:
@@ -1079,14 +1099,14 @@ def write_production_layers(period: str, committed_by: str):
         for r in layer_rows:
             conn.execute(text("""
                 INSERT INTO stg_wip_production_layers
-                    (accrual_period, iso_week, cost_center, customer_program,
+                    (accrual_period, iso_week, cost_center, customer_program, output_type,
                      units_produced, labor_pool, cost_per_unit, units_remaining,
                      layer_locked, locked_by, locked_at)
                 VALUES
-                    (:accrual_period, :iso_week, :cost_center, :customer_program,
+                    (:accrual_period, :iso_week, :cost_center, :customer_program, :output_type,
                      :units_produced, :labor_pool, :cost_per_unit, :units_remaining,
                      :layer_locked, :locked_by, :locked_at)
-                ON CONFLICT (accrual_period, iso_week, cost_center, customer_program)
+                ON CONFLICT (accrual_period, iso_week, cost_center, customer_program, output_type)
                 DO UPDATE SET
                     units_produced  = EXCLUDED.units_produced,
                     labor_pool      = EXCLUDED.labor_pool,
@@ -1120,14 +1140,15 @@ def run_fifo_matching(period: str, applied_by: str):
             ORDER BY iso_week, doc_number
         """), engine, params={"period": period})
 
-    demo_sales = _get_sales("v_kit_sales_by_iso_week")
-    bag_sales  = _get_sales("v_bag_sales_by_iso_week")
-    ow_sales   = _get_sales("v_overwrap_sales_by_iso_week")
+    demo_sales     = _get_sales("v_kit_sales_by_iso_week")
+    bag_sales      = _get_sales("v_bag_sales_by_iso_week")
+    ow_sales       = _get_sales("v_overwrap_sales_by_iso_week")
+    pickpack_sales = _get_sales("v_pickpack_sales_by_iso_week")
 
     # Pull all layers with remaining units — FIFO oldest first
     layers = pd.read_sql(text("""
         SELECT id, accrual_period, iso_week, cost_center, customer_program,
-               units_remaining, cost_per_unit
+               output_type, units_remaining, cost_per_unit
         FROM stg_wip_production_layers
         WHERE units_remaining > 0
         ORDER BY iso_week ASC, accrual_period ASC
@@ -1141,7 +1162,15 @@ def run_fifo_matching(period: str, applied_by: str):
 
     applied_rows = []
 
-    def _process(sales_df, cost_center, alias_map):
+    def _process(sales_df, output_type, alias_map, cost_center=None):
+        """
+        FIFO-consume eligible production layers for the given sales.
+
+        output_type : which layer type these sales consume from ('bag', 'overwrap',
+                      'packout', 'kit'). REQUIRED.
+        cost_center : optional filter. None = pickpack mode, consumes packout
+                      layers across all cost_centers (OGP packout + OW packout).
+        """
         if sales_df.empty:
             return
         for _, sale in sales_df.iterrows():
@@ -1149,14 +1178,17 @@ def run_fifo_matching(period: str, applied_by: str):
             if units_to_apply <= 0:
                 continue
 
-            # Resolve customer name to canonical program via alias map
-            raw_name       = str(sale["customer_name"]).lower()
-            program_label  = alias_map.get(raw_name, str(sale["customer_name"]))
+            raw_name      = str(sale["customer_name"]).lower()
+            program_label = alias_map.get(raw_name, str(sale["customer_name"]))
 
             eligible = layers[
-                (layers["cost_center"] == cost_center) &
-                (layers["customer_program"] == program_label)
-            ].sort_values(["iso_week", "accrual_period"])
+                (layers["customer_program"] == program_label) &
+                (layers["output_type"]      == output_type)
+            ]
+            if cost_center is not None:
+                eligible = eligible[eligible["cost_center"] == cost_center]
+
+            eligible = eligible.sort_values(["iso_week", "accrual_period"])
 
             for _, layer in eligible.iterrows():
                 if units_to_apply <= 0:
@@ -1173,7 +1205,7 @@ def run_fifo_matching(period: str, applied_by: str):
                     "accrual_period":    period,
                     "invoice_num":       str(sale["doc_number"]),
                     "customer_name":     str(sale["customer_name"]),
-                    "cost_center":       cost_center,
+                    "cost_center":       str(layer["cost_center"]),
                     "customer_program":  program_label,
                     "iso_week_produced": int(layer["iso_week"]),
                     "units_applied":     applied,
@@ -1187,11 +1219,14 @@ def run_fifo_matching(period: str, applied_by: str):
                 remaining[lid]  = avail - applied
                 units_to_apply -= applied
 
-    is_walmart = lambda n: "walmart" in n.lower()
-
-    _process(demo_sales, "Demo",     alias_map)
-    _process(bag_sales,  "OGP",      alias_map)
-    _process(ow_sales,   "Overwrap", alias_map)
+    # Bag invoices consume OGP/bag layers
+    _process(bag_sales,      output_type="bag",      alias_map=alias_map, cost_center="OGP")
+    # Demo invoices consume Demo/kit layers
+    _process(demo_sales,     output_type="kit",      alias_map=alias_map, cost_center="Demo")
+    # Overwrap invoices consume Overwrap/overwrap layers
+    _process(ow_sales,       output_type="overwrap", alias_map=alias_map, cost_center="Overwrap")
+    # Pickpack invoices consume packout layers from ANY cost_center (OGP+OW combined FIFO)
+    _process(pickpack_sales, output_type="packout",  alias_map=alias_map, cost_center=None)
 
     if not applied_rows:
         return
