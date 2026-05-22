@@ -2789,20 +2789,27 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
     # -------------------------------------------------------------------------
     # 3. Load OR compute — locked periods read from persisted snapshot
     # -------------------------------------------------------------------------
-    # When the allocation is locked, stg_labor_incurred_employee already
-    # holds the fanned-out result that employee_alloc_df would contain.
-    # Reading from it instead of recomputing is the difference between
-    # ~2 minutes of pandas work and a single sub-second SQL read.
+    # TEMPORARY: timing diagnostics. Remove after we know where time goes.
+    import time
+    _tick_state = {"t": time.time()}
+    def _tick(label):
+        now = time.time()
+        st.caption(f"⏱ {label}: {now - _tick_state['t']:.2f}s")
+        _tick_state["t"] = now
+
     existing  = get_existing_allocation(period)
     is_locked = not existing.empty
+    _tick("get_existing_allocation + is_locked check")
 
     if is_locked:
         # Locked path — single SQL read, zero recompute.
         employee_alloc_df = _load_employee_alloc_from_persisted(period)
-        alloc_warnings    = []
+        _tick("_load_employee_alloc_from_persisted")
+        alloc_warnings = []
         approved_summary, approved_detail = build_approved_employee_overview(
             period, cost_type_filter, emp_alloc=employee_alloc_df,
         )
+        _tick("build_approved_employee_overview (locked)")
         # Stubs for sections that are skipped or unused in the locked path.
         pools_df          = pd.DataFrame()
         pools_weekly      = pd.DataFrame()
@@ -2814,29 +2821,45 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
         reconciliation_df = pd.DataFrame()
         driver_overview   = {}
     else:
-        # Unlocked path — full compute, unchanged from prior behavior.
         pools_df = get_approved_cogs_pools(period)
+        _tick("get_approved_cogs_pools")
 
         sga_pool = get_approved_sga_pool(period)
         if cost_type_filter == "WIP":
             sga_pool = 0.0
+        _tick("get_approved_sga_pool")
 
-        activity     = _activity_dfs(period)
-        revenue_df   = get_revenue_by_program(period)
+        activity = _activity_dfs(period)
+        _tick("_activity_dfs (6 queries)")
+
+        revenue_df = get_revenue_by_program(period)
+        _tick("get_revenue_by_program")
+
         pools_weekly = get_approved_cogs_pools_weekly(period)
         pools_weekly["effective_bucket"] = pools_weekly["effective_bucket"].map(_normalize_bucket)
+        _tick("get_approved_cogs_pools_weekly")
+
         cogs_alloc = compute_cogs_allocation(pools_df, activity)
         sga_alloc  = compute_sga_allocation(sga_pool, revenue_df)
+        _tick("compute_cogs_allocation + compute_sga_allocation (deprecated no-ops)")
+
         employee_alloc_df, alloc_warnings = build_employee_heuristic_allocations(
             period, activity, revenue_df, cost_type_filter, return_warnings=True,
         )
+        _tick("build_employee_heuristic_allocations [LIKELY HOTSPOT]")
+
         reconciliation_df = build_program_reconciliation(
             pools_df, cogs_alloc, sga_pool, sga_alloc, employee_alloc_df,
         )
+        _tick("build_program_reconciliation")
+
         driver_overview = build_activity_driver_overview(cogs_alloc, activity, pools_weekly)
+        _tick("build_activity_driver_overview")
+
         approved_summary, approved_detail = build_approved_employee_overview(
             period, cost_type_filter,
         )
+        _tick("build_approved_employee_overview (unlocked)")
 
     # -------------------------------------------------------------------------
     # 4. Display
