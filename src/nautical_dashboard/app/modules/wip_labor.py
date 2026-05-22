@@ -915,37 +915,81 @@ def commit_allocation(rows: list[dict], period: str, committed_by: str):
 
 
 def unlock_allocation(period: str):
+    """
+    Unlocks a committed period by deleting all artifacts scoped to that period.
+    Manually-matched work order rows are preserved (operator intent shouldn't
+    be lost on unlock).
+
+    Architecture note — why this is a pure DELETE:
+    --------------------------------------------------------------------------
+    All "remaining" or "available" quantities in the labor pipeline are
+    computed from events (stg_wip_fifo_applied) at read time, not stored
+    as mutable counters. Production layer availability is derived as:
+
+        available = units_produced - SUM(fifo_applied.units_applied)
+
+    So when this function deletes a period's fifo_applied events, the layers
+    those events were consuming automatically become available again on the
+    next read — there is no counter to reverse.
+
+    A common scenario: March's commit consumed some of Feb's layers (March
+    fifo_applied rows reference Feb iso_weeks). Unlocking March deletes those
+    March events; Feb's layers automatically show their consumption reduced
+    on next query. No cross-period restoration logic needed.
+
+    The DELETEs are ordered output-first → events → source artifacts → input,
+    so each table is gone before anything that might still reference it on
+    read. All run inside a single transaction; partial failure rolls back.
+    """
     with engine.begin() as conn:
+        # 1. The persisted end-state (P&L + WIP rollup) — nothing reads from it
+        #    after this delete; safe to remove first.
         conn.execute(
-            text("DELETE FROM stg_labor_allocation WHERE accrual_period = :period"),
+            text("DELETE FROM stg_labor_applied WHERE accrual_period = :period"),
             {"period": period},
         )
-        conn.execute(
-            text("DELETE FROM stg_wip_production_layers WHERE accrual_period = :period"),
-            {"period": period},
-        )
+
+        # 2. Event tables. These are the source of truth for what consumed
+        #    what; removing them is what restores availability on layers
+        #    (current period and any prior periods this period consumed from).
         conn.execute(
             text("DELETE FROM stg_wip_fifo_applied WHERE accrual_period = :period"),
+            {"period": period},
+        )
+        conn.execute(
+            text("""
+                DELETE FROM stg_wip_work_order_applied
+                WHERE accrual_period = :period AND match_type != 'manual'
+            """),
             {"period": period},
         )
         conn.execute(
             text("DELETE FROM stg_wip_program_labor_accrual WHERE accrual_period = :period"),
             {"period": period},
         )
+
+        # 3. Production layer artifacts for this period. Other periods' layers
+        #    are not touched (they're independent records owned by their own
+        #    accrual_period).
         conn.execute(
-            text("DELETE FROM stg_wip_work_order_applied WHERE accrual_period = :period AND match_type != 'manual'"),
+            text("DELETE FROM stg_wip_production_layers WHERE accrual_period = :period"),
+            {"period": period},
+        )
+
+        # 4. Allocated labor and per-employee detail (regenerated from
+        #    stg_labor_employee_allocation + activity data on re-commit).
+        conn.execute(
+            text("DELETE FROM stg_labor_incurred_employee WHERE accrual_period = :period"),
             {"period": period},
         )
         conn.execute(
             text("DELETE FROM stg_labor_incurred WHERE accrual_period = :period"),
             {"period": period},
         )
+
+        # 5. The committed allocation lock itself.
         conn.execute(
-            text("DELETE FROM stg_labor_incurred_employee WHERE accrual_period = :period"),
-            {"period": period},
-        )
-        conn.execute(
-            text("DELETE FROM stg_labor_applied WHERE accrual_period = :period"),
+            text("DELETE FROM stg_labor_allocation WHERE accrual_period = :period"),
             {"period": period},
         )
 
