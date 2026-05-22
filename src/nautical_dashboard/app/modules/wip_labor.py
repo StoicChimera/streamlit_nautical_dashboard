@@ -2034,6 +2034,85 @@ def write_labor_applied(period: str, locked_by: str):
             )
         """), {"period": period, "locked_by": locked_by, "locked_at": now})
 
+        # ----------------------------------------------------------------
+        # Source 5 — production_wip
+        # Demo/OGP/Overwrap layer labor produced this period but not yet
+        # consumed by FIFO. Bridges the gap between stg_labor_incurred
+        # (which includes production allocations) and stg_labor_applied
+        # (which only included consumed labor via the 'fifo' source).
+        # Without this, production WIP would be invisible to any KPI
+        # that reads from stg_labor_applied, breaking the
+        # incurred = applied identity used as a close-out sanity check.
+        #
+        # Math: per layer, unconsumed_cost = units_remaining_at_close * cost_per_unit
+        # Where units_remaining_at_close = units_produced - units consumed
+        # by THIS period's FIFO (not later periods — those will be
+        # written into their own period's stg_labor_applied as 'fifo' rows).
+        # ----------------------------------------------------------------
+        conn.execute(text("""
+            INSERT INTO stg_labor_applied (
+                accrual_period, source, bucket, program, labor_type,
+                activity_driver, activity_value, weight,
+                wip_units_forward, wip_cost_forward,
+                wip_units_remaining, wip_cost_remaining,
+                applied_units, applied_cost,
+                locked, locked_by, locked_at
+            )
+            WITH this_period_consumption AS (
+                SELECT
+                    f.cost_center,
+                    f.iso_week_produced AS iso_week,
+                    CASE 
+                        WHEN f.customer_program LIKE 'Advantage - %' 
+                        THEN REPLACE(f.customer_program, 'Advantage - ', '')
+                        ELSE f.customer_program 
+                    END AS canonical_program,
+                    SUM(f.units_applied) AS units_consumed
+                FROM stg_wip_fifo_applied f
+                WHERE f.accrual_period = :period
+                GROUP BY 1, 2, 3
+            ),
+            unconsumed_layers AS (
+                SELECT
+                    l.accrual_period,
+                    l.cost_center,
+                    l.customer_program,
+                    SUM(l.units_produced) - COALESCE(SUM(c.units_consumed), 0) AS units_unconsumed,
+                    SUM(l.units_produced * l.cost_per_unit) 
+                        - COALESCE(SUM(c.units_consumed * l.cost_per_unit), 0) AS cost_unconsumed
+                FROM stg_wip_production_layers l
+                LEFT JOIN this_period_consumption c
+                    ON c.cost_center = l.cost_center
+                   AND c.iso_week    = l.iso_week
+                   AND c.canonical_program = CASE 
+                        WHEN l.customer_program LIKE 'Advantage - %' 
+                        THEN REPLACE(l.customer_program, 'Advantage - ', '')
+                        ELSE l.customer_program 
+                   END
+                WHERE l.accrual_period = :period
+                GROUP BY 1, 2, 3
+                HAVING SUM(l.units_produced * l.cost_per_unit) 
+                       - COALESCE(SUM(c.units_consumed * l.cost_per_unit), 0) > 0.005
+            )
+            SELECT
+                accrual_period,
+                'production_wip'                AS source,
+                cost_center                     AS bucket,
+                customer_program                AS program,
+                'direct_cogs'                   AS labor_type,
+                'Production Layer Unconsumed'   AS activity_driver,
+                units_unconsumed                AS activity_value,
+                NULL                            AS weight,
+                units_unconsumed                AS wip_units_forward,
+                cost_unconsumed                 AS wip_cost_forward,
+                units_unconsumed                AS wip_units_remaining,
+                cost_unconsumed                 AS wip_cost_remaining,
+                0                               AS applied_units,
+                cost_unconsumed                 AS applied_cost,
+                TRUE, :locked_by, :locked_at
+            FROM unconsumed_layers
+        """), {"period": period, "locked_by": locked_by, "locked_at": now})
+
 def run_work_order_matching(period: str, applied_by: str):
     """
     Suggestion-only work order matching for Arrived Co and Recess.
@@ -3233,19 +3312,28 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
             # period_allocation: current labor against programs with current revenue
             # fifo: current invoices consuming prior-period production layers
             # fulfillment_wip_applied: prior WIP the reviewer applied to current period
+            # Labor to P&L — sources that hit current period income statement.
             labor_to_pnl = applied_df[
                 applied_df["source"].isin(["period_allocation", "fifo", "fulfillment_wip_applied"])
             ]["applied_cost"].sum()
 
             # New WIP Generated — current-period labor that did NOT hit P&L,
             # added to balance sheet WIP for future application.
-            # current_fulfillment_wip: labor for programs with no current revenue
-            # work_order_assigned: ArrivedCo/Recess labor not yet billed
+            #   current_fulfillment_wip: labor for programs with no current revenue
+            #   work_order_assigned: ArrivedCo/Recess labor not yet billed
+            #   production_wip: Demo/OGP/Overwrap layer labor not yet FIFO-consumed
             new_wip_generated = applied_df[
-                applied_df["source"].isin(["current_fulfillment_wip", "work_order_assigned"])
+                applied_df["source"].isin([
+                    "current_fulfillment_wip", 
+                    "work_order_assigned",
+                    "production_wip",
+                ])
             ]["applied_cost"].sum()
 
-            # Total committed = everything written to stg_labor_applied this period
+            # Total committed = everything written to stg_labor_applied this period.
+            # Should reconcile to SUM(allocated_cost) from stg_labor_incurred for
+            # this period (plus the ArrivedCo/Recess work_order_assigned amount
+            # which originates in stg_wip_program_labor_accrual, not stg_labor_incurred).
             total_committed = labor_to_pnl + new_wip_generated
 
             a1, a2, a3, a4, a5 = st.columns(5)
