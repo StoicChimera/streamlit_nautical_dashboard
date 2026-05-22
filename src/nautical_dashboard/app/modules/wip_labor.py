@@ -1515,6 +1515,17 @@ def get_wip_summary(period: str) -> pd.DataFrame:
                 units_produced * cost_per_unit AS layer_pool
             FROM stg_wip_production_layers
             WHERE accrual_period = :period
+              -- Exclude ArrivedCo/Recess Overwrap. That labor is surfaced as
+              -- Work Order WIP via stg_wip_program_labor_accrual, not as
+              -- Production WIP. Including it here would double-count when
+              -- the page sums Production + Work Order WIP for Total Balance.
+              AND NOT (
+                  cost_center = 'Overwrap'
+                  AND (
+                      customer_program ILIKE '%arrived%'
+                      OR customer_program ILIKE '%recess%'
+                  )
+              )
         ),
         consumed AS (
             -- Source-of-truth consumption from fifo_applied, not units_remaining.
@@ -1568,6 +1579,13 @@ def get_outstanding_wip_all_periods() -> pd.DataFrame:
                 iso_week, units_produced, cost_per_unit,
                 units_produced * cost_per_unit AS layer_pool
             FROM stg_wip_production_layers
+            WHERE NOT (
+                cost_center = 'Overwrap'
+                AND (
+                    customer_program ILIKE '%arrived%'
+                    OR customer_program ILIKE '%recess%'
+                )
+            )
         ),
         consumed AS (
             -- ALL consumption ever recognized against these layers,
@@ -1610,6 +1628,12 @@ def get_outstanding_wip_all_periods() -> pd.DataFrame:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def get_fulfillment_wip(period: str) -> pd.DataFrame:
+    """
+    Returns fulfillment WIP for the period — labor allocated to programs
+    with no current-period revenue. Reads from stg_labor_applied where
+    source = 'current_fulfillment_wip', which is written by
+    write_labor_applied Source 4 during commit.
+    """
     try:
         return pd.read_sql(text("""
             SELECT
@@ -1622,12 +1646,7 @@ def get_fulfillment_wip(period: str) -> pd.DataFrame:
                 la.accrual_period
             FROM stg_labor_applied la
             WHERE la.accrual_period = :period
-              AND la.source = 'period_allocation'
-              AND NOT EXISTS (
-                  SELECT 1 FROM mv_program_profitability mv
-                  WHERE mv.month_start = TO_DATE(la.accrual_period, 'YYYY-MM')
-                    AND mv.customer_program = la.program
-              )
+              AND la.source = 'current_fulfillment_wip'
             GROUP BY 1, 2, 3, 4, 7
             ORDER BY applied_cost DESC
         """), engine, params={"period": period})
