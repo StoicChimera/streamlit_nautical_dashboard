@@ -225,45 +225,57 @@ def load_wip_summary_as_of(_engine, year: int, month: int) -> dict:
     # ----------------------------------------------------------------
     labor_production_wip = pd.read_sql(
         text("""
+            WITH layers AS (
+                SELECT 
+                    l.accrual_period,
+                    l.cost_center,
+                    l.customer_program,
+                    l.output_type,
+                    l.iso_week,
+                    l.units_produced,
+                    l.cost_per_unit,
+                    l.units_produced * l.cost_per_unit AS layer_pool
+                FROM stg_wip_production_layers l
+                WHERE TO_DATE(l.accrual_period, 'YYYY-MM') <= :period_end
+            ),
+            consumed AS (
+                -- Source-of-truth consumption from fifo_applied, not units_remaining
+                -- (units_remaining can be corrupted by unlock cycles that don't restore it)
+                SELECT
+                    f.cost_center,
+                    f.iso_week_produced AS iso_week,
+                    -- Normalize program names to handle 'Advantage - X' vs 'X' mismatch
+                    CASE 
+                        WHEN f.customer_program LIKE 'Advantage - %' 
+                        THEN REPLACE(f.customer_program, 'Advantage - ', '')
+                        ELSE f.customer_program 
+                    END AS canonical_program,
+                    SUM(f.units_applied) AS units_consumed,
+                    SUM(f.applied_cost)  AS cost_consumed
+                FROM stg_wip_fifo_applied f
+                WHERE TO_DATE(f.accrual_period, 'YYYY-MM') <= :period_end
+                GROUP BY 1, 2, 3
+            )
             SELECT
                 l.accrual_period,
                 l.cost_center,
                 l.customer_program,
-                SUM(l.labor_pool)                                   AS labor_pool,
-                SUM(l.units_produced)                               AS units_produced,
-                COALESCE(SUM(consumed.units_consumed), 0)           AS units_consumed,
-                SUM(l.units_produced) - COALESCE(SUM(consumed.units_consumed), 0)
-                                                                    AS units_remaining,
-                SUM(l.labor_pool) - SUM(
-                    l.labor_pool * CASE WHEN l.units_produced > 0
-                        THEN LEAST(
-                            COALESCE(consumed.units_consumed, 0) / l.units_produced,
-                            1.0
-                        )
-                        ELSE 1.0 END
-                )                                                   AS wip_balance
-            FROM stg_wip_production_layers l
-            LEFT JOIN (
-                SELECT
-                    cost_center,
-                    customer_program,
-                    SUM(units_applied) AS units_consumed
-                FROM stg_wip_fifo_applied
-                WHERE TO_DATE(accrual_period, 'YYYY-MM') <= :period_end
-                GROUP BY 1, 2
-            ) consumed
-                ON consumed.cost_center      = l.cost_center
-                AND consumed.customer_program = l.customer_program
-            WHERE TO_DATE(l.accrual_period, 'YYYY-MM') <= :period_end
+                SUM(l.layer_pool)                                          AS labor_pool,
+                SUM(l.units_produced)                                      AS units_produced,
+                COALESCE(SUM(c.units_consumed), 0)                         AS units_consumed,
+                SUM(l.units_produced) - COALESCE(SUM(c.units_consumed), 0) AS units_remaining,
+                SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0)      AS wip_balance
+            FROM layers l
+            LEFT JOIN consumed c
+                ON c.cost_center = l.cost_center
+               AND c.iso_week    = l.iso_week
+               AND c.canonical_program = CASE 
+                    WHEN l.customer_program LIKE 'Advantage - %' 
+                    THEN REPLACE(l.customer_program, 'Advantage - ', '')
+                    ELSE l.customer_program 
+               END
             GROUP BY l.accrual_period, l.cost_center, l.customer_program
-            HAVING SUM(l.labor_pool) - SUM(
-                l.labor_pool * CASE WHEN l.units_produced > 0
-                    THEN LEAST(
-                        COALESCE(consumed.units_consumed, 0) / l.units_produced,
-                        1.0
-                    )
-                    ELSE 1.0 END
-            ) > 0
+            HAVING SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0) > 0
             ORDER BY 1, 2, 3
         """),
         _engine,
