@@ -3167,23 +3167,29 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
         if applied_df.empty:
             st.info("No applied labor for this period. Commit allocation to generate.")
         else:
-            # Current Applied Labor (period allocation + fifo only)
-            current_applied = applied_df[
-                applied_df["source"].isin(["period_allocation", "fifo"])
+            # Labor to P&L — sources that hit current period income statement.
+            # period_allocation: current labor against programs with current revenue
+            # fifo: current invoices consuming prior-period production layers
+            # fulfillment_wip_applied: prior WIP the reviewer applied to current period
+            labor_to_pnl = applied_df[
+                applied_df["source"].isin(["period_allocation", "fifo", "fulfillment_wip_applied"])
             ]["applied_cost"].sum()
-            
-            # Applied WIP (manual selections + current fulfillment WIP)  
-            applied_wip = applied_df[
-                applied_df["source"].isin(["fulfillment_wip_applied", "work_order_assigned", "current_fulfillment_wip"])
+
+            # New WIP Generated — current-period labor that did NOT hit P&L,
+            # added to balance sheet WIP for future application.
+            # current_fulfillment_wip: labor for programs with no current revenue
+            # work_order_assigned: ArrivedCo/Recess labor not yet billed
+            new_wip_generated = applied_df[
+                applied_df["source"].isin(["current_fulfillment_wip", "work_order_assigned"])
             ]["applied_cost"].sum()
-            
-            # Total Applied Labor
-            total_applied = current_applied + applied_wip
-            
+
+            # Total committed = everything written to stg_labor_applied this period
+            total_committed = labor_to_pnl + new_wip_generated
+
             a1, a2, a3, a4, a5 = st.columns(5)
-            a1.metric("Current Applied Labor", _dollar(current_applied))
-            a2.metric("Applied WIP", _dollar(applied_wip))
-            a3.metric("Total Applied Labor", _dollar(total_applied))
+            a1.metric("Labor to P&L",          _dollar(labor_to_pnl))
+            a2.metric("New WIP Generated",     _dollar(new_wip_generated))
+            a3.metric("Total Labor Committed", _dollar(total_committed))
             a4.metric("Programs", applied_df["program"].nunique())
             a5.metric("Sources", applied_df["source"].nunique())
 
