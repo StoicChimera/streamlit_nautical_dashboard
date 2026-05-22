@@ -58,20 +58,37 @@ def load_sga_breakdown(_engine, year: int, month: int) -> pd.DataFrame:
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_sga_labor_total(_engine, year: int, month: int) -> float:
-    """Total labor SG&A (direct_sga labor type) allocated for the period."""
+    """
+    Total labor SG&A actually hitting current P&L for the period.
+
+    Pulls from stg_labor_applied (the post-allocation truth) filtered to
+    sources that hit the income statement (period_allocation, fifo,
+    fulfillment_wip_applied), and joins to mv_program_profitability so we
+    only count labor for programs with current-period revenue — matching
+    how mv_program_profitability.applied_sga is computed.
+
+    Stranded direct_sga labor (current_fulfillment_wip — no revenue
+    program to absorb it) is excluded; it sits as WIP on the balance
+    sheet and surfaces in the Labor Fulfillment WIP section.
+    """
     period = f"{year}-{month:02d}"
     df = pd.read_sql(
         text("""
-            SELECT COALESCE(SUM(allocated_cost), 0) AS total
-            FROM stg_labor_incurred
-            WHERE accrual_period = :period
-              AND labor_type = 'direct_sga'
+            SELECT COALESCE(SUM(la.applied_cost), 0) AS total
+            FROM stg_labor_applied la
+            WHERE la.accrual_period = :period
+              AND la.labor_type = 'direct_sga'
+              AND la.source IN ('period_allocation', 'fifo', 'fulfillment_wip_applied')
+              AND EXISTS (
+                  SELECT 1 FROM mv_program_profitability mv
+                  WHERE mv.month_start = TO_DATE(la.accrual_period, 'YYYY-MM')
+                    AND mv.customer_program = la.program
+              )
         """),
         _engine,
         params={"period": period},
     )
     return float(df["total"].iloc[0])
-
 
 @st.cache_data(ttl=60, show_spinner=False)
 def load_sga_warehouse_total(_engine, year: int, month: int) -> float:
