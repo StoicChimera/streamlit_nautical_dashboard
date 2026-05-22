@@ -1126,7 +1126,6 @@ def write_production_layers(period: str, committed_by: str):
                 "units_produced":   units,
                 "labor_pool":       pool,
                 "cost_per_unit":    round(pool / units, 6) if units > 0 else 0.0,
-                "units_remaining":  units,
                 "layer_locked":     True,
                 "locked_by":        committed_by,
                 "locked_at":        now,
@@ -1144,18 +1143,17 @@ def write_production_layers(period: str, committed_by: str):
             conn.execute(text("""
                 INSERT INTO stg_wip_production_layers
                     (accrual_period, iso_week, cost_center, customer_program, output_type,
-                     units_produced, labor_pool, cost_per_unit, units_remaining,
+                     units_produced, labor_pool, cost_per_unit,
                      layer_locked, locked_by, locked_at)
                 VALUES
                     (:accrual_period, :iso_week, :cost_center, :customer_program, :output_type,
-                     :units_produced, :labor_pool, :cost_per_unit, :units_remaining,
+                     :units_produced, :labor_pool, :cost_per_unit,
                      :layer_locked, :locked_by, :locked_at)
                 ON CONFLICT (accrual_period, iso_week, cost_center, customer_program, output_type)
                 DO UPDATE SET
                     units_produced  = EXCLUDED.units_produced,
                     labor_pool      = EXCLUDED.labor_pool,
                     cost_per_unit   = EXCLUDED.cost_per_unit,
-                    units_remaining = EXCLUDED.units_remaining,
                     layer_locked    = EXCLUDED.layer_locked,
                     locked_by       = EXCLUDED.locked_by,
                     locked_at       = EXCLUDED.locked_at
