@@ -2220,6 +2220,17 @@ def write_labor_applied(period: str, locked_by: str):
                         ELSE l.customer_program 
                    END
                 WHERE l.accrual_period = :period
+                  -- Exclude ArrivedCo/Recess Overwrap layers — that labor
+                  -- flows to stg_labor_applied via Source 3 (work_order_assigned)
+                  -- through stg_wip_program_labor_accrual. Including it here
+                  -- would double-count: same labor pool, two sources.
+                  AND NOT (
+                      l.cost_center = 'Overwrap'
+                      AND (
+                          l.customer_program ILIKE '%arrived%'
+                          OR l.customer_program ILIKE '%recess%'
+                      )
+                  )
                 GROUP BY 1, 2, 3
                 HAVING SUM(l.units_produced * l.cost_per_unit) 
                        - COALESCE(SUM(c.units_consumed * l.cost_per_unit), 0) > 0.005
