@@ -2219,31 +2219,18 @@ def _activity_dfs(period: str) -> dict[str, pd.DataFrame]:
 
 
 @st.cache_data(ttl=600, show_spinner="Computing employee allocations...")
-def _cached_employee_alloc(period: str) -> pd.DataFrame:
-    """
-    Cached wrapper around wlc.build_employee_allocations.
-
-    The Allocation tab calls this work four times across get_approved_cogs_pools,
-    get_approved_cogs_pools_weekly, build_approved_employee_overview, and
-    build_employee_heuristic_allocations. Without caching, the heavy pandas
-    compute runs four times per render. With caching keyed on period only,
-    the first caller pays the cost and the rest hit the cache for the next 60s.
-
-    The internal _activity_dfs and get_revenue_by_program calls are themselves
-    cached, so the wrapper does not redundantly fetch input data.
-    """
-    return wlc.build_employee_allocations(
-        period,
-        _activity_dfs(period),
-        get_revenue_by_program(period),
-    )
-
-
-@st.cache_data(ttl=600, show_spinner="Computing employee allocations...")
 def _cached_employee_alloc_with_warnings(period: str):
     """
-    Tuple-returning variant for callers that need the (result, warnings) pair.
-    Kept separate so the cache slot does not collide with the no-warnings call.
+    Single underlying compute slot for this module.
+
+    All other consumers (_cached_employee_alloc, get_approved_cogs_pools,
+    get_approved_cogs_pools_weekly, build_approved_employee_overview,
+    build_employee_heuristic_allocations) derive from this slot, so
+    wlc.build_employee_allocations runs at most once per period per render
+    cycle. Returns the (df, warnings) tuple.
+
+    Internal _activity_dfs and get_revenue_by_program calls are themselves
+    cached, so the wrapper does not redundantly fetch input data.
     """
     return wlc.build_employee_allocations(
         period,
@@ -2251,6 +2238,58 @@ def _cached_employee_alloc_with_warnings(period: str):
         get_revenue_by_program(period),
         return_warnings=True,
     )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_employee_alloc(period: str) -> pd.DataFrame:
+    """
+    No-warnings view of the cached compute. Derives from
+    _cached_employee_alloc_with_warnings so the underlying pandas work runs
+    once, not twice. Both slots are retained for call-site stability.
+    """
+    df, _ = _cached_employee_alloc_with_warnings(period)
+    return df
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_employee_alloc_from_persisted(period: str) -> pd.DataFrame:
+    """
+    Returns the equivalent of employee_alloc_df, read directly from
+    stg_labor_incurred_employee. Used by the Allocation tab when the period
+    is locked, so the locked view does not recompute from raw inputs.
+
+    Shape match notes:
+      - cost_type is derived from labor_type
+          ('direct_cogs', 'temp') -> 'COGS'
+          ('direct_sga')           -> 'SGA'
+      - iso_week is set to NULL. Weekly granularity is not preserved on
+        commit; the locked rendering path does not surface the weekly
+        Activity Driver Overview, so this is fine.
+      - source_assignment is set to '' to match the unlocked-path shape.
+    """
+    df = pd.read_sql(text("""
+        SELECT
+            source_bucket,
+            target_program,
+            labor_type,
+            employee_name,
+            labor_source,
+            role_detail,
+            activity_driver,
+            activity_value,
+            weight,
+            allocated_cost,
+            CASE
+                WHEN labor_type IN ('direct_cogs', 'temp') THEN 'COGS'
+                WHEN labor_type = 'direct_sga'             THEN 'SGA'
+                ELSE 'COGS'
+            END                          AS cost_type,
+            CAST(NULL AS INTEGER)        AS iso_week,
+            ''::text                     AS source_assignment
+        FROM stg_labor_incurred_employee
+        WHERE accrual_period = :period
+    """), engine, params={"period": period})
+    return df
 
 
 def compute_cogs_allocation(pools_df: pd.DataFrame, activity: dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -2272,9 +2311,20 @@ def compute_sga_allocation(sga_pool: float, revenue_df: pd.DataFrame) -> pd.Data
 # Allocation overview helpers
 # ---------------------------------------------------------------------------
 
-def build_approved_employee_overview(period: str, cost_type_filter: str = "All") -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Reads from new employee allocation table. Groups by cost center."""
-    emp_alloc = _cached_employee_alloc(period)
+def build_approved_employee_overview(
+    period: str,
+    cost_type_filter: str = "All",
+    emp_alloc: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reads from new employee allocation table. Groups by cost center.
+
+    If emp_alloc is provided, uses it directly. This is the locked-period
+    short-circuit path where the page has already loaded the snapshot from
+    stg_labor_incurred_employee and wants to avoid triggering the cached
+    compute.
+    """
+    if emp_alloc is None:
+        emp_alloc = _cached_employee_alloc(period)
     if emp_alloc.empty:
         return pd.DataFrame(columns=["Program","Employees","Approved Labor","Sources"]), pd.DataFrame()
 
@@ -2737,28 +2787,56 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
     all_reviewed  = (total_rows > 0) and (reviewed_rows == total_rows)
 
     # -------------------------------------------------------------------------
-    # 3. ALL compute — must happen before any display
+    # 3. Load OR compute — locked periods read from persisted snapshot
     # -------------------------------------------------------------------------
-    pools_df = get_approved_cogs_pools(period)
+    # When the allocation is locked, stg_labor_incurred_employee already
+    # holds the fanned-out result that employee_alloc_df would contain.
+    # Reading from it instead of recomputing is the difference between
+    # ~2 minutes of pandas work and a single sub-second SQL read.
+    existing  = get_existing_allocation(period)
+    is_locked = not existing.empty
 
-    sga_pool = get_approved_sga_pool(period)
-    if cost_type_filter == "WIP":
-        sga_pool = 0.0
+    if is_locked:
+        # Locked path — single SQL read, zero recompute.
+        employee_alloc_df = _load_employee_alloc_from_persisted(period)
+        alloc_warnings    = []
+        approved_summary, approved_detail = build_approved_employee_overview(
+            period, cost_type_filter, emp_alloc=employee_alloc_df,
+        )
+        # Stubs for sections that are skipped or unused in the locked path.
+        pools_df          = pd.DataFrame()
+        pools_weekly      = pd.DataFrame()
+        sga_pool          = 0.0
+        activity          = {}
+        revenue_df        = pd.DataFrame()
+        cogs_alloc        = pd.DataFrame()
+        sga_alloc         = pd.DataFrame()
+        reconciliation_df = pd.DataFrame()
+        driver_overview   = {}
+    else:
+        # Unlocked path — full compute, unchanged from prior behavior.
+        pools_df = get_approved_cogs_pools(period)
 
-    activity          = _activity_dfs(period)
-    revenue_df        = get_revenue_by_program(period)
-    pools_weekly      = get_approved_cogs_pools_weekly(period)
-    pools_weekly["effective_bucket"] = pools_weekly["effective_bucket"].map(_normalize_bucket)
-    cogs_alloc        = compute_cogs_allocation(pools_df, activity)
-    sga_alloc         = compute_sga_allocation(sga_pool, revenue_df)
-    employee_alloc_df, alloc_warnings = build_employee_heuristic_allocations(
-        period, activity, revenue_df, cost_type_filter, return_warnings=True,
-    )
-    reconciliation_df = build_program_reconciliation(pools_df, cogs_alloc, sga_pool, sga_alloc, employee_alloc_df)
-    driver_overview   = build_activity_driver_overview(cogs_alloc, activity, pools_weekly)
-    existing          = get_existing_allocation(period)
-    is_locked         = not existing.empty
-    approved_summary, approved_detail = build_approved_employee_overview(period, cost_type_filter)
+        sga_pool = get_approved_sga_pool(period)
+        if cost_type_filter == "WIP":
+            sga_pool = 0.0
+
+        activity     = _activity_dfs(period)
+        revenue_df   = get_revenue_by_program(period)
+        pools_weekly = get_approved_cogs_pools_weekly(period)
+        pools_weekly["effective_bucket"] = pools_weekly["effective_bucket"].map(_normalize_bucket)
+        cogs_alloc = compute_cogs_allocation(pools_df, activity)
+        sga_alloc  = compute_sga_allocation(sga_pool, revenue_df)
+        employee_alloc_df, alloc_warnings = build_employee_heuristic_allocations(
+            period, activity, revenue_df, cost_type_filter, return_warnings=True,
+        )
+        reconciliation_df = build_program_reconciliation(
+            pools_df, cogs_alloc, sga_pool, sga_alloc, employee_alloc_df,
+        )
+        driver_overview = build_activity_driver_overview(cogs_alloc, activity, pools_weekly)
+        approved_summary, approved_detail = build_approved_employee_overview(
+            period, cost_type_filter,
+        )
 
     # -------------------------------------------------------------------------
     # 4. Display
@@ -2947,10 +3025,19 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
     st.markdown("---")
 
     # =========================================================================
-    # ACTIVITY DRIVER OVERVIEW
+    # ACTIVITY DRIVER OVERVIEW — skipped when locked
+    # The driver breakdown is computed from raw activity inputs. For locked
+    # periods we skip it entirely (the committed cost center pools below
+    # already show the locked allocation). Users can Unlock and Recommit to
+    # recompute and view weekly driver breakdowns.
     # =========================================================================
     st.markdown(f'<h3 style="color:{SECTION_HEADER_COLOR};">Activity Driver Overview</h3>', unsafe_allow_html=True)
-    if not driver_overview:
+    if is_locked:
+        st.info(
+            "Activity driver detail is not computed for locked periods. "
+            "Unlock and recommit to recompute and view weekly driver breakdowns."
+        )
+    elif not driver_overview:
         st.info("No COGS activity drivers found for this period.")
     else:
         _render_coverage_warning(activity.get("receiving", pd.DataFrame()), "Receipts", period)
