@@ -1400,21 +1400,52 @@ def get_fifo_applied(period: str) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def get_wip_summary(period: str) -> pd.DataFrame:
     return pd.read_sql(text("""
+        WITH layers AS (
+            SELECT 
+                accrual_period, cost_center, customer_program, 
+                iso_week, units_produced, cost_per_unit,
+                units_produced * cost_per_unit AS layer_pool
+            FROM stg_wip_production_layers
+            WHERE accrual_period = :period
+        ),
+        consumed AS (
+            -- Source-of-truth consumption from fifo_applied, not units_remaining.
+            -- units_remaining can be corrupted by unlock cycles that don't reverse it.
+            SELECT
+                f.cost_center,
+                f.iso_week_produced AS iso_week,
+                CASE 
+                    WHEN f.customer_program LIKE 'Advantage - %' 
+                    THEN REPLACE(f.customer_program, 'Advantage - ', '')
+                    ELSE f.customer_program 
+                END AS canonical_program,
+                SUM(f.units_applied) AS units_consumed,
+                SUM(f.applied_cost)  AS cost_consumed
+            FROM stg_wip_fifo_applied f
+            -- Only count consumption that has been recognized in or before
+            -- this period; later-period consumption doesn't reduce this
+            -- period's closing WIP balance.
+            WHERE TO_DATE(f.accrual_period, 'YYYY-MM') <= TO_DATE(:period, 'YYYY-MM')
+            GROUP BY 1, 2, 3
+        )
         SELECT
-            cost_center,
-            customer_program,
-            SUM(units_produced)                         AS units_produced,
-            SUM(units_remaining)                        AS units_remaining,
-            SUM(units_produced - units_remaining)       AS units_consumed,
-            SUM(labor_pool)                             AS total_labor_pool,
-            SUM(labor_pool * (1 - CASE WHEN units_produced > 0
-                THEN units_remaining / units_produced ELSE 1 END))
-                                                        AS recognized_cost,
-            SUM(labor_pool * CASE WHEN units_produced > 0
-                THEN units_remaining / units_produced ELSE 1 END)
-                                                        AS outstanding_wip
-        FROM stg_wip_production_layers
-        WHERE accrual_period = :period
+            l.cost_center,
+            l.customer_program,
+            SUM(l.units_produced)                                       AS units_produced,
+            SUM(l.units_produced) - COALESCE(SUM(c.units_consumed), 0)  AS units_remaining,
+            COALESCE(SUM(c.units_consumed), 0)                          AS units_consumed,
+            SUM(l.layer_pool)                                           AS total_labor_pool,
+            COALESCE(SUM(c.cost_consumed), 0)                           AS recognized_cost,
+            SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0)       AS outstanding_wip
+        FROM layers l
+        LEFT JOIN consumed c
+            ON c.cost_center = l.cost_center
+           AND c.iso_week    = l.iso_week
+           AND c.canonical_program = CASE 
+                WHEN l.customer_program LIKE 'Advantage - %' 
+                THEN REPLACE(l.customer_program, 'Advantage - ', '')
+                ELSE l.customer_program 
+           END
         GROUP BY 1, 2
         ORDER BY 1, 2
     """), engine, params={"period": period})
@@ -1423,17 +1454,48 @@ def get_wip_summary(period: str) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def get_outstanding_wip_all_periods() -> pd.DataFrame:
     return pd.read_sql(text("""
+        WITH layers AS (
+            SELECT 
+                accrual_period, cost_center, customer_program,
+                iso_week, units_produced, cost_per_unit,
+                units_produced * cost_per_unit AS layer_pool
+            FROM stg_wip_production_layers
+        ),
+        consumed AS (
+            -- ALL consumption ever recognized against these layers,
+            -- regardless of consumption period. This is the cumulative
+            -- balance-sheet view: how much of each period's production
+            -- has been consumed across the entire system to date.
+            SELECT
+                f.cost_center,
+                f.iso_week_produced AS iso_week,
+                CASE 
+                    WHEN f.customer_program LIKE 'Advantage - %' 
+                    THEN REPLACE(f.customer_program, 'Advantage - ', '')
+                    ELSE f.customer_program 
+                END AS canonical_program,
+                SUM(f.units_applied) AS units_consumed,
+                SUM(f.applied_cost)  AS cost_consumed
+            FROM stg_wip_fifo_applied f
+            GROUP BY 1, 2, 3
+        )
         SELECT
-            accrual_period,
-            cost_center,
-            customer_program,
-            SUM(units_remaining)    AS units_remaining,
-            SUM(labor_pool * CASE WHEN units_produced > 0
-                THEN units_remaining / units_produced ELSE 1 END)
-                                    AS outstanding_wip
-        FROM stg_wip_production_layers
-        WHERE units_remaining > 0
+            l.accrual_period,
+            l.cost_center,
+            l.customer_program,
+            SUM(l.units_produced) - COALESCE(SUM(c.units_consumed), 0) AS units_remaining,
+            SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0)      AS outstanding_wip
+        FROM layers l
+        LEFT JOIN consumed c
+            ON c.cost_center = l.cost_center
+           AND c.iso_week    = l.iso_week
+           AND c.canonical_program = CASE 
+                WHEN l.customer_program LIKE 'Advantage - %' 
+                THEN REPLACE(l.customer_program, 'Advantage - ', '')
+                ELSE l.customer_program 
+           END
         GROUP BY 1, 2, 3
+        HAVING SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0) > 0
         ORDER BY 1, 2, 3
     """), engine)
 
