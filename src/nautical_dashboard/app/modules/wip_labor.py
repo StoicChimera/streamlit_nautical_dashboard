@@ -2220,27 +2220,21 @@ def _activity_dfs(period: str) -> dict[str, pd.DataFrame]:
 
 @st.cache_data(ttl=600, show_spinner="Computing employee allocations...")
 def _cached_employee_alloc_with_warnings(period: str):
-    """..."""
-    import time
-    _t = time.time()
-    
-    act = _activity_dfs(period)
-    t_activity = time.time() - _t; _t = time.time()
-    
-    rev = get_revenue_by_program(period)
-    t_revenue = time.time() - _t; _t = time.time()
-    
-    result = wlc.build_employee_allocations(period, act, rev, return_warnings=True)
-    t_compute = time.time() - _t
-    
-    # Stash on session state since we're inside a cache_data function and
-    # can't st.caption() directly without breaking the cache hashing.
-    st.session_state["_alloc_timings"] = {
-        "activity_dfs": t_activity,
-        "revenue": t_revenue,
-        "compute": t_compute,
-    }
-    return result
+    """
+    Single underlying compute slot for this module.
+
+    All other consumers (_cached_employee_alloc, get_approved_cogs_pools,
+    get_approved_cogs_pools_weekly, build_approved_employee_overview,
+    build_employee_heuristic_allocations) derive from this slot, so
+    wlc.build_employee_allocations runs at most once per period per render
+    cycle. Returns the (df, warnings) tuple.
+    """
+    return wlc.build_employee_allocations(
+        period,
+        _activity_dfs(period),
+        get_revenue_by_program(period),
+        return_warnings=True,
+    )
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -2792,27 +2786,19 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
     # -------------------------------------------------------------------------
     # 3. Load OR compute — locked periods read from persisted snapshot
     # -------------------------------------------------------------------------
-    # TEMPORARY: timing diagnostics. Remove after we know where time goes.
-    import time
-    _tick_state = {"t": time.time()}
-    def _tick(label):
-        now = time.time()
-        st.caption(f"⏱ {label}: {now - _tick_state['t']:.2f}s")
-        _tick_state["t"] = now
+    existing  = get_existing_allocation(period)
+    is_locked = not existing.empty
 
     existing  = get_existing_allocation(period)
     is_locked = not existing.empty
-    _tick("get_existing_allocation + is_locked check")
 
     if is_locked:
         # Locked path — single SQL read, zero recompute.
         employee_alloc_df = _load_employee_alloc_from_persisted(period)
-        _tick("_load_employee_alloc_from_persisted")
         alloc_warnings = []
         approved_summary, approved_detail = build_approved_employee_overview(
             period, cost_type_filter, emp_alloc=employee_alloc_df,
         )
-        _tick("build_approved_employee_overview (locked)")
         # Stubs for sections that are skipped or unused in the locked path.
         pools_df          = pd.DataFrame()
         pools_weekly      = pd.DataFrame()
@@ -2825,52 +2811,28 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
         driver_overview   = {}
     else:
         pools_df = get_approved_cogs_pools(period)
-        _tick("get_approved_cogs_pools")
 
         sga_pool = get_approved_sga_pool(period)
         if cost_type_filter == "WIP":
             sga_pool = 0.0
-        _tick("get_approved_sga_pool")
 
         activity = _activity_dfs(period)
-        _tick("_activity_dfs (6 queries)")
-
         revenue_df = get_revenue_by_program(period)
-        _tick("get_revenue_by_program")
-
         pools_weekly = get_approved_cogs_pools_weekly(period)
         pools_weekly["effective_bucket"] = pools_weekly["effective_bucket"].map(_normalize_bucket)
-        _tick("get_approved_cogs_pools_weekly")
-
         cogs_alloc = compute_cogs_allocation(pools_df, activity)
         sga_alloc  = compute_sga_allocation(sga_pool, revenue_df)
-        _tick("compute_cogs_allocation + compute_sga_allocation (deprecated no-ops)")
-
         employee_alloc_df, alloc_warnings = build_employee_heuristic_allocations(
             period, activity, revenue_df, cost_type_filter, return_warnings=True,
         )
-        _tick("build_employee_heuristic_allocations [LIKELY HOTSPOT]")
-
         reconciliation_df = build_program_reconciliation(
             pools_df, cogs_alloc, sga_pool, sga_alloc, employee_alloc_df,
         )
-        _tick("build_program_reconciliation")
-
         driver_overview = build_activity_driver_overview(cogs_alloc, activity, pools_weekly)
-        _tick("build_activity_driver_overview")
-
         approved_summary, approved_detail = build_approved_employee_overview(
             period, cost_type_filter,
         )
-        _tick("build_approved_employee_overview (unlocked)")
-        if "_alloc_timings" in st.session_state:
-            tm = st.session_state["_alloc_timings"]
-            st.caption(
-                f"⏱ Internal split — activity SQL: {tm['activity_dfs']:.2f}s · "
-                f"revenue SQL: {tm['revenue']:.2f}s · "
-                f"pandas compute: {tm['compute']:.2f}s"
-            )
-            
+
     # -------------------------------------------------------------------------
     # 4. Display
     # -------------------------------------------------------------------------
