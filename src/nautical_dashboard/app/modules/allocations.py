@@ -31,18 +31,18 @@ from nautical_dashboard.app.modules.allocation_engine import (
     ALL_BUCKETS,
     _consolidate_program,
     copy_sqft_forward,
-    get_committed_allocation,
-    get_prior_warehouse_wip_applicable,
-    get_sqft_inputs,
-    get_warehouse_wip,
-    get_warehouse_wip_all_periods,
-    is_committed,
     save_sqft_inputs,
     seed_sqft_month,
     unlock_allocation,
     write_warehouse_wip_applied,
-    _get_office_headcount_split,
     _period,
+    get_committed_allocation as _engine_get_committed_allocation,
+    get_prior_warehouse_wip_applicable as _engine_get_prior_warehouse_wip_applicable,
+    get_sqft_inputs as _engine_get_sqft_inputs,
+    get_warehouse_wip as _engine_get_warehouse_wip,
+    get_warehouse_wip_all_periods as _engine_get_warehouse_wip_all_periods,
+    is_committed as _engine_is_committed,
+    _get_office_headcount_split as _engine_get_office_headcount_split,
 )
 
 # =====================================================
@@ -107,6 +107,48 @@ def _cb() -> int:
     return int(st.session_state.get("wh_cache_bust", 0))
 
 
+# =====================================================
+# Cached wrappers around engine readers
+# Engine functions are pure (no streamlit dependency).
+# _bust_cache_and_rerun() calls st.cache_data.clear() globally,
+# so any mutation that uses it invalidates these automatically.
+# =====================================================
+
+@st.cache_data(ttl=300)
+def is_committed(month_start: date) -> bool:
+    return _engine_is_committed(month_start)
+
+
+@st.cache_data(ttl=300)
+def get_committed_allocation(month_start: date) -> pd.DataFrame:
+    return _engine_get_committed_allocation(month_start)
+
+
+@st.cache_data(ttl=300)
+def get_sqft_inputs(month_start: date) -> pd.DataFrame:
+    return _engine_get_sqft_inputs(month_start)
+
+
+@st.cache_data(ttl=300)
+def get_warehouse_wip(month_start: date) -> pd.DataFrame:
+    return _engine_get_warehouse_wip(month_start)
+
+
+@st.cache_data(ttl=300)
+def get_prior_warehouse_wip_applicable(month_start: date) -> pd.DataFrame:
+    return _engine_get_prior_warehouse_wip_applicable(month_start)
+
+
+@st.cache_data(ttl=300)
+def get_warehouse_wip_all_periods(as_of_month: Optional[date] = None) -> pd.DataFrame:
+    return _engine_get_warehouse_wip_all_periods(as_of_month=as_of_month)
+
+
+@st.cache_data(ttl=300)
+def _get_office_headcount_split(period: str) -> tuple[float, float]:
+    return _engine_get_office_headcount_split(period)
+
+
 def month_floor(d: date) -> date:
     return d.replace(day=1)
 
@@ -137,12 +179,30 @@ def get_months(cache_bust: int) -> list[date]:
     return df["month_start"].tolist()
 
 
+@st.cache_data(ttl=300)
 def get_allocated_cost(month_start: date) -> float:
     df = pd.read_sql(
         text("SELECT allocated_warehouse_cost FROM alloc_warehouse_cost_monthly WHERE month_start = :m"),
         engine, params={"m": month_start},
     )
     return float(df["allocated_warehouse_cost"].iloc[0]) if not df.empty else 0.0
+
+
+@st.cache_data(ttl=300)
+def get_allocated_cost_meta(month_start: date) -> pd.DataFrame:
+    return pd.read_sql(
+        text("SELECT updated_by, updated_at FROM alloc_warehouse_cost_monthly WHERE month_start = :m"),
+        engine, params={"m": month_start},
+    )
+
+
+@st.cache_data(ttl=300)
+def get_warehouse_wip_applied_count(period: str) -> int:
+    df = pd.read_sql(
+        text("SELECT COUNT(*) AS n FROM stg_warehouse_wip_applied WHERE accrual_period = :p"),
+        engine, params={"p": period},
+    )
+    return int(df["n"].iloc[0]) if not df.empty else 0
 
 
 def upsert_allocated_cost(month_start: date, cost: float) -> None:
@@ -451,10 +511,7 @@ def _render_warehouse_cost(month_start: date) -> float:
         st.caption("This total is divided across all sqft (shared buckets + direct footprints) to produce a $/sqft rate.")
 
     # Last saved metadata
-    meta = pd.read_sql(
-        text("SELECT updated_by, updated_at FROM alloc_warehouse_cost_monthly WHERE month_start = :m"),
-        engine, params={"m": month_start},
-    )
+    meta = get_allocated_cost_meta(month_start)
     if not meta.empty and pd.notna(meta["updated_by"].iloc[0]):
         st.caption(f"Last saved by {meta['updated_by'].iloc[0]} at {meta['updated_at'].iloc[0]}")
 
@@ -793,13 +850,10 @@ def _render_committed_results(month_start: date) -> None:
 
     # Unlock
     period_str = month_start.strftime("%Y-%m")
-    applied_count = pd.read_sql(
-        text("SELECT COUNT(*) AS n FROM stg_warehouse_wip_applied WHERE accrual_period = :p"),
-        engine, params={"p": period_str},
-    )["n"].iloc[0]
+    applied_count = get_warehouse_wip_applied_count(period_str)
 
     unlock_warning = (
-        f"This will clear the committed allocation AND {int(applied_count)} "
+        f"This will clear the committed allocation AND {applied_count} "
         f"prior-period WIP application(s) that were applied to {period_str}."
         if applied_count > 0
         else "This will clear the committed allocation."
@@ -896,7 +950,7 @@ def _render_warehouse_wip_tab(month_start: date, reviewer: str) -> None:
                         ].to_dict("records")
                         write_warehouse_wip_applied(month_start, rows_to_write, reviewer)
                         st.success(f"Applied {_dollar(selected_total)} of prior warehouse WIP to {month_start:%Y-%m}.")
-                        st.rerun()
+                        _bust_cache_and_rerun()
             with col_info:
                 st.caption(
                     f"Selected total: {_dollar(selected_total)}  "
