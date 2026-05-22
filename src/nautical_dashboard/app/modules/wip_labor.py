@@ -1154,13 +1154,59 @@ def run_fifo_matching(period: str, applied_by: str):
     ow_sales       = _get_sales("v_overwrap_sales_by_iso_week")
     pickpack_sales = _get_sales("v_pickpack_sales_by_iso_week")
 
-    # Pull all layers with remaining units — FIFO oldest first
+    # Pull all layers and compute current availability from fifo_applied events.
+    # units_remaining is no longer stored — it's derived from events so we can't
+    # get out of sync with the consumption history.
+    #
+    # Availability join handles the raw-vs-canonical customer_program mismatch
+    # between layers (raw 'Walmart OGP') and fifo_applied (canonical
+    # 'Advantage - Walmart OGP') by normalizing both sides.
+    #
+    # IMPORTANT: this DELETE is run BEFORE we compute availability so that
+    # availability reflects state with this period's prior FIFO matches
+    # already removed. Otherwise re-running matching for the same period
+    # would see its own historical consumption and refuse to re-match.
+    with engine.begin() as conn:
+        conn.execute(
+            text("DELETE FROM stg_wip_fifo_applied WHERE accrual_period = :period"),
+            {"period": period},
+        )
+
     layers = pd.read_sql(text("""
-        SELECT id, accrual_period, iso_week, cost_center, customer_program,
-               output_type, units_remaining, cost_per_unit
-        FROM stg_wip_production_layers
-        WHERE units_remaining > 0
-        ORDER BY iso_week ASC, accrual_period ASC
+        WITH consumed AS (
+            SELECT
+                f.cost_center,
+                f.iso_week_produced AS iso_week,
+                CASE
+                    WHEN f.customer_program LIKE 'Advantage - %'
+                    THEN REPLACE(f.customer_program, 'Advantage - ', '')
+                    ELSE f.customer_program
+                END AS canonical_program,
+                SUM(f.units_applied) AS units_consumed
+            FROM stg_wip_fifo_applied f
+            GROUP BY 1, 2, 3
+        )
+        SELECT
+            l.id,
+            l.accrual_period,
+            l.iso_week,
+            l.cost_center,
+            l.customer_program,
+            l.output_type,
+            l.cost_per_unit,
+            l.units_produced,
+            l.units_produced - COALESCE(c.units_consumed, 0) AS units_remaining
+        FROM stg_wip_production_layers l
+        LEFT JOIN consumed c
+            ON c.cost_center = l.cost_center
+           AND c.iso_week    = l.iso_week
+           AND c.canonical_program = CASE
+                WHEN l.customer_program LIKE 'Advantage - %'
+                THEN REPLACE(l.customer_program, 'Advantage - ', '')
+                ELSE l.customer_program
+           END
+        WHERE l.units_produced - COALESCE(c.units_consumed, 0) > 0
+        ORDER BY l.iso_week ASC, l.accrual_period ASC
     """), engine)
 
     if layers.empty:
@@ -1246,11 +1292,10 @@ def run_fifo_matching(period: str, applied_by: str):
     if not applied_rows:
         return
 
+    # DELETE already done above (before availability was computed).
+    # Just insert the new consumption events. No layer UPDATE — availability
+    # is derived from these events on read, not stored.
     with engine.begin() as conn:
-        conn.execute(
-            text("DELETE FROM stg_wip_fifo_applied WHERE accrual_period = :period"),
-            {"period": period},
-        )
         for r in applied_rows:
             conn.execute(text("""
                 INSERT INTO stg_wip_fifo_applied
@@ -1262,14 +1307,6 @@ def run_fifo_matching(period: str, applied_by: str):
                      :customer_program, :iso_week_produced, :units_applied,
                      :cost_per_unit, :applied_cost, :match_type, :applied_by, :applied_at)
             """), r)
-
-    with engine.begin() as conn:
-        for lid, rem in remaining.items():
-            conn.execute(text("""
-                UPDATE stg_wip_production_layers
-                SET units_remaining = :remaining
-                WHERE id = :id
-            """), {"remaining": float(rem), "id": lid})
 
 
 def write_program_labor_accrual(period: str, committed_by: str):
