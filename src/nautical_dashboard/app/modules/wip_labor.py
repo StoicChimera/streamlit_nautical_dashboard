@@ -2220,24 +2220,27 @@ def _activity_dfs(period: str) -> dict[str, pd.DataFrame]:
 
 @st.cache_data(ttl=600, show_spinner="Computing employee allocations...")
 def _cached_employee_alloc_with_warnings(period: str):
-    """
-    Single underlying compute slot for this module.
-
-    All other consumers (_cached_employee_alloc, get_approved_cogs_pools,
-    get_approved_cogs_pools_weekly, build_approved_employee_overview,
-    build_employee_heuristic_allocations) derive from this slot, so
-    wlc.build_employee_allocations runs at most once per period per render
-    cycle. Returns the (df, warnings) tuple.
-
-    Internal _activity_dfs and get_revenue_by_program calls are themselves
-    cached, so the wrapper does not redundantly fetch input data.
-    """
-    return wlc.build_employee_allocations(
-        period,
-        _activity_dfs(period),
-        get_revenue_by_program(period),
-        return_warnings=True,
-    )
+    """..."""
+    import time
+    _t = time.time()
+    
+    act = _activity_dfs(period)
+    t_activity = time.time() - _t; _t = time.time()
+    
+    rev = get_revenue_by_program(period)
+    t_revenue = time.time() - _t; _t = time.time()
+    
+    result = wlc.build_employee_allocations(period, act, rev, return_warnings=True)
+    t_compute = time.time() - _t
+    
+    # Stash on session state since we're inside a cache_data function and
+    # can't st.caption() directly without breaking the cache hashing.
+    st.session_state["_alloc_timings"] = {
+        "activity_dfs": t_activity,
+        "revenue": t_revenue,
+        "compute": t_compute,
+    }
+    return result
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -2860,7 +2863,14 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
             period, cost_type_filter,
         )
         _tick("build_approved_employee_overview (unlocked)")
-
+        if "_alloc_timings" in st.session_state:
+            tm = st.session_state["_alloc_timings"]
+            st.caption(
+                f"⏱ Internal split — activity SQL: {tm['activity_dfs']:.2f}s · "
+                f"revenue SQL: {tm['revenue']:.2f}s · "
+                f"pandas compute: {tm['compute']:.2f}s"
+            )
+            
     # -------------------------------------------------------------------------
     # 4. Display
     # -------------------------------------------------------------------------
