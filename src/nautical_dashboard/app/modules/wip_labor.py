@@ -4474,6 +4474,7 @@ def _render_wip_period_summary(period: str):
     summary            = get_wip_summary(period)
     fulfillment_wip_df = get_fulfillment_wip(period)
     applicable_wip_df  = get_prior_fulfillment_wip_applicable(period)
+    work_order_wip_df  = get_accrual_balance(period)
 
     # =========================================================================
     # PRIOR PERIOD FULFILLMENT WIP WARNING + APPLY
@@ -4584,16 +4585,36 @@ def _render_wip_period_summary(period: str):
     total_recognized      = summary["recognized_cost"].sum()
     total_production_wip  = summary["outstanding_wip"].sum()
     total_fulfillment_wip = float(fulfillment_wip_df["applied_cost"].sum()) if not fulfillment_wip_df.empty else 0.0
-    total_wip_balance     = total_production_wip + total_fulfillment_wip
+    total_workorder_wip   = float(work_order_wip_df["unapplied_cost"].sum()) if not work_order_wip_df.empty else 0.0
+    total_wip_balance     = total_production_wip + total_fulfillment_wip + total_workorder_wip
     total_produced        = summary["units_produced"].sum()
     total_remaining       = summary["units_remaining"].sum()
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Total Labor Pool",  _dollar(total_pool))
-    k2.metric("Recognized COGS",   _dollar(total_recognized))
-    k3.metric("Production WIP",    _dollar(total_production_wip))
-    k4.metric("Fulfillment WIP",   _dollar(total_fulfillment_wip))
-    k5.metric("Total WIP Balance", _dollar(total_wip_balance))
+    # Top-line KPIs — the three slices must add to Total WIP Balance.
+    # This reconciles with "New WIP Generated" on the Allocation tab,
+    # which sums the same three sources from stg_labor_applied.
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Production WIP",  _dollar(total_production_wip),
+              help="Demo/OGP/Overwrap layer labor produced but not yet FIFO-consumed by sales.")
+    k2.metric("Fulfillment WIP", _dollar(total_fulfillment_wip),
+              help="Period allocation labor for programs with no current revenue. Pending future invoice.")
+    k3.metric("Work Order WIP",  _dollar(total_workorder_wip),
+              help="ArrivedCo / Recess labor pending work order assignment to an invoice.")
+    k4.metric("Total WIP Balance", _dollar(total_wip_balance))
+
+    st.caption(
+        "These three categories sum to Feb's total WIP on the balance sheet. "
+        "This figure matches 'New WIP Generated' on the Allocation tab."
+    )
+    st.markdown("")
+
+    k5, k6, k7 = st.columns(3)
+    k5.metric("Total Labor Pool",  _dollar(total_pool),
+              help="Total production-cost-center labor allocated this period (Demo + OGP + Overwrap).")
+    k6.metric("Recognized COGS",   _dollar(total_recognized),
+              help="Production labor consumed by sales invoices this period (FIFO matched).")
+    k7.metric("Production Units Remaining", _units(total_remaining),
+              help="Units in production layers not yet consumed by sales.")
 
     st.caption(
         f"Units Produced: {_units(total_produced)}  "
@@ -4603,19 +4624,23 @@ def _render_wip_period_summary(period: str):
     st.markdown("")
 
     # =========================================================================
-    # COMBINED DETAIL TABLE
+    # COMBINED DETAIL TABLE — all three WIP slices in one view
     # =========================================================================
-    display = summary.copy()
-    display.columns = [
-        "Cost Center", "Program", "Units Produced", "Units Remaining",
-        "Units Consumed", "Labor Pool", "Recognized Cost", "Outstanding WIP",
-    ]
-    for col in ["Labor Pool", "Recognized Cost", "Outstanding WIP"]:
-        display[col] = display[col].map(_dollar)
-    for col in ["Units Produced", "Units Remaining", "Units Consumed"]:
-        display[col] = display[col].map(_units)
-    display["WIP Type"] = "Production"
+    # Production WIP rows
+    if not summary.empty:
+        prod_display = summary.copy()
+        prod_display.columns = [
+            "Cost Center", "Program", "Units Produced", "Units Remaining",
+            "Units Consumed", "Labor Pool", "Recognized Cost", "Outstanding WIP",
+        ]
+        prod_display["WIP Type"] = "Production"
+    else:
+        prod_display = pd.DataFrame(columns=[
+            "Cost Center", "Program", "Units Produced", "Units Remaining",
+            "Units Consumed", "Labor Pool", "Recognized Cost", "Outstanding WIP", "WIP Type",
+        ])
 
+    # Fulfillment WIP rows
     if not fulfillment_wip_df.empty:
         fulfillment_display = fulfillment_wip_df.groupby(
             ["program", "cost_center"], as_index=False
@@ -4624,25 +4649,46 @@ def _render_wip_period_summary(period: str):
             "cost_center":  "Cost Center",
             "applied_cost": "Outstanding WIP",
         })
-        fulfillment_display["Units Produced"]  = ""
-        fulfillment_display["Units Remaining"] = ""
-        fulfillment_display["Units Consumed"]  = ""
-        fulfillment_display["Labor Pool"]      = ""
-        fulfillment_display["Recognized Cost"] = _dollar(0.0)
+        fulfillment_display["Units Produced"]  = None
+        fulfillment_display["Units Remaining"] = None
+        fulfillment_display["Units Consumed"]  = None
+        fulfillment_display["Labor Pool"]      = None
+        fulfillment_display["Recognized Cost"] = 0.0
         fulfillment_display["WIP Type"]        = "Fulfillment"
-        fulfillment_display["Outstanding WIP"] = fulfillment_display["Outstanding WIP"].map(_dollar)
+    else:
+        fulfillment_display = pd.DataFrame(columns=prod_display.columns)
 
-        display = pd.concat(
-            [display, fulfillment_display[[
-                "WIP Type", "Cost Center", "Program",
-                "Units Produced", "Units Remaining", "Units Consumed",
-                "Labor Pool", "Recognized Cost", "Outstanding WIP",
-            ]]],
-            ignore_index=True,
-        )
+    # Work Order WIP rows (ArrivedCo / Recess)
+    if not work_order_wip_df.empty:
+        wo_display = work_order_wip_df.rename(columns={
+            "customer":              "Program",
+            "unapplied_cost":        "Outstanding WIP",
+            "labor_pool_attributed": "Labor Pool",
+            "applied_cost":          "Recognized Cost",
+            "units_produced":        "Units Produced",
+        }).copy()
+        wo_display["Cost Center"]     = "Overwrap"
+        wo_display["Units Remaining"] = wo_display["Units Produced"]   # not consumed until invoiced
+        wo_display["Units Consumed"]  = 0.0
+        wo_display["WIP Type"]        = "Work Order"
+        wo_display = wo_display[[
+            "Cost Center", "Program", "Units Produced", "Units Remaining",
+            "Units Consumed", "Labor Pool", "Recognized Cost", "Outstanding WIP", "WIP Type",
+        ]]
+    else:
+        wo_display = pd.DataFrame(columns=prod_display.columns)
+
+    # Combine and format
+    combined = pd.concat([prod_display, fulfillment_display, wo_display], ignore_index=True)
+
+    if not combined.empty:
+        for col in ["Labor Pool", "Recognized Cost", "Outstanding WIP"]:
+            combined[col] = combined[col].map(_dollar)
+        for col in ["Units Produced", "Units Remaining", "Units Consumed"]:
+            combined[col] = combined[col].map(_units)
 
     st.dataframe(
-        display[[
+        combined[[
             "WIP Type", "Cost Center", "Program",
             "Units Produced", "Units Remaining", "Units Consumed",
             "Labor Pool", "Recognized Cost", "Outstanding WIP",
