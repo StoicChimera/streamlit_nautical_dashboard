@@ -1449,18 +1449,47 @@ def write_program_labor_accrual(period: str, committed_by: str):
 @st.cache_data(ttl=60, show_spinner=False)
 def get_production_layers(period: str) -> pd.DataFrame:
     return pd.read_sql(text("""
+        WITH consumed AS (
+            SELECT
+                f.cost_center,
+                f.iso_week_produced AS iso_week,
+                CASE
+                    WHEN f.customer_program LIKE 'Advantage - %'
+                    THEN REPLACE(f.customer_program, 'Advantage - ', '')
+                    ELSE f.customer_program
+                END AS canonical_program,
+                SUM(f.units_applied) AS units_consumed
+            FROM stg_wip_fifo_applied f
+            GROUP BY 1, 2, 3
+        )
         SELECT
-            id, accrual_period, iso_week, cost_center, customer_program,
-            units_produced, labor_pool, cost_per_unit,
-            units_remaining,
-            units_produced - units_remaining AS units_consumed,
-            CASE WHEN units_produced > 0
-                 THEN ROUND((units_produced - units_remaining) / units_produced * 100, 1)
-                 ELSE 0 END AS pct_consumed,
-            layer_locked, locked_by, locked_at
-        FROM stg_wip_production_layers
-        WHERE accrual_period = :period
-        ORDER BY cost_center, iso_week, customer_program
+            l.id,
+            l.accrual_period,
+            l.iso_week,
+            l.cost_center,
+            l.customer_program,
+            l.units_produced,
+            l.labor_pool,
+            l.cost_per_unit,
+            l.units_produced - COALESCE(c.units_consumed, 0)         AS units_remaining,
+            COALESCE(c.units_consumed, 0)                            AS units_consumed,
+            CASE WHEN l.units_produced > 0
+                 THEN ROUND(COALESCE(c.units_consumed, 0)::numeric / l.units_produced * 100, 1)
+                 ELSE 0 END                                          AS pct_consumed,
+            l.layer_locked,
+            l.locked_by,
+            l.locked_at
+        FROM stg_wip_production_layers l
+        LEFT JOIN consumed c
+            ON c.cost_center = l.cost_center
+           AND c.iso_week    = l.iso_week
+           AND c.canonical_program = CASE
+                WHEN l.customer_program LIKE 'Advantage - %'
+                THEN REPLACE(l.customer_program, 'Advantage - ', '')
+                ELSE l.customer_program
+           END
+        WHERE l.accrual_period = :period
+        ORDER BY l.cost_center, l.iso_week, l.customer_program
     """), engine, params={"period": period})
 
 
@@ -2024,17 +2053,39 @@ def write_labor_applied(period: str, locked_by: str):
                 TRUE, :locked_by, :locked_at
             FROM stg_wip_fifo_applied f
             LEFT JOIN (
+                -- Per-program layer pool with units_remaining and wip_cost_remaining
+                -- computed from fifo_applied events (units_remaining is no longer
+                -- a stored column on stg_wip_production_layers).
                 SELECT
-                    accrual_period,
-                    cost_center,
-                    customer_program,
-                    SUM(units_produced)     AS units_produced,
-                    SUM(labor_pool)         AS labor_pool,
-                    SUM(units_remaining)    AS units_remaining,
-                    SUM(labor_pool * CASE WHEN units_produced > 0
-                        THEN units_remaining / units_produced
-                        ELSE 1 END)         AS wip_cost_remaining
-                FROM stg_wip_production_layers
+                    lay.accrual_period,
+                    lay.cost_center,
+                    lay.customer_program,
+                    SUM(lay.units_produced)                                         AS units_produced,
+                    SUM(lay.units_produced * lay.cost_per_unit)                     AS labor_pool,
+                    SUM(lay.units_produced - COALESCE(cons.units_consumed, 0))      AS units_remaining,
+                    SUM((lay.units_produced - COALESCE(cons.units_consumed, 0))
+                         * lay.cost_per_unit)                                       AS wip_cost_remaining
+                FROM stg_wip_production_layers lay
+                LEFT JOIN (
+                    SELECT
+                        f2.cost_center,
+                        f2.iso_week_produced AS iso_week,
+                        CASE
+                            WHEN f2.customer_program LIKE 'Advantage - %'
+                            THEN REPLACE(f2.customer_program, 'Advantage - ', '')
+                            ELSE f2.customer_program
+                        END AS canonical_program,
+                        SUM(f2.units_applied) AS units_consumed
+                    FROM stg_wip_fifo_applied f2
+                    GROUP BY 1, 2, 3
+                ) cons
+                    ON cons.cost_center = lay.cost_center
+                   AND cons.iso_week    = lay.iso_week
+                   AND cons.canonical_program = CASE
+                        WHEN lay.customer_program LIKE 'Advantage - %'
+                        THEN REPLACE(lay.customer_program, 'Advantage - ', '')
+                        ELSE lay.customer_program
+                   END
                 GROUP BY 1, 2, 3
             ) l ON  l.accrual_period   = f.accrual_period
                 AND l.cost_center      = f.cost_center
