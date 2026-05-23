@@ -632,14 +632,24 @@ def get_ogp_units(period: str) -> pd.DataFrame:
 def get_ow_units(period: str) -> pd.DataFrame:
     sql = text("""
         SELECT
-            DATE_TRUNC('week', date_finished)               AS week_start,
-            EXTRACT(WEEK FROM date_finished)::int           AS iso_week,
+            week_start,
+            iso_week,
             customer,
-            SUM(units_produced)                             AS units
-        FROM stg_smartsheet_overwrap
-        WHERE accrual_month = :period
-          AND units_produced > 0
-          AND date_finished IS NOT NULL
+            SUM(units) AS units
+        FROM (
+            SELECT
+                DATE_TRUNC('week', date_finished)         AS week_start,
+                EXTRACT(WEEK FROM date_finished)::int     AS iso_week,
+                resolve_overwrap_customer(
+                    customer, project_name, work_order_number
+                )                                          AS customer,
+                units_produced                            AS units
+            FROM stg_smartsheet_overwrap
+            WHERE accrual_month = :period
+              AND units_produced > 0
+              AND date_finished IS NOT NULL
+        ) r
+        WHERE customer IS NOT NULL
         GROUP BY 1, 2, 3
         ORDER BY 1, units DESC
     """)
