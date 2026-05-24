@@ -2284,9 +2284,13 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
       - resolves to a row in dim_customer
       - active = TRUE
       - is_revenue_customer = TRUE
-      - roll_up_for_cost = FALSE
 
-    threshold is the $ amount above which the severity escalates from warn
+    Note: roll_up_for_cost is intentionally NOT checked. That flag controls
+    P&L grouping for reporting (mv_program_profitability), not allocation
+    eligibility. A sub-program can have its own WMS records, receipts, and
+    shipments while still being grouped under a parent for reporting.
+
+    threshold is the $ amount above which severity escalates from warn
     to fail. Default 500.
     """
     df = pd.read_sql(text("""
@@ -2315,7 +2319,6 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
                 WHEN dc.customer_name IS NULL              THEN 'not_in_dim_customer'
                 WHEN dc.active = FALSE                     THEN 'inactive_customer'
                 WHEN dc.is_revenue_customer = FALSE        THEN 'not_revenue_customer'
-                WHEN dc.roll_up_for_cost = TRUE            THEN 'rollup_not_target'
                 ELSE 'unknown'
             END AS issue
         FROM resolved r
@@ -2324,9 +2327,7 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
         WHERE dc.customer_name IS NULL
            OR dc.active = FALSE
            OR dc.is_revenue_customer = FALSE
-           OR dc.roll_up_for_cost = TRUE
-        GROUP BY 1, 2, 3, dc.customer_name, dc.active,
-                 dc.is_revenue_customer, dc.roll_up_for_cost
+        GROUP BY 1, 2, 3, dc.customer_name, dc.active, dc.is_revenue_customer
         ORDER BY allocated_cost DESC
     """), engine, params={"period": period})
 
