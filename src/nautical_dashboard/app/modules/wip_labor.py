@@ -2348,19 +2348,15 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
 
 def _check_orphan_invoices(period: str, threshold) -> dict:
     """
-    Invoices in the four sales views (kit / bag / overwrap / pickpack) for
-    PRODUCTION customers (activity_class = 'Production' in dim_customer)
-    where FIFO consumed zero units per view-line.
+    Invoices in the production sales views (kit / bag / overwrap / pickpack)
+    for PRODUCTION customers (activity_class = 'Production') where FIFO
+    consumed zero units per view-line.
 
-    The output type mapping is:
-        demo  invoice  <-> kit layers
-        bag   invoice  <-> bag layers
-        overwrap invoice <-> overwrap layers
-        pickpack invoice <-> packout / pickpack layers
-
-    Customer gate: invoices for fulfillment-only customers (no production)
-    don't run through this match path. Customer names are canonicalized via
-    dim_customer_alias before joining to dim_customer.
+    Special rule: pickpack lines on invoices that ALSO have a bag or overwrap
+    line are excluded from orphan checking. The bag/overwrap production
+    records cover the pickpack labor — there's no separate pickpack
+    smartsheet entry expected for those shipments. Only stand-alone pickpack
+    invoices (no bag, no overwrap on the same doc_number) are checked.
 
     threshold is the total unmatched-units count above which severity
     escalates from warn to fail. Default 1000 units.
@@ -2396,21 +2392,37 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
                   = TO_DATE(:period, 'YYYY-MM')
             GROUP BY 1, 2, 3
         ),
+        -- Set of doc_numbers that have bag or overwrap lines. Pickpack on
+        -- these invoices is implicitly covered by the bag/overwrap production
+        -- and should not be checked separately.
+        covered_pickpack_docs AS (
+            SELECT DISTINCT doc_number
+            FROM all_invoices
+            WHERE view_name IN ('bag', 'overwrap')
+        ),
+        invoices_filtered AS (
+            SELECT *
+            FROM all_invoices ai
+            WHERE NOT (
+                ai.view_name = 'pickpack'
+                AND ai.doc_number IN (SELECT doc_number FROM covered_pickpack_docs)
+            )
+        ),
         invoices_resolved AS (
             SELECT
-                ai.view_name,
-                ai.doc_number,
-                ai.customer_name,
-                ai.units,
+                f.view_name,
+                f.doc_number,
+                f.customer_name,
+                f.units,
                 COALESCE(
                     (SELECT a.canonical_name FROM dim_customer_alias a
-                     WHERE LOWER(a.alias) = LOWER(ai.customer_name)
+                     WHERE LOWER(a.alias) = LOWER(f.customer_name)
                        AND a.active = TRUE
                        AND COALESCE(a.exclude, FALSE) = FALSE
                      LIMIT 1),
-                    ai.customer_name
+                    f.customer_name
                 ) AS resolved_customer
-            FROM all_invoices ai
+            FROM invoices_filtered f
         ),
         invoices_production_only AS (
             SELECT ir.*
