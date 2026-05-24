@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import altair as alt
 import os
-import re
+import json
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -1968,7 +1968,21 @@ def write_labor_applied(period: str, locked_by: str):
                 GROUP BY 1, 2, 3
             ) l ON  l.accrual_period   = f.accrual_period
                 AND l.cost_center      = f.cost_center
-                AND l.customer_program = f.customer_program
+                AND COALESCE(
+                        (SELECT a.canonical_name FROM dim_customer_alias a
+                         WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                           AND a.active = TRUE
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        l.customer_program
+                    ) = COALESCE(
+                        (SELECT a.canonical_name FROM dim_customer_alias a
+                         WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                           AND a.active = TRUE
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        f.customer_program
+                    )
             WHERE f.accrual_period = :period
             GROUP BY f.accrual_period, f.cost_center, f.customer_program,
                     l.units_produced, l.labor_pool, l.units_remaining, l.wip_cost_remaining
@@ -2105,6 +2119,158 @@ def write_labor_applied(period: str, locked_by: str):
                 TRUE, :locked_by, :locked_at
             FROM unconsumed_layers
         """), {"period": period, "locked_by": locked_by, "locked_at": now})
+
+
+# ---------------------------------------------------------------------------
+# Close checks — post-commit reconciliation
+# ---------------------------------------------------------------------------
+
+def run_close_checks(period: str, committed_by: str) -> list[dict]:
+    """
+    Runs all post-commit reconciliation checks. Writes findings to
+    stg_labor_close_check. Returns the list of check results for inline
+    display in the UI.
+
+    Each check returns a dict with:
+        severity      : 'pass' | 'warn' | 'fail'
+        metric_value  : numeric headline (variance, count, etc.)
+        details       : list of offending rows (capped at 50 on write)
+
+    Checks are non-blocking — they record findings, they don't abort the
+    commit. The UI surfaces severity so a reviewer can decide whether to
+    investigate before closing the books.
+    """
+    findings = []
+
+    checks = [
+        ("scaffolding_test", _check_scaffolding_test, None),
+        ("identity_holds",   _check_identity_holds,  1.00),
+    ]
+
+    with engine.begin() as conn:
+        # Clear prior run for this period — we keep only the latest set of
+        # findings per period. Change to append-only if you want full history.
+        conn.execute(
+            text("DELETE FROM stg_labor_close_check WHERE accrual_period = :period"),
+            {"period": period},
+        )
+
+        for check_name, check_fn, threshold in checks:
+            result = check_fn(period, threshold)
+            findings.append({"check_name": check_name, **result})
+
+            conn.execute(text("""
+                INSERT INTO stg_labor_close_check
+                    (accrual_period, check_name, severity, metric_value,
+                     threshold, details, committed_by)
+                VALUES
+                    (:period, :check_name, :severity, :metric_value,
+                     :threshold, CAST(:details AS jsonb), :by)
+            """), {
+                "period":       period,
+                "check_name":   check_name,
+                "severity":     result["severity"],
+                "metric_value": result.get("metric_value"),
+                "threshold":    threshold,
+                "details":      json.dumps(result.get("details", [])[:50]),
+                "by":           committed_by,
+            })
+
+    return findings
+
+
+def _check_scaffolding_test(period: str, threshold) -> dict:
+    """
+    Placeholder check that always returns 'pass'. Used to verify the
+    runner plumbing works before we write any real checks.
+    """
+    return {
+        "severity":     "pass",
+        "metric_value": 0,
+        "details":      [],
+    }
+
+
+def _check_identity_holds(period: str, threshold) -> dict:
+    """
+    Identity: SUM(applied) - SUM(incurred) - SUM(fifo_from_prior_periods) = 0
+
+    fifo_from_prior is the consumption events in this period that reached back
+    into earlier periods' layers. Computed by joining fifo events to their
+    source layers via the canonical-name bridge that the rest of the pipeline
+    uses (dim_customer_alias canonicalization).
+    """
+    df = pd.read_sql(text("""
+        WITH metrics AS (
+            SELECT
+                (SELECT COALESCE(SUM(allocated_cost), 0)
+                 FROM stg_labor_incurred
+                 WHERE accrual_period = :period) AS incurred,
+
+                (SELECT COALESCE(SUM(applied_cost), 0)
+                 FROM stg_labor_applied
+                 WHERE accrual_period = :period
+                   AND source IN (
+                       'period_allocation', 'fifo', 'current_fulfillment_wip',
+                       'fulfillment_wip_applied', 'production_wip'
+                   )) AS applied,
+
+                -- FIFO consumption from prior-period layers.
+                -- Both sides resolved to canonical via dim_customer_alias so
+                -- raw-vs-canonical mismatches (e.g. 'Walmart OGP' on layer,
+                -- 'Advantage - Walmart OGP' on fifo event) don't drop rows.
+                (SELECT COALESCE(SUM(f.applied_cost), 0)
+                 FROM stg_wip_fifo_applied f
+                 JOIN stg_wip_production_layers l
+                   ON l.cost_center      = f.cost_center
+                  AND l.iso_week         = f.iso_week_produced
+                  AND l.output_type      = f.output_type
+                  AND COALESCE(
+                        (SELECT a.canonical_name FROM dim_customer_alias a
+                         WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                           AND a.active = TRUE
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        l.customer_program
+                      ) = COALESCE(
+                        (SELECT a.canonical_name FROM dim_customer_alias a
+                         WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                           AND a.active = TRUE
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        f.customer_program
+                      )
+                 WHERE f.accrual_period = :period
+                   AND l.accrual_period < :period) AS fifo_from_prior
+        )
+        SELECT
+            incurred,
+            applied,
+            fifo_from_prior,
+            ROUND((applied - incurred - fifo_from_prior)::numeric, 2) AS variance
+        FROM metrics
+    """), engine, params={"period": period})
+
+    if df.empty:
+        return {"severity": "pass", "metric_value": 0, "details": []}
+
+    row = df.iloc[0]
+    variance = float(row["variance"] or 0)
+    tolerance = float(threshold) if threshold is not None else 1.00
+
+    severity = "pass" if abs(variance) <= tolerance else "fail"
+
+    return {
+        "severity":     severity,
+        "metric_value": variance,
+        "details": [{
+            "incurred":         float(row["incurred"] or 0),
+            "applied":          float(row["applied"] or 0),
+            "fifo_from_prior":  float(row["fifo_from_prior"] or 0),
+            "variance":         variance,
+            "tolerance":        tolerance,
+        }],
+    }
 
 # ---------------------------------------------------------------------------
 # Allocation compute
@@ -4043,7 +4209,7 @@ def _render_fulfillment_wip(period: str):
         "These programs had activity (receipts, shipments, or inventory) in the period "
         "but no corresponding revenue invoice. Follow up to confirm billing is pending."
     )
-    
+
 
 def _render_wip_period_summary(period: str):
     st.markdown(
