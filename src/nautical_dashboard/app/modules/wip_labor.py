@@ -3464,10 +3464,11 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
             a4.metric("Programs", applied_df["program"].nunique())
             a5.metric("Sources", applied_df["source"].nunique())
 
-            # Check for pending WIP applications
+            # Check for pending fulfillment WIP applications.
+            # Work order WIP checks removed in phase 2 AC/R refactor (2026-05-23) —
+            # AC/R now flows through standard FIFO with no separate application step.
             pending_warnings = []
             
-            # Check fulfillment WIP
             fulfillment_wip_pending = get_prior_fulfillment_wip_applicable(period)
             if not fulfillment_wip_pending.empty:
                 total_pending_fulfillment = fulfillment_wip_pending["accrued_cost"].sum()
@@ -3476,23 +3477,6 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
                     f"(see Fulfillment WIP tab)"
                 )
             
-            # Check work order WIP  
-            accrual_pending = get_accrual_balance(period)
-            unmatched_pending = get_unmatched_work_orders(period)
-            if not accrual_pending.empty or not unmatched_pending.empty:
-                if not accrual_pending.empty:
-                    total_pending_wo = accrual_pending["unapplied_cost"].sum()
-                    pending_warnings.append(
-                        f"${total_pending_wo:,.2f} of work order WIP pending review "
-                        f"(see Arrived Co / Recess tab)"
-                    )
-                if not unmatched_pending.empty:
-                    pending_warnings.append(
-                        f"{len(unmatched_pending)} unmatched invoices pending work order assignment "
-                        f"(see Arrived Co / Recess tab)"
-                    )
-            
-            # Show warnings if any exist
             if pending_warnings:
                 st.warning(
                     "**Pending WIP Applications:**\n\n" + 
