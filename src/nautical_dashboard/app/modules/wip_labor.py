@@ -2280,20 +2280,37 @@ def _check_identity_holds(period: str, threshold) -> dict:
 def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
     """
     Flags programs in stg_labor_incurred that aren't valid allocation targets
-    per dim_customer. A valid target is:
-      - exists in dim_customer
+    per dim_customer, AFTER resolving via dim_customer_alias. A valid target:
+      - resolves to a row in dim_customer
       - active = TRUE
       - is_revenue_customer = TRUE
       - roll_up_for_cost = FALSE
 
     threshold is the $ amount above which the severity escalates from warn
-    to fail. Any unmatched targets at all triggers at least 'warn'.
+    to fail. Default 500.
     """
     df = pd.read_sql(text("""
+        WITH resolved AS (
+            SELECT
+                li.program,
+                li.source_bucket,
+                li.allocated_cost,
+                COALESCE(
+                    (SELECT a.canonical_name FROM dim_customer_alias a
+                     WHERE LOWER(a.alias) = LOWER(li.program)
+                       AND a.active = TRUE
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    li.program
+                ) AS resolved_program
+            FROM stg_labor_incurred li
+            WHERE li.accrual_period = :period
+        )
         SELECT
-            li.program,
-            li.source_bucket,
-            ROUND(SUM(li.allocated_cost)::numeric, 2) AS allocated_cost,
+            r.program,
+            r.source_bucket,
+            r.resolved_program,
+            ROUND(SUM(r.allocated_cost)::numeric, 2) AS allocated_cost,
             CASE
                 WHEN dc.customer_name IS NULL              THEN 'not_in_dim_customer'
                 WHEN dc.active = FALSE                     THEN 'inactive_customer'
@@ -2301,17 +2318,14 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
                 WHEN dc.roll_up_for_cost = TRUE            THEN 'rollup_not_target'
                 ELSE 'unknown'
             END AS issue
-        FROM stg_labor_incurred li
+        FROM resolved r
         LEFT JOIN dim_customer dc
-            ON LOWER(dc.customer_name) = LOWER(li.program)
-        WHERE li.accrual_period = :period
-          AND (
-              dc.customer_name IS NULL
-              OR dc.active = FALSE
-              OR dc.is_revenue_customer = FALSE
-              OR dc.roll_up_for_cost = TRUE
-          )
-        GROUP BY 1, 2, dc.customer_name, dc.active,
+            ON LOWER(dc.customer_name) = LOWER(r.resolved_program)
+        WHERE dc.customer_name IS NULL
+           OR dc.active = FALSE
+           OR dc.is_revenue_customer = FALSE
+           OR dc.roll_up_for_cost = TRUE
+        GROUP BY 1, 2, 3, dc.customer_name, dc.active,
                  dc.is_revenue_customer, dc.roll_up_for_cost
         ORDER BY allocated_cost DESC
     """), engine, params={"period": period})
@@ -2478,15 +2492,17 @@ def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
     """
     Production layers in stg_wip_production_layers for customer_programs
     that don't appear in any smartsheet (demo / ogp / overwrap) for the
-    period. Means labor pool got attributed to a program that didn't
-    actually produce, or the smartsheet ↔ layer name bridge is broken.
+    period, AFTER both sides resolve via dim_customer_alias. Means labor
+    pool got attributed to a program that didn't actually produce, or
+    the smartsheet ↔ layer name bridge is broken.
 
     threshold is the $ amount above which severity escalates from warn
-    to fail. Default $500.
+    to fail. Default 500.
     """
     df = pd.read_sql(text("""
         WITH smartsheet_programs AS (
-            SELECT DISTINCT COALESCE(a.canonical_name, s.customer) AS resolved
+            SELECT DISTINCT 
+                LOWER(COALESCE(a.canonical_name, s.customer)) AS resolved
             FROM stg_smartsheet_demo s
             LEFT JOIN dim_customer_alias a
                 ON LOWER(a.alias) = LOWER(s.customer)
@@ -2497,7 +2513,8 @@ def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
 
             UNION
 
-            SELECT DISTINCT COALESCE(a.canonical_name, s.job_name)
+            SELECT DISTINCT 
+                LOWER(COALESCE(a.canonical_name, s.job_name))
             FROM stg_smartsheet_ogp s
             LEFT JOIN dim_customer_alias a
                 ON LOWER(a.alias) = LOWER(s.job_name)
@@ -2508,35 +2525,44 @@ def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
 
             UNION
 
-            SELECT DISTINCT resolve_overwrap_customer(
-                s.customer, s.project_name, s.work_order_number
-            )
+            SELECT DISTINCT 
+                LOWER(resolve_overwrap_customer(
+                    s.customer, s.project_name, s.work_order_number
+                ))
             FROM stg_smartsheet_overwrap s
             WHERE s.accrual_month = :period
               AND s.units_produced > 0
-        )
-        SELECT
-            l.cost_center,
-            l.customer_program,
-            l.output_type,
-            SUM(l.units_produced)                                       AS units,
-            ROUND(SUM(l.units_produced * l.cost_per_unit)::numeric, 2)  AS pool
-        FROM stg_wip_production_layers l
-        WHERE l.accrual_period = :period
-          AND LOWER(
-                COALESCE(
+        ),
+        resolved_layers AS (
+            SELECT
+                l.cost_center,
+                l.customer_program,
+                l.output_type,
+                l.units_produced,
+                l.cost_per_unit,
+                LOWER(COALESCE(
                     (SELECT a.canonical_name FROM dim_customer_alias a
                      WHERE LOWER(a.alias) = LOWER(l.customer_program)
                        AND a.active = TRUE
                        AND COALESCE(a.exclude, FALSE) = FALSE
                      LIMIT 1),
                     l.customer_program
-                )
-              ) NOT IN (
-                SELECT LOWER(resolved) FROM smartsheet_programs
-                WHERE resolved IS NOT NULL
-              )
-        GROUP BY 1, 2, 3
+                )) AS resolved_program
+            FROM stg_wip_production_layers l
+            WHERE l.accrual_period = :period
+        )
+        SELECT
+            rl.cost_center,
+            rl.customer_program,
+            rl.output_type,
+            rl.resolved_program,
+            SUM(rl.units_produced)                                       AS units,
+            ROUND(SUM(rl.units_produced * rl.cost_per_unit)::numeric, 2) AS pool
+        FROM resolved_layers rl
+        WHERE rl.resolved_program NOT IN (
+            SELECT resolved FROM smartsheet_programs WHERE resolved IS NOT NULL
+        )
+        GROUP BY 1, 2, 3, 4
         ORDER BY pool DESC
     """), engine, params={"period": period})
 
