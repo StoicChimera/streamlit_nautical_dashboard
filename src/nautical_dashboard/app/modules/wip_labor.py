@@ -4043,28 +4043,7 @@ def _render_fulfillment_wip(period: str):
         "These programs had activity (receipts, shipments, or inventory) in the period "
         "but no corresponding revenue invoice. Follow up to confirm billing is pending."
     )
-    applicable_wip_df = get_prior_fulfillment_wip_applicable(period)
-    if not applicable_wip_df.empty or not df.empty:
-        st.markdown("---")
-        st.markdown("#### Commit Fulfillment WIP Applications")
-        st.caption("Lock in all fulfillment WIP applications for this period.")
-        
-        wip_commit_col, _ = st.columns([2, 6])
-        with wip_commit_col:
-            # Get reviewer name from session state
-            reviewer = st.session_state.get("wip_reviewer", "")
-            if st.button(
-                "Commit WIP Applications",
-                key=f"commit_fulfillment_wip_{period}",
-                type="secondary",
-                use_container_width=True,
-            ):
-                if not reviewer:
-                    st.warning("Enter your name in the Reviewer's Name field above before committing.")
-                else:
-                    st.success("Fulfillment WIP applications committed.")
-                    get_labor_applied.clear()
-                    st.rerun()
+    
 
 def _render_wip_period_summary(period: str):
     st.markdown(
