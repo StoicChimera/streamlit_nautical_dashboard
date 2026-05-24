@@ -2468,9 +2468,13 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
         return {"severity": "pass", "metric_value": 0, "details": []}
 
     total_unmatched = float(df["unmatched_units"].sum())
-    fail_threshold = float(threshold) if threshold is not None else 1000.0
 
-    severity = "fail" if total_unmatched > fail_threshold else "warn"
+    # Orphan invoices represent operational data quality gaps (smartsheet
+    # production wasn't logged for billed units), not system bugs. The
+    # unmatched portion gets zero FIFO consumption, which surfaces as
+    # inflated margin on profitability until production is logged. Severity
+    # is capped at 'warn' — flags for ops follow-up but never blocks close.
+    severity = "warn"
 
     return {
         "severity":     severity,
@@ -4581,6 +4585,10 @@ def render_close_check_banner(period: str):
     Renders a status banner showing the latest close check results for the
     period. Pulls from stg_labor_close_check. Shows nothing if no checks
     have been recorded yet.
+
+    For checks with non-empty details (e.g. orphan_invoices with operational
+    gaps), an expandable drill-down table is rendered inside the
+    Reconciliation Detail expander.
     """
     df = pd.read_sql(text("""
         SELECT check_name, severity, metric_value, threshold, details, committed_at
@@ -4614,11 +4622,26 @@ def render_close_check_banner(period: str):
         st.success(f"Reconciliation: {total} of {total} checks passed.")
 
     with st.expander("Reconciliation detail", expanded=not fails.empty):
-        display = df[["check_name", "severity", "metric_value", "threshold"]].copy()
-        display.columns = ["Check", "Status", "Value", "Tolerance"]
-        display["Check"] = display["Check"].str.replace("_", " ").str.title()
-        display["Status"] = display["Status"].str.upper()
-        st.dataframe(display, use_container_width=True, hide_index=True)
+        # Summary table
+        summary = df[["check_name", "severity", "metric_value", "threshold"]].copy()
+        summary.columns = ["Check", "Status", "Value", "Tolerance"]
+        summary["Check"] = summary["Check"].str.replace("_", " ").str.title()
+        summary["Status"] = summary["Status"].str.upper()
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        # Drill-down per check with non-empty details
+        for _, row in df.iterrows():
+            details = row["details"]
+            if not details:
+                continue
+
+            check_label = row["check_name"].replace("_", " ").title()
+            with st.expander(
+                f"{check_label} — {len(details)} item(s)",
+                expanded=False,
+            ):
+                detail_df = pd.DataFrame(details)
+                st.dataframe(detail_df, use_container_width=True, hide_index=True)
 
 
 def _render_wip_period_summary(period: str):
