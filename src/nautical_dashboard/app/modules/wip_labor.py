@@ -1274,9 +1274,13 @@ def run_fifo_matching(period: str, applied_by: str):
         FIFO-consume eligible production layers for the given sales.
 
         output_type : which layer type these sales consume from ('bag', 'overwrap',
-                      'packout', 'kit'). REQUIRED.
+                    'packout', 'kit'). REQUIRED.
         cost_center : optional filter. None = pickpack mode, consumes packout
-                      layers across all cost_centers (OGP packout + OW packout).
+                    layers across all cost_centers (OGP packout + OW packout).
+
+        Hard period gate: layers can only be consumed by sales in the same
+        accrual_period or later. A Feb invoice cannot consume a March layer.
+        Physically impossible — you can't ship what hasn't been produced yet.
         """
         if sales_df.empty:
             return
@@ -1296,7 +1300,8 @@ def run_fifo_matching(period: str, applied_by: str):
 
             eligible = layers[
                 (layers["customer_program"].str.lower().isin(candidates_lc)) &
-                (layers["output_type"]      == output_type)
+                (layers["output_type"]      == output_type) &
+                (layers["accrual_period"]   <= period)   # HARD GATE: no future layers
             ]
             if cost_center is not None:
                 eligible = eligible[eligible["cost_center"] == cost_center]
