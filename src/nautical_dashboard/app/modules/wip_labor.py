@@ -3608,6 +3608,7 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
                     write_program_labor_accrual(period, reviewer_name)
 
                     write_labor_applied(period, reviewer_name)
+                    run_close_checks(period, reviewer_name)  # NEW
                     st.rerun()
 
 # ---------------------------------------------------------------------------
