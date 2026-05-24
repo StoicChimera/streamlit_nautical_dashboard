@@ -2143,10 +2143,11 @@ def run_close_checks(period: str, committed_by: str) -> list[dict]:
     findings = []
 
     checks = [
-        ("scaffolding_test",              _check_scaffolding_test,              None),
-        ("identity_holds",                _check_identity_holds,                1.00),
-        ("unmatched_allocation_targets",  _check_unmatched_allocation_targets,  500.0),
-        ("orphan_invoices",               _check_orphan_invoices,               1000.0),
+        ("scaffolding_test",                 _check_scaffolding_test,                None),
+        ("identity_holds",                   _check_identity_holds,                  1.00),
+        ("unmatched_allocation_targets",     _check_unmatched_allocation_targets,    500.0),
+        ("orphan_invoices",                  _check_orphan_invoices,                 1000.0),
+        ("future_period_consumption",        _check_future_period_consumption,       None),
     ]
 
     with engine.begin() as conn:
@@ -2414,6 +2415,60 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
     return {
         "severity":     severity,
         "metric_value": total_unmatched,
+        "details":      df.to_dict(orient="records"),
+    }
+
+
+def _check_future_period_consumption(period: str, threshold) -> dict:
+    """
+    Tripwire. FIFO events in this period that consumed layers from a period
+    AFTER this period's accrual date. Should never happen — FIFO can only
+    consume layers from the current period or earlier periods.
+
+    Any row returned = fail. This is a regression detector for the period
+    gate. threshold is ignored.
+    """
+    df = pd.read_sql(text("""
+        SELECT
+            f.accrual_period       AS event_period,
+            l.accrual_period       AS layer_period,
+            f.invoice_num,
+            f.customer_program,
+            f.iso_week_produced,
+            f.output_type,
+            f.units_applied,
+            ROUND(f.applied_cost::numeric, 2) AS applied_cost
+        FROM stg_wip_fifo_applied f
+        JOIN stg_wip_production_layers l
+          ON l.cost_center      = f.cost_center
+         AND l.iso_week         = f.iso_week_produced
+         AND l.output_type      = f.output_type
+         AND COALESCE(
+                (SELECT a.canonical_name FROM dim_customer_alias a
+                 WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                   AND a.active = TRUE
+                   AND COALESCE(a.exclude, FALSE) = FALSE
+                 LIMIT 1),
+                l.customer_program
+            ) = COALESCE(
+                (SELECT a.canonical_name FROM dim_customer_alias a
+                 WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                   AND a.active = TRUE
+                   AND COALESCE(a.exclude, FALSE) = FALSE
+                 LIMIT 1),
+                f.customer_program
+            )
+        WHERE f.accrual_period = :period
+          AND TO_DATE(l.accrual_period, 'YYYY-MM')
+              > TO_DATE(f.accrual_period, 'YYYY-MM')
+    """), engine, params={"period": period})
+
+    if df.empty:
+        return {"severity": "pass", "metric_value": 0, "details": []}
+
+    return {
+        "severity":     "fail",
+        "metric_value": float(len(df)),
         "details":      df.to_dict(orient="records"),
     }
 
