@@ -2143,8 +2143,9 @@ def run_close_checks(period: str, committed_by: str) -> list[dict]:
     findings = []
 
     checks = [
-        ("scaffolding_test", _check_scaffolding_test, None),
-        ("identity_holds",   _check_identity_holds,  1.00),
+        ("scaffolding_test",              _check_scaffolding_test,              None),
+        ("identity_holds",                _check_identity_holds,                1.00),
+        ("unmatched_allocation_targets",  _check_unmatched_allocation_targets,  500.0),
     ]
 
     with engine.begin() as conn:
@@ -2271,6 +2272,61 @@ def _check_identity_holds(period: str, threshold) -> dict:
             "tolerance":        tolerance,
         }],
     }
+
+
+def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
+    """
+    Flags programs in stg_labor_incurred that aren't valid allocation targets
+    per dim_customer. A valid target is:
+      - exists in dim_customer
+      - active = TRUE
+      - is_revenue_customer = TRUE
+      - roll_up_for_cost = FALSE
+
+    threshold is the $ amount above which the severity escalates from warn
+    to fail. Any unmatched targets at all triggers at least 'warn'.
+    """
+    df = pd.read_sql(text("""
+        SELECT
+            li.program,
+            li.source_bucket,
+            ROUND(SUM(li.allocated_cost)::numeric, 2) AS allocated_cost,
+            CASE
+                WHEN dc.customer_name IS NULL              THEN 'not_in_dim_customer'
+                WHEN dc.active = FALSE                     THEN 'inactive_customer'
+                WHEN dc.is_revenue_customer = FALSE        THEN 'not_revenue_customer'
+                WHEN dc.roll_up_for_cost = TRUE            THEN 'rollup_not_target'
+                ELSE 'unknown'
+            END AS issue
+        FROM stg_labor_incurred li
+        LEFT JOIN dim_customer dc
+            ON LOWER(dc.customer_name) = LOWER(li.program)
+        WHERE li.accrual_period = :period
+          AND (
+              dc.customer_name IS NULL
+              OR dc.active = FALSE
+              OR dc.is_revenue_customer = FALSE
+              OR dc.roll_up_for_cost = TRUE
+          )
+        GROUP BY 1, 2, dc.customer_name, dc.active,
+                 dc.is_revenue_customer, dc.roll_up_for_cost
+        ORDER BY allocated_cost DESC
+    """), engine, params={"period": period})
+
+    if df.empty:
+        return {"severity": "pass", "metric_value": 0, "details": []}
+
+    total_bad = float(df["allocated_cost"].sum())
+    fail_threshold = float(threshold) if threshold is not None else 500.0
+
+    severity = "fail" if total_bad > fail_threshold else "warn"
+
+    return {
+        "severity":     severity,
+        "metric_value": total_bad,
+        "details":      df.to_dict(orient="records"),
+    }
+
 
 # ---------------------------------------------------------------------------
 # Allocation compute
