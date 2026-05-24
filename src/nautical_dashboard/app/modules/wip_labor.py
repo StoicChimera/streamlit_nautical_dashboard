@@ -4366,11 +4366,20 @@ def _render_outstanding_wip_all():
         f'<h3 style="color:{SECTION_HEADER_COLOR};">Outstanding WIP — All Periods</h3>',
         unsafe_allow_html=True,
     )
-    st.caption("Production labor on the balance sheet across all periods — produced but not yet sold.")
+    st.caption(
+        "Production labor on the balance sheet across all periods — produced but not yet sold. "
+        "Rows under $1.00 are hidden as immaterial rounding residual."
+    )
 
     wip = get_outstanding_wip_all_periods()
     if wip.empty:
         st.info("No outstanding WIP across any period.")
+        return
+
+    # Hide sub-dollar rounding residual rows
+    wip = wip[wip["outstanding_wip"] >= 1.00].copy()
+    if wip.empty:
+        st.success("No material outstanding WIP across any period.")
         return
 
     total_wip = wip["outstanding_wip"].sum()
