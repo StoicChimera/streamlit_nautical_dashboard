@@ -2332,12 +2332,11 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
 def _check_orphan_invoices(period: str, threshold) -> dict:
     """
     Invoices that show in the sales views but FIFO consumed zero units
-    against them. Means either:
+    against them per view. Means either:
       - The alias bridge between invoice customer_name and production layer
         customer_program failed
       - Production for that program hasn't been recorded in smartsheet yet
       - The invoice is for something that doesn't generate production labor
-        (e.g. resale items billed via labor pipeline by mistake)
 
     threshold is the total unmatched-units count above which severity
     escalates from warn to fail. Default 1000 units.
@@ -2374,10 +2373,20 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
             GROUP BY 1, 2, 3
         ),
         fifo_consumed AS (
-            SELECT invoice_num, SUM(units_applied) AS units_applied
+            SELECT 
+                invoice_num,
+                CASE 
+                    WHEN output_type IN ('kit', 'demo') THEN 'demo'
+                    WHEN output_type = 'bag'            THEN 'bag'
+                    WHEN output_type = 'overwrap'       THEN 'overwrap'
+                    WHEN output_type = 'packout'        THEN 'overwrap'
+                    WHEN output_type = 'pickpack'       THEN 'pickpack'
+                    ELSE output_type
+                END AS view_name,
+                SUM(units_applied) AS units_applied
             FROM stg_wip_fifo_applied
             WHERE accrual_period = :period
-            GROUP BY 1
+            GROUP BY 1, 2
         )
         SELECT
             ai.view_name,
@@ -2387,8 +2396,10 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
             COALESCE(fc.units_applied, 0)                  AS fifo_units,
             ai.units - COALESCE(fc.units_applied, 0)       AS unmatched_units
         FROM all_invoices ai
-        LEFT JOIN fifo_consumed fc ON fc.invoice_num = ai.doc_number
-        WHERE ai.units > COALESCE(fc.units_applied, 0)
+        LEFT JOIN fifo_consumed fc 
+            ON fc.invoice_num = ai.doc_number
+           AND fc.view_name   = ai.view_name
+        WHERE ai.units - COALESCE(fc.units_applied, 0) > 0
         ORDER BY unmatched_units DESC
     """), engine, params={"period": period})
 
