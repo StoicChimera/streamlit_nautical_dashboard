@@ -2348,12 +2348,19 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
 
 def _check_orphan_invoices(period: str, threshold) -> dict:
     """
-    Invoices that show in the sales views but FIFO consumed zero units
-    against them per view. Means either:
-      - The alias bridge between invoice customer_name and production layer
-        customer_program failed
-      - Production for that program hasn't been recorded in smartsheet yet
-      - The invoice is for something that doesn't generate production labor
+    Invoices in the four sales views (kit / bag / overwrap / pickpack) for
+    PRODUCTION customers (activity_class = 'Production' in dim_customer)
+    where FIFO consumed zero units per view-line.
+
+    The output type mapping is:
+        demo  invoice  <-> kit layers
+        bag   invoice  <-> bag layers
+        overwrap invoice <-> overwrap layers
+        pickpack invoice <-> packout / pickpack layers
+
+    Customer gate: invoices for fulfillment-only customers (no production)
+    don't run through this match path. Customer names are canonicalized via
+    dim_customer_alias before joining to dim_customer.
 
     threshold is the total unmatched-units count above which severity
     escalates from warn to fail. Default 1000 units.
@@ -2389,15 +2396,39 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
                   = TO_DATE(:period, 'YYYY-MM')
             GROUP BY 1, 2, 3
         ),
+        invoices_resolved AS (
+            SELECT
+                ai.view_name,
+                ai.doc_number,
+                ai.customer_name,
+                ai.units,
+                COALESCE(
+                    (SELECT a.canonical_name FROM dim_customer_alias a
+                     WHERE LOWER(a.alias) = LOWER(ai.customer_name)
+                       AND a.active = TRUE
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    ai.customer_name
+                ) AS resolved_customer
+            FROM all_invoices ai
+        ),
+        invoices_production_only AS (
+            SELECT ir.*
+            FROM invoices_resolved ir
+            JOIN dim_customer dc
+              ON LOWER(dc.customer_name) = LOWER(ir.resolved_customer)
+            WHERE dc.activity_class = 'Production'
+              AND dc.active = TRUE
+        ),
         fifo_consumed AS (
-            SELECT 
+            SELECT
                 invoice_num,
-                CASE 
-                    WHEN output_type IN ('kit', 'demo') THEN 'demo'
-                    WHEN output_type = 'bag'            THEN 'bag'
-                    WHEN output_type = 'overwrap'       THEN 'overwrap'
-                    WHEN output_type = 'packout'        THEN 'overwrap'
-                    WHEN output_type = 'pickpack'       THEN 'pickpack'
+                CASE
+                    WHEN output_type IN ('kit', 'demo')             THEN 'demo'
+                    WHEN output_type = 'bag'                         THEN 'bag'
+                    WHEN output_type = 'overwrap'                    THEN 'overwrap'
+                    WHEN output_type IN ('packout', 'pickpack',
+                                          'pack_out', 'pick_pack')   THEN 'pickpack'
                     ELSE output_type
                 END AS view_name,
                 SUM(units_applied) AS units_applied
@@ -2406,17 +2437,18 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
             GROUP BY 1, 2
         )
         SELECT
-            ai.view_name,
-            ai.doc_number,
-            ai.customer_name,
-            ai.units                                       AS invoiced_units,
-            COALESCE(fc.units_applied, 0)                  AS fifo_units,
-            ai.units - COALESCE(fc.units_applied, 0)       AS unmatched_units
-        FROM all_invoices ai
-        LEFT JOIN fifo_consumed fc 
-            ON fc.invoice_num = ai.doc_number
-           AND fc.view_name   = ai.view_name
-        WHERE ai.units - COALESCE(fc.units_applied, 0) > 0
+            ipo.view_name,
+            ipo.doc_number,
+            ipo.customer_name,
+            ipo.resolved_customer,
+            ipo.units                                       AS invoiced_units,
+            COALESCE(fc.units_applied, 0)                   AS fifo_units,
+            ipo.units - COALESCE(fc.units_applied, 0)       AS unmatched_units
+        FROM invoices_production_only ipo
+        LEFT JOIN fifo_consumed fc
+            ON fc.invoice_num = ipo.doc_number
+           AND fc.view_name   = ipo.view_name
+        WHERE ROUND((ipo.units - COALESCE(fc.units_applied, 0))::numeric, 0) > 0
         ORDER BY unmatched_units DESC
     """), engine, params={"period": period})
 
