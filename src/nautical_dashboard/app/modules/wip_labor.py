@@ -4586,8 +4586,8 @@ def render_close_check_banner(period: str):
     period. Pulls from stg_labor_close_check. Shows nothing if no checks
     have been recorded yet.
 
-    For checks with non-empty details (e.g. orphan_invoices with operational
-    gaps), an expandable drill-down table is rendered inside the
+    Streamlit does not allow nested expanders, so per-check drill-down
+    detail is rendered as labeled tables stacked vertically inside the
     Reconciliation Detail expander.
     """
     df = pd.read_sql(text("""
@@ -4629,19 +4629,17 @@ def render_close_check_banner(period: str):
         summary["Status"] = summary["Status"].str.upper()
         st.dataframe(summary, use_container_width=True, hide_index=True)
 
-        # Drill-down per check with non-empty details
-        for _, row in df.iterrows():
-            details = row["details"]
-            if not details:
-                continue
-
-            check_label = row["check_name"].replace("_", " ").title()
-            with st.expander(
-                f"{check_label} — {len(details)} item(s)",
-                expanded=False,
-            ):
-                detail_df = pd.DataFrame(details)
+        # Per-check drill-down as labeled sections (no nested expanders)
+        checks_with_details = df[df["details"].apply(lambda d: bool(d))]
+        if not checks_with_details.empty:
+            st.markdown("---")
+            st.markdown("**Check detail**")
+            for _, row in checks_with_details.iterrows():
+                check_label = row["check_name"].replace("_", " ").title()
+                st.markdown(f"**{check_label}** ({len(row['details'])} item(s))")
+                detail_df = pd.DataFrame(row["details"])
                 st.dataframe(detail_df, use_container_width=True, hide_index=True)
+                st.markdown("")
 
 
 def _render_wip_period_summary(period: str):
