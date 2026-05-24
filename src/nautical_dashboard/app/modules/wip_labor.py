@@ -4212,11 +4212,55 @@ def _render_fulfillment_wip(period: str):
     )
 
 
+def render_close_check_banner(period: str):
+    """
+    Renders a status banner showing the latest close check results for the
+    period. Pulls from stg_labor_close_check. Shows nothing if no checks
+    have been recorded yet.
+    """
+    df = pd.read_sql(text("""
+        SELECT check_name, severity, metric_value, threshold, details, committed_at
+        FROM stg_labor_close_check
+        WHERE accrual_period = :period
+        ORDER BY committed_at DESC
+    """), engine, params={"period": period})
+
+    if df.empty:
+        return
+
+    # Only show the most recent run (group by committed_at, take latest)
+    latest_ts = df["committed_at"].max()
+    df = df[df["committed_at"] == latest_ts].reset_index(drop=True)
+
+    fails = df[df["severity"] == "fail"]
+    warns = df[df["severity"] == "warn"]
+    passes = df[df["severity"] == "pass"]
+
+    if not fails.empty:
+        st.error(
+            f"Close checks: {len(fails)} fail, {len(warns)} warn, {len(passes)} pass. "
+            f"Review failures before close."
+        )
+    elif not warns.empty:
+        st.warning(
+            f"Close checks: {len(warns)} warn, {len(passes)} pass. "
+            f"Review warnings when convenient."
+        )
+    else:
+        st.success(f"All {len(passes)} close checks pass.")
+
+    with st.expander("Close check detail", expanded=not fails.empty):
+        display = df[["check_name", "severity", "metric_value", "threshold"]].copy()
+        display.columns = ["Check", "Severity", "Metric", "Threshold"]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+
 def _render_wip_period_summary(period: str):
     st.markdown(
         f'<h3 style="color:{SECTION_HEADER_COLOR};">Period Summary</h3>',
         unsafe_allow_html=True,
     )
+    render_close_check_banner(period)
 
     summary            = get_wip_summary(period)
     fulfillment_wip_df = get_fulfillment_wip(period)
