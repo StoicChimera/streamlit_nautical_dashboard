@@ -2492,9 +2492,12 @@ def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
     """
     Production layers in stg_wip_production_layers for customer_programs
     that don't appear in any smartsheet (demo / ogp / overwrap) for the
-    period, AFTER both sides resolve via dim_customer_alias. Means labor
-    pool got attributed to a program that didn't actually produce, or
-    the smartsheet ↔ layer name bridge is broken.
+    period, AFTER both sides resolve via dim_customer_alias.
+
+    The overwrap smartsheet uses resolve_overwrap_customer() which returns
+    a raw customer name; that raw name is then run through
+    dim_customer_alias to get to canonical so it matches the layer side's
+    canonicalized form.
 
     threshold is the $ amount above which severity escalates from warn
     to fail. Default 500.
@@ -2526,8 +2529,15 @@ def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
             UNION
 
             SELECT DISTINCT 
-                LOWER(resolve_overwrap_customer(
-                    s.customer, s.project_name, s.work_order_number
+                LOWER(COALESCE(
+                    (SELECT a.canonical_name FROM dim_customer_alias a
+                     WHERE LOWER(a.alias) = LOWER(
+                         resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
+                     )
+                       AND a.active = TRUE
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
                 ))
             FROM stg_smartsheet_overwrap s
             WHERE s.accrual_month = :period
