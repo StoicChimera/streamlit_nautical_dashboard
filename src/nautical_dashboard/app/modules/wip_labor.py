@@ -1334,6 +1334,7 @@ def run_fifo_matching(period: str, applied_by: str):
                     "cost_center":       str(layer["cost_center"]),
                     "customer_program":  program_label,
                     "iso_week_produced": int(layer["iso_week"]),
+                    "output_type":       str(layer["output_type"]),
                     "units_applied":     applied,
                     "cost_per_unit":     float(layer["cost_per_unit"]),
                     "applied_cost":      cost,
@@ -1365,11 +1366,11 @@ def run_fifo_matching(period: str, applied_by: str):
             conn.execute(text("""
                 INSERT INTO stg_wip_fifo_applied
                     (accrual_period, invoice_num, customer_name, cost_center,
-                     customer_program, iso_week_produced, units_applied,
+                     customer_program, iso_week_produced, output_type, units_applied,
                      cost_per_unit, applied_cost, match_type, applied_by, applied_at)
                 VALUES
                     (:accrual_period, :invoice_num, :customer_name, :cost_center,
-                     :customer_program, :iso_week_produced, :units_applied,
+                     :customer_program, :iso_week_produced, :output_type, :units_applied,
                      :cost_per_unit, :applied_cost, :match_type, :applied_by, :applied_at)
             """), r)
 
