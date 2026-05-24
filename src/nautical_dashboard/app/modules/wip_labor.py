@@ -2146,6 +2146,7 @@ def run_close_checks(period: str, committed_by: str) -> list[dict]:
         ("scaffolding_test",              _check_scaffolding_test,              None),
         ("identity_holds",                _check_identity_holds,                1.00),
         ("unmatched_allocation_targets",  _check_unmatched_allocation_targets,  500.0),
+        ("orphan_invoices",               _check_orphan_invoices,               1000.0),
     ]
 
     with engine.begin() as conn:
@@ -2324,6 +2325,84 @@ def _check_unmatched_allocation_targets(period: str, threshold) -> dict:
     return {
         "severity":     severity,
         "metric_value": total_bad,
+        "details":      df.to_dict(orient="records"),
+    }
+
+
+def _check_orphan_invoices(period: str, threshold) -> dict:
+    """
+    Invoices that show in the sales views but FIFO consumed zero units
+    against them. Means either:
+      - The alias bridge between invoice customer_name and production layer
+        customer_program failed
+      - Production for that program hasn't been recorded in smartsheet yet
+      - The invoice is for something that doesn't generate production labor
+        (e.g. resale items billed via labor pipeline by mistake)
+
+    threshold is the total unmatched-units count above which severity
+    escalates from warn to fail. Default 1000 units.
+    """
+    df = pd.read_sql(text("""
+        WITH all_invoices AS (
+            SELECT 'demo' AS view_name, doc_number, customer_name,
+                   SUM(total_units) AS units
+            FROM v_kit_sales_by_iso_week
+            WHERE contract_completion_date IS NOT NULL
+              AND DATE_TRUNC('month', contract_completion_date::date)
+                  = TO_DATE(:period, 'YYYY-MM')
+            GROUP BY 1, 2, 3
+            UNION ALL
+            SELECT 'bag', doc_number, customer_name, SUM(total_units)
+            FROM v_bag_sales_by_iso_week
+            WHERE contract_completion_date IS NOT NULL
+              AND DATE_TRUNC('month', contract_completion_date::date)
+                  = TO_DATE(:period, 'YYYY-MM')
+            GROUP BY 1, 2, 3
+            UNION ALL
+            SELECT 'overwrap', doc_number, customer_name, SUM(total_units)
+            FROM v_overwrap_sales_by_iso_week
+            WHERE contract_completion_date IS NOT NULL
+              AND DATE_TRUNC('month', contract_completion_date::date)
+                  = TO_DATE(:period, 'YYYY-MM')
+            GROUP BY 1, 2, 3
+            UNION ALL
+            SELECT 'pickpack', doc_number, customer_name, SUM(total_units)
+            FROM v_pickpack_sales_by_iso_week
+            WHERE contract_completion_date IS NOT NULL
+              AND DATE_TRUNC('month', contract_completion_date::date)
+                  = TO_DATE(:period, 'YYYY-MM')
+            GROUP BY 1, 2, 3
+        ),
+        fifo_consumed AS (
+            SELECT invoice_num, SUM(units_applied) AS units_applied
+            FROM stg_wip_fifo_applied
+            WHERE accrual_period = :period
+            GROUP BY 1
+        )
+        SELECT
+            ai.view_name,
+            ai.doc_number,
+            ai.customer_name,
+            ai.units                                       AS invoiced_units,
+            COALESCE(fc.units_applied, 0)                  AS fifo_units,
+            ai.units - COALESCE(fc.units_applied, 0)       AS unmatched_units
+        FROM all_invoices ai
+        LEFT JOIN fifo_consumed fc ON fc.invoice_num = ai.doc_number
+        WHERE ai.units > COALESCE(fc.units_applied, 0)
+        ORDER BY unmatched_units DESC
+    """), engine, params={"period": period})
+
+    if df.empty:
+        return {"severity": "pass", "metric_value": 0, "details": []}
+
+    total_unmatched = float(df["unmatched_units"].sum())
+    fail_threshold = float(threshold) if threshold is not None else 1000.0
+
+    severity = "fail" if total_unmatched > fail_threshold else "warn"
+
+    return {
+        "severity":     severity,
+        "metric_value": total_unmatched,
         "details":      df.to_dict(orient="records"),
     }
 
