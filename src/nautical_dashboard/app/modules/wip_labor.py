@@ -4228,30 +4228,32 @@ def render_close_check_banner(period: str):
     if df.empty:
         return
 
-    # Only show the most recent run (group by committed_at, take latest)
     latest_ts = df["committed_at"].max()
     df = df[df["committed_at"] == latest_ts].reset_index(drop=True)
 
-    fails = df[df["severity"] == "fail"]
-    warns = df[df["severity"] == "warn"]
+    fails  = df[df["severity"] == "fail"]
+    warns  = df[df["severity"] == "warn"]
     passes = df[df["severity"] == "pass"]
+    total  = len(df)
 
     if not fails.empty:
         st.error(
-            f"Close checks: {len(fails)} fail, {len(warns)} warn, {len(passes)} pass. "
-            f"Review failures before close."
+            f"Reconciliation: {len(fails)} failed, {len(warns)} warning, "
+            f"{len(passes)} passed. Review failures before close."
         )
     elif not warns.empty:
         st.warning(
-            f"Close checks: {len(warns)} warn, {len(passes)} pass. "
-            f"Review warnings when convenient."
+            f"Reconciliation: {len(warns)} warning, {len(passes)} passed. "
+            f"Review warnings prior to close."
         )
     else:
-        st.success(f"All {len(passes)} close checks pass.")
+        st.success(f"Reconciliation: {total} of {total} checks passed.")
 
-    with st.expander("Close check detail", expanded=not fails.empty):
+    with st.expander("Reconciliation detail", expanded=not fails.empty):
         display = df[["check_name", "severity", "metric_value", "threshold"]].copy()
-        display.columns = ["Check", "Severity", "Metric", "Threshold"]
+        display.columns = ["Check", "Status", "Value", "Tolerance"]
+        display["Check"] = display["Check"].str.replace("_", " ").str.title()
+        display["Status"] = display["Status"].str.upper()
         st.dataframe(display, use_container_width=True, hide_index=True)
 
 
