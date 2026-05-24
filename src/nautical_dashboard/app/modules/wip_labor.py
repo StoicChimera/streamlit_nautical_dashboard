@@ -1378,92 +1378,12 @@ def run_fifo_matching(period: str, applied_by: str):
 
 
 def write_program_labor_accrual(period: str, committed_by: str):
-    """
-    Writes stg_wip_program_labor_accrual for Arrived Co and Recess.
-    Labor pool is sourced from stg_wip_production_layers (Overwrap cost center).
-    Applied cost is summed from stg_wip_work_order_applied for the period.
-    Unapplied cost is computed as labor_pool_attributed - applied_cost.
-    """
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Pull Arrived Co and Recess labor from production layers
-    layers = pd.read_sql(text("""
-        SELECT
-            customer_program                    AS customer,
-            SUM(units_produced)                 AS units_produced,
-            SUM(labor_pool)                     AS labor_pool_attributed,
-            CASE WHEN SUM(units_produced) > 0
-                 THEN ROUND(SUM(labor_pool) / SUM(units_produced), 6)
-                 ELSE 0 END                     AS cost_per_unit
-        FROM stg_wip_production_layers
-        WHERE accrual_period = :period
-          AND cost_center = 'Overwrap'
-          AND (
-              customer_program ILIKE '%arrived%'
-              OR customer_program ILIKE '%recess%'
-          )
-        GROUP BY 1
-    """), engine, params={"period": period})
-
-    if layers.empty:
-        return
-
-    # Pull already-applied costs from work order applied table
-    applied = pd.read_sql(text("""
-        SELECT
-            customer,
-            SUM(applied_cost) AS applied_cost
-        FROM stg_wip_work_order_applied
-        WHERE accrual_period = :period
-        GROUP BY 1
-    """), engine, params={"period": period})
-
-    applied_map = {}
-    if not applied.empty:
-        applied_map = dict(zip(applied["customer"], applied["applied_cost"]))
-
-    with engine.begin() as conn:
-        conn.execute(
-            text("DELETE FROM stg_wip_program_labor_accrual WHERE accrual_period = :period"),
-            {"period": period},
-        )
-        for _, row in layers.iterrows():
-            customer            = str(row["customer"])
-            labor_pool          = float(row["labor_pool_attributed"])
-            units_produced      = float(row["units_produced"])
-            cost_per_unit       = float(row["cost_per_unit"])
-            applied_cost        = float(applied_map.get(customer, 0.0))
-            unapplied_cost      = round(labor_pool - applied_cost, 2)
-
-            conn.execute(text("""
-                INSERT INTO stg_wip_program_labor_accrual
-                    (accrual_period, customer, labor_pool_attributed,
-                     units_produced, cost_per_unit, applied_cost,
-                     unapplied_cost, locked, locked_by, locked_at)
-                VALUES
-                    (:period, :customer, :labor_pool,
-                     :units_produced, :cost_per_unit, :applied_cost,
-                     :unapplied_cost, TRUE, :locked_by, :locked_at)
-                ON CONFLICT (accrual_period, customer)
-                DO UPDATE SET
-                    labor_pool_attributed = EXCLUDED.labor_pool_attributed,
-                    units_produced        = EXCLUDED.units_produced,
-                    cost_per_unit         = EXCLUDED.cost_per_unit,
-                    applied_cost          = EXCLUDED.applied_cost,
-                    unapplied_cost        = EXCLUDED.unapplied_cost,
-                    locked_by             = EXCLUDED.locked_by,
-                    locked_at             = EXCLUDED.locked_at
-            """), {
-                "period":        period,
-                "customer":      customer,
-                "labor_pool":    labor_pool,
-                "units_produced": units_produced,
-                "cost_per_unit": cost_per_unit,
-                "applied_cost":  applied_cost,
-                "unapplied_cost": unapplied_cost,
-                "locked_by":     committed_by,
-                "locked_at":     now,
-            })
+    """No-op as of phase 2 AC/R refactor (2026-05-23).
+    AC/R labor now flows through standard fifo + production_wip sources
+    via stg_wip_production_layers + stg_wip_fifo_applied. The legacy
+    stg_wip_program_labor_accrual table is retained for historical audit
+    but is no longer written to."""
+    return
 
 
 # ---------------------------------------------------------------------------
@@ -4350,11 +4270,10 @@ def _units(v):
 
 
 def render_production_wip_tab(period: str, reviewer_name: str):
-    wip_tab1, wip_tab2, wip_tab3, wip_tab4, wip_tab5 = st.tabs([
+    wip_tab1, wip_tab2, wip_tab3, wip_tab4 = st.tabs([
         "Period Summary",
         "Production Layers",
         "FIFO Applied",
-        "Arrived Co / Recess",
         "Fulfillment WIP",
     ])
 
@@ -4370,9 +4289,6 @@ def render_production_wip_tab(period: str, reviewer_name: str):
         _render_fifo_applied(period)
 
     with wip_tab4:
-        _render_arrived_co_recess(period, reviewer_name)
-
-    with wip_tab5:
         _render_fulfillment_wip(period)
 
 
@@ -4670,25 +4586,8 @@ def _render_wip_period_summary(period: str):
     else:
         fulfillment_display = pd.DataFrame(columns=prod_display.columns)
 
-    # Work Order WIP rows (ArrivedCo / Recess)
-    if not work_order_wip_df.empty:
-        wo_display = work_order_wip_df.rename(columns={
-            "customer":              "Program",
-            "unapplied_cost":        "Outstanding WIP",
-            "labor_pool_attributed": "Labor Pool",
-            "applied_cost":          "Recognized Cost",
-            "units_produced":        "Units Produced",
-        }).copy()
-        wo_display["Cost Center"]     = "Overwrap"
-        wo_display["Units Remaining"] = wo_display["Units Produced"]   # not consumed until invoiced
-        wo_display["Units Consumed"]  = 0.0
-        wo_display["WIP Type"]        = "Work Order"
-        wo_display = wo_display[[
-            "Cost Center", "Program", "Units Produced", "Units Remaining",
-            "Units Consumed", "Labor Pool", "Recognized Cost", "Outstanding WIP", "WIP Type",
-        ]]
-    else:
-        wo_display = pd.DataFrame(columns=prod_display.columns)
+    # Work Order WIP rows removed in phase 2 AC/R refactor (2026-05-23).
+    wo_display = pd.DataFrame(columns=prod_display.columns)
 
     # Combine and format
     combined = pd.concat([prod_display, fulfillment_display, wo_display], ignore_index=True)
