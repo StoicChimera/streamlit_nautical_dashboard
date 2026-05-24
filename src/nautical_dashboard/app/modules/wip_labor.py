@@ -2148,6 +2148,7 @@ def run_close_checks(period: str, committed_by: str) -> list[dict]:
         ("unmatched_allocation_targets",     _check_unmatched_allocation_targets,    500.0),
         ("orphan_invoices",                  _check_orphan_invoices,                 1000.0),
         ("future_period_consumption",        _check_future_period_consumption,       None),
+        ("layers_without_smartsheet_basis",  _check_layers_without_smartsheet_basis, 500.0),
     ]
 
     with engine.begin() as conn:
@@ -2469,6 +2470,87 @@ def _check_future_period_consumption(period: str, threshold) -> dict:
     return {
         "severity":     "fail",
         "metric_value": float(len(df)),
+        "details":      df.to_dict(orient="records"),
+    }
+
+
+def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
+    """
+    Production layers in stg_wip_production_layers for customer_programs
+    that don't appear in any smartsheet (demo / ogp / overwrap) for the
+    period. Means labor pool got attributed to a program that didn't
+    actually produce, or the smartsheet ↔ layer name bridge is broken.
+
+    threshold is the $ amount above which severity escalates from warn
+    to fail. Default $500.
+    """
+    df = pd.read_sql(text("""
+        WITH smartsheet_programs AS (
+            SELECT DISTINCT COALESCE(a.canonical_name, s.customer) AS resolved
+            FROM stg_smartsheet_demo s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.customer)
+               AND a.active = TRUE
+               AND COALESCE(a.exclude, FALSE) = FALSE
+            WHERE s.accrual_month = :period
+              AND s.number_of_cases_completed > 0
+
+            UNION
+
+            SELECT DISTINCT COALESCE(a.canonical_name, s.job_name)
+            FROM stg_smartsheet_ogp s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.job_name)
+               AND a.active = TRUE
+               AND COALESCE(a.exclude, FALSE) = FALSE
+            WHERE s.accrual_month = :period
+              AND s.daily_production_complete > 0
+
+            UNION
+
+            SELECT DISTINCT resolve_overwrap_customer(
+                s.customer, s.project_name, s.work_order_number
+            )
+            FROM stg_smartsheet_overwrap s
+            WHERE s.accrual_month = :period
+              AND s.units_produced > 0
+        )
+        SELECT
+            l.cost_center,
+            l.customer_program,
+            l.output_type,
+            SUM(l.units_produced)                                       AS units,
+            ROUND(SUM(l.units_produced * l.cost_per_unit)::numeric, 2)  AS pool
+        FROM stg_wip_production_layers l
+        WHERE l.accrual_period = :period
+          AND LOWER(
+                COALESCE(
+                    (SELECT a.canonical_name FROM dim_customer_alias a
+                     WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                       AND a.active = TRUE
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    l.customer_program
+                )
+              ) NOT IN (
+                SELECT LOWER(resolved) FROM smartsheet_programs
+                WHERE resolved IS NOT NULL
+              )
+        GROUP BY 1, 2, 3
+        ORDER BY pool DESC
+    """), engine, params={"period": period})
+
+    if df.empty:
+        return {"severity": "pass", "metric_value": 0, "details": []}
+
+    total_pool = float(df["pool"].sum())
+    fail_threshold = float(threshold) if threshold is not None else 500.0
+
+    severity = "fail" if total_pool > fail_threshold else "warn"
+
+    return {
+        "severity":     severity,
+        "metric_value": total_pool,
         "details":      df.to_dict(orient="records"),
     }
 
