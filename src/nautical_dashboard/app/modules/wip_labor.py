@@ -1229,11 +1229,15 @@ def run_fifo_matching(period: str, applied_by: str):
             SELECT
                 f.cost_center,
                 f.iso_week_produced AS iso_week,
-                CASE
-                    WHEN f.customer_program LIKE 'Advantage - %'
-                    THEN REPLACE(f.customer_program, 'Advantage - ', '')
-                    ELSE f.customer_program
-                END AS canonical_program,
+                COALESCE(
+                    (SELECT a.canonical_name 
+                     FROM dim_customer_alias a 
+                     WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                       AND a.active = TRUE 
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    f.customer_program
+                ) AS canonical_program,
                 SUM(f.units_applied) AS units_consumed
             FROM stg_wip_fifo_applied f
             GROUP BY 1, 2, 3
@@ -1252,11 +1256,15 @@ def run_fifo_matching(period: str, applied_by: str):
         LEFT JOIN consumed c
             ON c.cost_center = l.cost_center
            AND c.iso_week    = l.iso_week
-           AND c.canonical_program = CASE
-                WHEN l.customer_program LIKE 'Advantage - %'
-                THEN REPLACE(l.customer_program, 'Advantage - ', '')
-                ELSE l.customer_program
-           END
+           AND c.canonical_program = COALESCE(
+                (SELECT a.canonical_name 
+                 FROM dim_customer_alias a 
+                 WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                   AND a.active = TRUE 
+                   AND COALESCE(a.exclude, FALSE) = FALSE
+                 LIMIT 1),
+                l.customer_program
+            )
         WHERE l.units_produced - COALESCE(c.units_consumed, 0) > 0
         ORDER BY l.iso_week ASC, l.accrual_period ASC
     """), engine)
@@ -1466,11 +1474,15 @@ def get_production_layers(period: str) -> pd.DataFrame:
             SELECT
                 f.cost_center,
                 f.iso_week_produced AS iso_week,
-                CASE
-                    WHEN f.customer_program LIKE 'Advantage - %'
-                    THEN REPLACE(f.customer_program, 'Advantage - ', '')
-                    ELSE f.customer_program
-                END AS canonical_program,
+                COALESCE(
+                    (SELECT a.canonical_name 
+                     FROM dim_customer_alias a 
+                     WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                       AND a.active = TRUE 
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    f.customer_program
+                ) AS canonical_program,
                 SUM(f.units_applied) AS units_consumed
             FROM stg_wip_fifo_applied f
             GROUP BY 1, 2, 3
@@ -1496,11 +1508,15 @@ def get_production_layers(period: str) -> pd.DataFrame:
         LEFT JOIN consumed c
             ON c.cost_center = l.cost_center
            AND c.iso_week    = l.iso_week
-           AND c.canonical_program = CASE
-                WHEN l.customer_program LIKE 'Advantage - %'
-                THEN REPLACE(l.customer_program, 'Advantage - ', '')
-                ELSE l.customer_program
-           END
+           AND c.canonical_program = COALESCE(
+                (SELECT a.canonical_name 
+                 FROM dim_customer_alias a 
+                 WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                   AND a.active = TRUE 
+                   AND COALESCE(a.exclude, FALSE) = FALSE
+                 LIMIT 1),
+                l.customer_program
+            )
         WHERE l.accrual_period = :period
         ORDER BY l.cost_center, l.iso_week, l.customer_program
     """), engine, params={"period": period})
@@ -1534,8 +1550,6 @@ def get_wip_summary(period: str) -> pd.DataFrame:
             -- AC/R is now standard Production WIP, no special exclusion.
         ),
         consumed AS (
-            -- Source-of-truth consumption from fifo_applied, not units_remaining.
-            -- units_remaining can be corrupted by unlock cycles that don't reverse it.
             SELECT
                 f.cost_center,
                 f.iso_week_produced AS iso_week,
@@ -1547,9 +1561,6 @@ def get_wip_summary(period: str) -> pd.DataFrame:
                 SUM(f.units_applied) AS units_consumed,
                 SUM(f.applied_cost)  AS cost_consumed
             FROM stg_wip_fifo_applied f
-            -- Only count consumption that has been recognized in or before
-            -- this period; later-period consumption doesn't reduce this
-            -- period's closing WIP balance.
             WHERE TO_DATE(f.accrual_period, 'YYYY-MM') <= TO_DATE(:period, 'YYYY-MM')
             GROUP BY 1, 2, 3
         )
@@ -1585,22 +1596,20 @@ def get_outstanding_wip_all_periods() -> pd.DataFrame:
                 iso_week, units_produced, cost_per_unit,
                 units_produced * cost_per_unit AS layer_pool
             FROM stg_wip_production_layers
-            -- AC/R filter REMOVED in phase 2 refactor (2026-05-23).
-            -- AC/R is now standard Production WIP, no special exclusion.
         ),
         consumed AS (
-            -- ALL consumption ever recognized against these layers,
-            -- regardless of consumption period. This is the cumulative
-            -- balance-sheet view: how much of each period's production
-            -- has been consumed across the entire system to date.
             SELECT
                 f.cost_center,
                 f.iso_week_produced AS iso_week,
-                CASE 
-                    WHEN f.customer_program LIKE 'Advantage - %' 
-                    THEN REPLACE(f.customer_program, 'Advantage - ', '')
-                    ELSE f.customer_program 
-                END AS canonical_program,
+                COALESCE(
+                    (SELECT a.canonical_name 
+                     FROM dim_customer_alias a 
+                     WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                       AND a.active = TRUE 
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    f.customer_program
+                ) AS canonical_program,
                 SUM(f.units_applied) AS units_consumed,
                 SUM(f.applied_cost)  AS cost_consumed
             FROM stg_wip_fifo_applied f
@@ -1616,11 +1625,15 @@ def get_outstanding_wip_all_periods() -> pd.DataFrame:
         LEFT JOIN consumed c
             ON c.cost_center = l.cost_center
            AND c.iso_week    = l.iso_week
-           AND c.canonical_program = CASE 
-                WHEN l.customer_program LIKE 'Advantage - %' 
-                THEN REPLACE(l.customer_program, 'Advantage - ', '')
-                ELSE l.customer_program 
-           END
+           AND c.canonical_program = COALESCE(
+                (SELECT a.canonical_name 
+                 FROM dim_customer_alias a 
+                 WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                   AND a.active = TRUE 
+                   AND COALESCE(a.exclude, FALSE) = FALSE
+                 LIMIT 1),
+                l.customer_program
+            )
         GROUP BY 1, 2, 3
         HAVING SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0) > 0
         ORDER BY 1, 2, 3
@@ -2088,22 +2101,30 @@ def write_labor_applied(period: str, locked_by: str):
                     SELECT
                         f2.cost_center,
                         f2.iso_week_produced AS iso_week,
-                        CASE
-                            WHEN f2.customer_program LIKE 'Advantage - %'
-                            THEN REPLACE(f2.customer_program, 'Advantage - ', '')
-                            ELSE f2.customer_program
-                        END AS canonical_program,
+                        COALESCE(
+                            (SELECT a.canonical_name 
+                             FROM dim_customer_alias a 
+                             WHERE LOWER(a.alias) = LOWER(f2.customer_program)
+                               AND a.active = TRUE 
+                               AND COALESCE(a.exclude, FALSE) = FALSE
+                             LIMIT 1),
+                            f2.customer_program
+                        ) AS canonical_program,
                         SUM(f2.units_applied) AS units_consumed
                     FROM stg_wip_fifo_applied f2
                     GROUP BY 1, 2, 3
                 ) cons
                     ON cons.cost_center = lay.cost_center
                    AND cons.iso_week    = lay.iso_week
-                   AND cons.canonical_program = CASE
-                        WHEN lay.customer_program LIKE 'Advantage - %'
-                        THEN REPLACE(lay.customer_program, 'Advantage - ', '')
-                        ELSE lay.customer_program
-                   END
+                   AND cons.canonical_program = COALESCE(
+                        (SELECT a.canonical_name 
+                         FROM dim_customer_alias a 
+                         WHERE LOWER(a.alias) = LOWER(lay.customer_program)
+                           AND a.active = TRUE 
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        lay.customer_program
+                    )
                 GROUP BY 1, 2, 3
             ) l ON  l.accrual_period   = f.accrual_period
                 AND l.cost_center      = f.cost_center
@@ -2180,11 +2201,15 @@ def write_labor_applied(period: str, locked_by: str):
                 SELECT
                     f.cost_center,
                     f.iso_week_produced AS iso_week,
-                    CASE 
-                        WHEN f.customer_program LIKE 'Advantage - %' 
-                        THEN REPLACE(f.customer_program, 'Advantage - ', '')
-                        ELSE f.customer_program 
-                    END AS canonical_program,
+                    COALESCE(
+                        (SELECT a.canonical_name 
+                         FROM dim_customer_alias a 
+                         WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                           AND a.active = TRUE 
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        f.customer_program
+                    ) AS canonical_program,
                     SUM(f.units_applied) AS units_consumed
                 FROM stg_wip_fifo_applied f
                 WHERE f.accrual_period = :period
@@ -2202,15 +2227,19 @@ def write_labor_applied(period: str, locked_by: str):
                 LEFT JOIN this_period_consumption c
                     ON c.cost_center = l.cost_center
                    AND c.iso_week    = l.iso_week
-                   AND c.canonical_program = CASE 
-                        WHEN l.customer_program LIKE 'Advantage - %' 
-                        THEN REPLACE(l.customer_program, 'Advantage - ', '')
-                        ELSE l.customer_program 
-                   END
+                   AND c.canonical_program = COALESCE(
+                        (SELECT a.canonical_name 
+                         FROM dim_customer_alias a 
+                         WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                           AND a.active = TRUE 
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        l.customer_program
+                    )
                 WHERE l.accrual_period = :period
-                  -- AC/R filter REMOVED in phase 2 refactor (2026-05-23).
-                  -- AC/R labor now flows through fifo (consumed) and
-                  -- production_wip (unconsumed) via standard pipeline.
+                  -- Canonicalization via dim_customer_alias (replaces inline CASE WHEN).
+                  -- Handles ArrivedCo ↔ Arrived Co, Walmart OGP ↔ Advantage - Walmart OGP,
+                  -- and any future naming mismatches without code changes.
                 GROUP BY 1, 2, 3
                 HAVING SUM(l.units_produced * l.cost_per_unit) 
                        - COALESCE(SUM(c.units_consumed * l.cost_per_unit), 0) > 0.005
