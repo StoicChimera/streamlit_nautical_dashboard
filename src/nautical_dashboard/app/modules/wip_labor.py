@@ -1530,17 +1530,8 @@ def get_wip_summary(period: str) -> pd.DataFrame:
                 units_produced * cost_per_unit AS layer_pool
             FROM stg_wip_production_layers
             WHERE accrual_period = :period
-              -- Exclude ArrivedCo/Recess Overwrap. That labor is surfaced as
-              -- Work Order WIP via stg_wip_program_labor_accrual, not as
-              -- Production WIP. Including it here would double-count when
-              -- the page sums Production + Work Order WIP for Total Balance.
-              AND NOT (
-                  cost_center = 'Overwrap'
-                  AND (
-                      customer_program ILIKE '%arrived%'
-                      OR customer_program ILIKE '%recess%'
-                  )
-              )
+            -- AC/R filter REMOVED in phase 2 refactor (2026-05-23).
+            -- AC/R is now standard Production WIP, no special exclusion.
         ),
         consumed AS (
             -- Source-of-truth consumption from fifo_applied, not units_remaining.
@@ -1594,13 +1585,8 @@ def get_outstanding_wip_all_periods() -> pd.DataFrame:
                 iso_week, units_produced, cost_per_unit,
                 units_produced * cost_per_unit AS layer_pool
             FROM stg_wip_production_layers
-            WHERE NOT (
-                cost_center = 'Overwrap'
-                AND (
-                    customer_program ILIKE '%arrived%'
-                    OR customer_program ILIKE '%recess%'
-                )
-            )
+            -- AC/R filter REMOVED in phase 2 refactor (2026-05-23).
+            -- AC/R is now standard Production WIP, no special exclusion.
         ),
         consumed AS (
             -- ALL consumption ever recognized against these layers,
@@ -2127,41 +2113,9 @@ def write_labor_applied(period: str, locked_by: str):
                     l.units_produced, l.labor_pool, l.units_remaining, l.wip_cost_remaining
         """), {"period": period, "locked_by": locked_by, "locked_at": now})
 
-        # ----------------------------------------------------------------
-        # Source 3 — work_order_assigned
-        # Arrived Co and Recess from stg_wip_program_labor_accrual
-        # ----------------------------------------------------------------
-        conn.execute(text("""
-            INSERT INTO stg_labor_applied (
-                accrual_period, source, bucket, program, labor_type,
-                activity_driver, activity_value, weight,
-                wip_units_forward, wip_cost_forward,
-                wip_units_remaining, wip_cost_remaining,
-                applied_units, applied_cost,
-                locked, locked_by, locked_at
-            )
-            SELECT
-                accrual_period,
-                'work_order_assigned',
-                'Overwrap'                  AS bucket,
-                CASE 
-                    WHEN customer = 'ArrivedCo' THEN 'Arrived Co'
-                    ELSE customer
-                END AS program,
-                'direct_cogs'               AS labor_type,
-                'Work Order Assigned'       AS activity_driver,
-                units_produced              AS activity_value,
-                NULL                        AS weight,
-                units_produced              AS wip_units_forward,
-                labor_pool_attributed       AS wip_cost_forward,
-                units_produced              AS wip_units_remaining,
-                unapplied_cost              AS wip_cost_remaining,
-                units_produced              AS applied_units,
-                labor_pool_attributed       AS applied_cost,
-                TRUE, :locked_by, :locked_at
-            FROM stg_wip_program_labor_accrual
-            WHERE accrual_period = :period
-        """), {"period": period, "locked_by": locked_by, "locked_at": now})
+        # Source 3 — REMOVED in phase 2 AC/R refactor (2026-05-23).
+        # AC/R labor now flows through the standard fifo + production_wip
+        # sources via the unified sales views (which no longer exclude AC/R).
 
         # ----------------------------------------------------------------
         # Source 4 — current_fulfillment_wip
@@ -2254,17 +2208,9 @@ def write_labor_applied(period: str, locked_by: str):
                         ELSE l.customer_program 
                    END
                 WHERE l.accrual_period = :period
-                  -- Exclude ArrivedCo/Recess Overwrap layers — that labor
-                  -- flows to stg_labor_applied via Source 3 (work_order_assigned)
-                  -- through stg_wip_program_labor_accrual. Including it here
-                  -- would double-count: same labor pool, two sources.
-                  AND NOT (
-                      l.cost_center = 'Overwrap'
-                      AND (
-                          l.customer_program ILIKE '%arrived%'
-                          OR l.customer_program ILIKE '%recess%'
-                      )
-                  )
+                  -- AC/R filter REMOVED in phase 2 refactor (2026-05-23).
+                  -- AC/R labor now flows through fifo (consumed) and
+                  -- production_wip (unconsumed) via standard pipeline.
                 GROUP BY 1, 2, 3
                 HAVING SUM(l.units_produced * l.cost_per_unit) 
                        - COALESCE(SUM(c.units_consumed * l.cost_per_unit), 0) > 0.005
@@ -4619,25 +4565,22 @@ def _render_wip_period_summary(period: str):
     total_recognized      = summary["recognized_cost"].sum()
     total_production_wip  = summary["outstanding_wip"].sum()
     total_fulfillment_wip = float(fulfillment_wip_df["applied_cost"].sum()) if not fulfillment_wip_df.empty else 0.0
-    total_workorder_wip   = float(work_order_wip_df["unapplied_cost"].sum()) if not work_order_wip_df.empty else 0.0
-    total_wip_balance     = total_production_wip + total_fulfillment_wip + total_workorder_wip
+    total_wip_balance     = total_production_wip + total_fulfillment_wip
     total_produced        = summary["units_produced"].sum()
     total_remaining       = summary["units_remaining"].sum()
 
-    # Top-line KPIs — the three slices must add to Total WIP Balance.
-    # This reconciles with "New WIP Generated" on the Allocation tab,
-    # which sums the same three sources from stg_labor_applied.
-    k1, k2, k3, k4 = st.columns(4)
+    # Top-line KPIs — Production WIP + Fulfillment WIP = Total WIP Balance.
+    # Work Order WIP removed in phase 2 AC/R refactor (2026-05-23) —
+    # AC/R labor now flows through the standard Production WIP path.
+    k1, k2, k3 = st.columns(3)
     k1.metric("Production WIP",  _dollar(total_production_wip),
-              help="Demo/OGP/Overwrap layer labor produced but not yet FIFO-consumed by sales.")
+              help="Demo/OGP/Overwrap layer labor produced but not yet FIFO-consumed by sales (includes AC/R).")
     k2.metric("Fulfillment WIP", _dollar(total_fulfillment_wip),
               help="Period allocation labor for programs with no current revenue. Pending future invoice.")
-    k3.metric("Work Order WIP",  _dollar(total_workorder_wip),
-              help="ArrivedCo / Recess labor pending work order assignment to an invoice.")
-    k4.metric("Total WIP Balance", _dollar(total_wip_balance))
+    k3.metric("Total WIP Balance", _dollar(total_wip_balance))
 
     st.caption(
-        "These three categories sum to Feb's total WIP on the balance sheet. "
+        "These two categories sum to total WIP on the balance sheet. "
         "This figure matches 'New WIP Generated' on the Allocation tab."
     )
     st.markdown("")
