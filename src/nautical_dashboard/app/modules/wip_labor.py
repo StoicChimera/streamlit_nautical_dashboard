@@ -1441,6 +1441,72 @@ def get_outstanding_wip_all_periods() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def get_outstanding_fulfillment_wip_all_periods() -> pd.DataFrame:
+    """
+    Returns fulfillment WIP grouped by ORIGIN period — the period the labor
+    was originally incurred. Nets applied amounts against original amounts
+    at the (origin_period, program, cost_center, labor_type) grain.
+
+    A row appearing here for origin_period = 2026-01 means: labor was
+    accrued to a no-revenue program in Jan 2026 and is STILL not invoiced
+    as of today. The longer the gap between origin_period and today, the
+    bigger the audit concern.
+
+    Origin period for applied rows is parsed from activity_driver, which
+    is written as 'WIP from {origin_period}: {original_driver}' by
+    write_fulfillment_wip_applied.
+
+    Rows under $1.00 are hidden as immaterial rounding residual.
+    """
+    return pd.read_sql(text("""
+        WITH original AS (
+            SELECT
+                accrual_period    AS origin_period,
+                bucket            AS cost_center,
+                program,
+                labor_type,
+                SUM(applied_cost) AS original_amount
+            FROM stg_labor_applied
+            WHERE source = 'current_fulfillment_wip'
+            GROUP BY 1, 2, 3, 4
+        ),
+        applied AS (
+            SELECT
+                -- Parse 'WIP from YYYY-MM: ...' to recover origin period.
+                -- substring grabs the 7-char date right after 'WIP from '.
+                SUBSTRING(activity_driver FROM 'WIP from (\d{4}-\d{2}):') AS origin_period,
+                bucket            AS cost_center,
+                program,
+                labor_type,
+                SUM(applied_cost) AS applied_amount
+            FROM stg_labor_applied
+            WHERE source = 'fulfillment_wip_applied'
+              AND activity_driver ~ '^WIP from \d{4}-\d{2}:'
+            GROUP BY 1, 2, 3, 4
+        )
+        SELECT
+            o.origin_period,
+            o.cost_center,
+            o.program,
+            o.labor_type,
+            o.original_amount,
+            COALESCE(a.applied_amount, 0)                         AS applied_amount,
+            o.original_amount - COALESCE(a.applied_amount, 0)     AS outstanding_wip,
+            -- Age in months. NULL-safe via TO_DATE. Useful for triage.
+            EXTRACT(YEAR  FROM AGE(CURRENT_DATE, TO_DATE(o.origin_period, 'YYYY-MM'))) * 12
+          + EXTRACT(MONTH FROM AGE(CURRENT_DATE, TO_DATE(o.origin_period, 'YYYY-MM'))) AS months_outstanding
+        FROM original o
+        LEFT JOIN applied a
+            ON a.origin_period = o.origin_period
+           AND a.cost_center   = o.cost_center
+           AND a.program       = o.program
+           AND a.labor_type    = o.labor_type
+        WHERE o.original_amount - COALESCE(a.applied_amount, 0) >= 1.00
+        ORDER BY o.origin_period, o.program
+    """), engine)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def get_fulfillment_wip(period: str) -> pd.DataFrame:
     """
     Returns fulfillment WIP for the period — labor allocated to programs
@@ -3981,6 +4047,8 @@ def render_production_wip_tab(period: str, reviewer_name: str):
         _render_wip_period_summary(period)
         st.markdown("---")
         _render_outstanding_wip_all()
+        st.markdown("---")
+        _render_outstanding_fulfillment_wip_all()
 
     with wip_tab2:
         _render_production_layers(period)
@@ -4482,6 +4550,67 @@ def _render_outstanding_wip_all():
         st.altair_chart(chart, use_container_width=True)
     else:
         st.caption("Period-over-period trend will appear once 3 or more periods have been committed.")
+
+
+def _render_outstanding_fulfillment_wip_all():
+    st.markdown(
+        f'<h3 style="color:{SECTION_HEADER_COLOR};">Outstanding Fulfillment WIP — All Periods</h3>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Fulfillment labor on the balance sheet across all periods — accrued "
+        "for programs with no revenue at the time, still not invoiced. "
+        "Origin Period is when the labor was incurred. Rows under $1.00 are "
+        "hidden as immaterial rounding residual."
+    )
+
+    wip = get_outstanding_fulfillment_wip_all_periods()
+    if wip.empty:
+        st.success("No outstanding fulfillment WIP across any period.")
+        return
+
+    total_wip = wip["outstanding_wip"].sum()
+    st.metric("Total Outstanding Fulfillment WIP", _dollar(total_wip))
+    st.markdown("")
+
+    display = wip.copy()
+    display = display[[
+        "origin_period", "cost_center", "program", "labor_type",
+        "outstanding_wip", "months_outstanding",
+    ]].copy()
+    display.columns = [
+        "Origin Period", "Cost Center", "Program", "Labor Type",
+        "Outstanding WIP", "Months Outstanding",
+    ]
+    display["Outstanding WIP"]    = display["Outstanding WIP"].map(_dollar)
+    display["Months Outstanding"] = display["Months Outstanding"].map(
+        lambda x: f"{int(x)}" if pd.notna(x) else ""
+    )
+    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # Period-over-period trend
+    if len(wip["origin_period"].unique()) >= 3:
+        chart_df = wip.groupby("origin_period")["outstanding_wip"].sum().reset_index()
+        chart = (
+            alt.Chart(chart_df).mark_line(point=True, color="#ff7f0e")
+            .encode(
+                x=alt.X("origin_period:N", sort=None, title="Origin Period"),
+                y=alt.Y("outstanding_wip:Q", title="Outstanding WIP ($)",
+                        axis=alt.Axis(format="$,.0f")),
+                tooltip=[
+                    alt.Tooltip("origin_period:N",   title="Origin Period"),
+                    alt.Tooltip("outstanding_wip:Q", title="WIP $", format="$,.2f"),
+                ],
+            )
+            .properties(height=250)
+        )
+        st.altair_chart(chart, use_container_width=True)
+    else:
+        st.caption(
+            "Period-over-period trend will appear once 3 or more origin "
+            "periods have outstanding WIP."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Main render
