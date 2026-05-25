@@ -170,14 +170,21 @@ def get_programs_for_cost_center(cost_center_name: str, period: str) -> list[str
 
 @st.cache_data(ttl=300, show_spinner=False)
 def get_all_revenue_programs() -> list[str]:
-    """All active billable programs. Used as the dropdown universe for
-    direct_program allocation lines."""
+    """Direct-assignment dropdown universe for direct_program allocation lines.
+
+    Only customers explicitly marked as valid direct-hire targets. Rollup
+    nodes (Advantage - Demo, Advantage - OGP, etc.) must be excluded here —
+    labor charged to a rollup terminates there instead of fanning out to
+    actual customer programs via produced units, which is the bug this
+    filter prevents.
+    """
     df = pd.read_sql(text("""
         SELECT customer_name
         FROM dim_customer
         WHERE active = TRUE
           AND is_revenue_customer = TRUE
           AND roll_up_for_cost = FALSE
+          AND allow_direct_hire = TRUE
         ORDER BY customer_name
     """), engine)
     return df['customer_name'].tolist()
