@@ -1538,9 +1538,13 @@ def get_fulfillment_wip(period: str) -> pd.DataFrame:
 def get_prior_fulfillment_wip_applicable(period: str) -> pd.DataFrame:
     """
     Returns prior period fulfillment WIP rows where:
-    - The program had no revenue in the period it was incurred
+    - Labor was written as source = 'current_fulfillment_wip' (program had
+      no revenue when labor was incurred)
     - The program HAS revenue in the current period
     - The WIP has not already been applied to the current period
+
+    Surfaces stale WIP that should be expensed against current-period revenue.
+    Used by both the auto-apply path during commit and the manual review UI.
     """
     try:
         return pd.read_sql(text("""
@@ -1553,14 +1557,8 @@ def get_prior_fulfillment_wip_applicable(period: str) -> pd.DataFrame:
                 SUM(la.activity_value)      AS activity_value,
                 SUM(la.applied_cost)        AS accrued_cost
             FROM stg_labor_applied la
-            WHERE la.source = 'period_allocation'
+            WHERE la.source = 'current_fulfillment_wip'
               AND la.accrual_period != :period
-              -- Had no revenue in the origin period
-              AND NOT EXISTS (
-                  SELECT 1 FROM mv_program_profitability mv
-                  WHERE mv.month_start = TO_DATE(la.accrual_period, 'YYYY-MM')
-                    AND mv.customer_program = la.program
-              )
               -- Has revenue in the current period
               AND EXISTS (
                   SELECT 1 FROM mv_program_profitability mv
@@ -1624,6 +1622,41 @@ def write_fulfillment_wip_applied(period: str, rows: list[dict], locked_by: str)
                 "locked_by":        locked_by,
                 "locked_at":        now,
             })
+
+
+def auto_apply_prior_fulfillment_wip(period: str, committed_by: str) -> dict:
+    """
+    Auto-applies all applicable prior-period fulfillment WIP to the current
+    period. Called at commit time, after write_labor_applied, before
+    close checks.
+
+    Returns a summary dict for post-commit display:
+        {
+            'rows_applied':       int,
+            'programs_applied':   int,
+            'total_amount':       float,
+            'detail':             pd.DataFrame,   # full per-row breakdown
+        }
+    """
+    applicable = get_prior_fulfillment_wip_applicable(period)
+
+    if applicable.empty:
+        return {
+            'rows_applied':     0,
+            'programs_applied': 0,
+            'total_amount':     0.0,
+            'detail':           pd.DataFrame(),
+        }
+
+    rows = applicable.to_dict('records')
+    write_fulfillment_wip_applied(period, rows, committed_by)
+
+    return {
+        'rows_applied':     len(rows),
+        'programs_applied': int(applicable['program'].nunique()),
+        'total_amount':     float(applicable['accrued_cost'].sum()),
+        'detail':           applicable.copy(),
+    }
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -3492,6 +3525,37 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
         locked_by = existing["committed_by"].iloc[0] if "committed_by" in existing.columns else "unknown"
         locked_at = existing["committed_at"].iloc[0] if "committed_at" in existing.columns else ""
         st.success(f"Allocation committed by **{locked_by}** at {locked_at}")
+
+        # Post-commit auto-apply summary, if present from this session's commit
+        result = st.session_state.get(f'auto_apply_result_{period}')
+        if result and result['rows_applied'] > 0:
+            st.info(
+                f"Auto-applied {_dollar(result['total_amount'])} of prior fulfillment WIP "
+                f"across {result['programs_applied']} programs "
+                f"({result['rows_applied']} line(s))"
+            )
+            with st.expander("Auto-applied WIP detail", expanded=False):
+                detail = result['detail'].copy()
+                detail['accrued_cost']   = detail['accrued_cost'].map(_dollar)
+                detail['activity_value'] = detail['activity_value'].map("{:,.2f}".format)
+                detail = detail.rename(columns={
+                    'origin_period':   'Origin Period',
+                    'program':         'Program',
+                    'cost_center':     'Cost Center',
+                    'labor_type':      'Labor Type',
+                    'activity_driver': 'Driver',
+                    'activity_value':  'Driver Value',
+                    'accrued_cost':    'Applied Cost',
+                })
+                st.dataframe(
+                    detail[[
+                        'Origin Period', 'Program', 'Cost Center', 'Labor Type',
+                        'Driver', 'Driver Value', 'Applied Cost',
+                    ]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
         can_unlock = auth.has_role("admin", "controller")
         if st.button(
             "Unlock and Recommit",
@@ -3905,7 +3969,15 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
                     write_program_labor_accrual(period, reviewer_name)
 
                     write_labor_applied(period, reviewer_name)
-                    run_close_checks(period, reviewer_name)  # NEW
+
+                    # Auto-apply prior-period fulfillment WIP where revenue now exists
+                    auto_apply_result = auto_apply_prior_fulfillment_wip(period, reviewer_name)
+                    if auto_apply_result['rows_applied'] > 0:
+                        st.session_state[f'auto_apply_result_{period}'] = auto_apply_result
+
+                    run_close_checks(period, reviewer_name)
+                    get_prior_fulfillment_wip_applicable.clear()
+                    get_labor_applied.clear()
                     st.rerun()
 
 # ---------------------------------------------------------------------------
