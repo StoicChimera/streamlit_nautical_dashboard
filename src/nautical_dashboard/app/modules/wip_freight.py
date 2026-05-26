@@ -634,7 +634,6 @@ def render():
             st.success("No unmatched lines — all freight is period-matched.")
         else:
             st.divider()
-            st.subheader("Bulk assign unmatched lines")
             render_freight_bulk_assigner(
                 engine,
                 df_unmatched,
