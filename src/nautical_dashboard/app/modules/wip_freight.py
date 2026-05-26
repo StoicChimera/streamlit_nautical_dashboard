@@ -265,6 +265,256 @@ def load_freight_signoff(engine, accrual_period: str):
     )
     return df.iloc[0].to_dict() if not df.empty else None
 
+
+# ---------------------------------------------------------------------------
+# Bulk freight assignment helper (virtualized, off-screen preserving)
+# ---------------------------------------------------------------------------
+
+def _bulk_freight_set_key(prefix: str) -> str:
+    return f"freight_bulk_set_{prefix}"
+
+
+def _bulk_freight_editor_key(prefix: str) -> str:
+    return f"freight_bulk_editor_{prefix}"
+
+
+def _bulk_freight_cache_key(prefix: str) -> str:
+    return f"freight_bulk_cache_{prefix}"
+
+
+def _bulk_freight_sig_key(prefix: str) -> str:
+    return f"freight_bulk_sig_{prefix}"
+
+
+def _row_uid(row) -> str:
+    """Stable identifier for a freight line — invoice_num + line_description.
+    Mirrors the unique key used in dim_freight_matching's ON CONFLICT clause."""
+    return f"{row['invoice_num']}||{row['line_description']}"
+
+
+def render_freight_bulk_assigner(
+    engine,
+    df: pd.DataFrame,
+    key_prefix: str,
+    *,
+    show_columns: list[str] | None = None,
+    empty_msg: str = "No unmatched lines.",
+):
+    """Virtualized bulk-assign UI for freight lines.
+
+    Renders:
+      - placeholder slot for the bulk-assign panel (filled after the list)
+      - filterable st.data_editor with a Select checkbox column
+      - Select all visible / Clear buttons
+      - bulk period + notes form (in the placeholder, rendered last)
+
+    df must contain: invoice_num, line_description, customer_full_name,
+                     customer_ref_num, amount, bill_date.
+    """
+    if df.empty:
+        st.success(empty_msg)
+        return
+
+    set_k    = _bulk_freight_set_key(key_prefix)
+    editor_k = _bulk_freight_editor_key(key_prefix)
+    cache_k  = _bulk_freight_cache_key(key_prefix)
+    sig_k    = _bulk_freight_sig_key(key_prefix)
+
+    if set_k not in st.session_state:
+        st.session_state[set_k] = set()
+
+    # Reserve the bulk panel slot up front so it appears above the list
+    # but renders content after the list has synced the selection.
+    bulk_panel_slot = st.empty()
+
+    st.warning(f"{len(df)} unmatched line(s) — ${df['amount'].sum():,.2f} total")
+
+    # --- Filter ---
+    search_term = st.text_input(
+        "Filter by customer or description",
+        key=f"freight_bulk_search_{key_prefix}",
+        placeholder="Type to filter...",
+    )
+
+    filtered = df.copy()
+    if search_term:
+        mask = (
+            filtered['customer_full_name'].astype(str).str.contains(search_term, case=False, na=False)
+            | filtered['line_description'].astype(str).str.contains(search_term, case=False, na=False)
+        )
+        filtered = filtered[mask]
+
+    if filtered.empty:
+        st.info("No lines match the current filter.")
+        return
+
+    # Build a stable row_uid so off-screen preservation works across filter changes.
+    filtered = filtered.reset_index(drop=True)
+    filtered['_row_uid'] = filtered.apply(_row_uid, axis=1)
+
+    prior_selected = st.session_state[set_k]
+
+    # Cache signature: filter + row count. Rebuilds when filter changes
+    # or underlying data shrinks (post-Apply).
+    filter_sig = f"{search_term}|n={len(filtered)}"
+    if st.session_state.get(sig_k) != filter_sig:
+        display_cols = {
+            'Select':       filtered['_row_uid'].isin(prior_selected).values,
+            'Invoice':      filtered['invoice_num'].astype(str).values,
+            'Bill Date':    [
+                d.strftime('%Y-%m-%d') if pd.notna(d) else 'N/A'
+                for d in filtered['bill_date']
+            ],
+            'Customer':     filtered['customer_full_name'].astype(str).values,
+            'Customer Ref': filtered['customer_ref_num'].fillna('').astype(str).values,
+            'Description':  filtered['line_description'].astype(str).values,
+            'Amount':       [f"${float(a):,.2f}" for a in filtered['amount']],
+        }
+        if show_columns:
+            display_cols = {k: v for k, v in display_cols.items() if k in show_columns or k == 'Select'}
+
+        st.session_state[cache_k] = pd.DataFrame(display_cols)
+        if editor_k in st.session_state:
+            del st.session_state[editor_k]
+        st.session_state[sig_k] = filter_sig
+
+    display_df = st.session_state[cache_k]
+    caption_slot = st.empty()
+
+    edited = st.data_editor(
+        display_df,
+        use_container_width=True,
+        height=520,
+        hide_index=True,
+        key=editor_k,
+        disabled=[c for c in display_df.columns if c != 'Select'],
+        column_config={
+            'Select':       st.column_config.CheckboxColumn('Select', default=False, width='small'),
+            'Invoice':      st.column_config.TextColumn('Invoice', width='small'),
+            'Bill Date':    st.column_config.TextColumn('Bill Date', width='small'),
+            'Customer':     st.column_config.TextColumn('Customer', width='medium'),
+            'Customer Ref': st.column_config.TextColumn('Customer Ref', width='small'),
+            'Description':  st.column_config.TextColumn('Description', width='large'),
+            'Amount':       st.column_config.TextColumn('Amount', width='small'),
+        },
+    )
+
+    # Sync visible truth, preserve off-screen.
+    visible_uids = set(filtered['_row_uid'])
+    # Map visible editor rows back to row_uid via the Invoice + Description columns.
+    # display_df preserves order, so we can zip.
+    edited_with_uid = edited.copy()
+    edited_with_uid['_row_uid'] = filtered['_row_uid'].values
+    visible_selected = set(edited_with_uid[edited_with_uid['Select']]['_row_uid'])
+    preserved_offscreen = prior_selected - visible_uids
+    st.session_state[set_k] = preserved_offscreen | visible_selected
+
+    n_after = len(st.session_state[set_k])
+    selected_amount = float(
+        df[df.apply(_row_uid, axis=1).isin(st.session_state[set_k])]['amount'].sum()
+    )
+
+    cap = (
+        f"Showing {len(filtered)} of {len(df)}  "
+        f"·  **{n_after}** selected  ·  ${selected_amount:,.2f} selected total"
+    )
+    if preserved_offscreen:
+        cap += f"  ·  {len(preserved_offscreen)} off-screen retained"
+    caption_slot.caption(cap)
+
+    # --- Select all visible / Clear ---
+    not_yet = visible_uids - visible_selected
+    col_sa, col_cl = st.columns(2)
+    with col_sa:
+        if not_yet and st.button(
+            f"Select all {len(not_yet)} visible",
+            key=f"freight_select_all_{key_prefix}",
+            use_container_width=True,
+            help="Checks every visible row. Off-screen selections are preserved.",
+        ):
+            new_cached = st.session_state[cache_k].copy()
+            new_cached['Select'] = True
+            st.session_state[cache_k] = new_cached
+            if editor_k in st.session_state:
+                del st.session_state[editor_k]
+            st.rerun()
+    with col_cl:
+        if n_after and st.button(
+            f"Clear selection ({n_after})",
+            key=f"freight_clear_sel_{key_prefix}",
+            use_container_width=True,
+        ):
+            new_cached = st.session_state[cache_k].copy()
+            new_cached['Select'] = False
+            st.session_state[cache_k] = new_cached
+            if editor_k in st.session_state:
+                del st.session_state[editor_k]
+            st.session_state[set_k] = set()
+            st.rerun()
+
+    # --- Bulk-assign panel (rendered into the reserved slot) ---
+    with bulk_panel_slot.container():
+        with st.container(border=True):
+            if n_after == 0:
+                st.markdown("### Bulk assign period")
+                st.caption(
+                    "Select lines in the list below, then pick a period to apply "
+                    "to all of them in one transaction."
+                )
+            else:
+                # Build a small preview (up to 5 customers)
+                selected_df = df[df.apply(_row_uid, axis=1).isin(st.session_state[set_k])]
+                preview_customers = sorted(set(selected_df['customer_full_name'].astype(str)))[:5]
+                preview = ", ".join(f"`{c}`" for c in preview_customers)
+                if len(set(selected_df['customer_full_name'])) > 5:
+                    preview += f" + {len(set(selected_df['customer_full_name'])) - 5} more"
+
+                st.markdown(
+                    f"### Bulk assign period — {n_after} line(s) selected  "
+                    f"·  ${selected_amount:,.2f}"
+                )
+                st.caption(preview)
+
+            with st.form(f"freight_bulk_form_{key_prefix}"):
+                bulk_period = st.date_input(
+                    "Recognized period — normalized to 1st of month",
+                    value=date.today().replace(day=1),
+                    key=f"freight_bulk_period_{key_prefix}",
+                )
+                bulk_notes = st.text_input(
+                    "Notes (optional)",
+                    key=f"freight_bulk_notes_{key_prefix}",
+                )
+                submitted = st.form_submit_button(
+                    f"Apply to {n_after} selected" if n_after else "Apply to selected",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=(n_after == 0),
+                )
+
+                if submitted and n_after > 0:
+                    rp = bulk_period.replace(day=1)
+                    selected_df = df[df.apply(_row_uid, axis=1).isin(st.session_state[set_k])]
+                    for _, row in selected_df.iterrows():
+                        upsert_match(
+                            engine,
+                            invoice_num        = row['invoice_num'],
+                            line_description   = row['line_description'],
+                            customer_ref_num   = row.get('customer_ref_num'),
+                            customer_full_name = row['customer_full_name'],
+                            recognized_period  = rp,
+                            notes              = bulk_notes,
+                        )
+                    refresh_mv(engine)
+                    # Reset selection and editor state so the same batch
+                    # can't be re-applied by accident.
+                    st.session_state[set_k] = set()
+                    if editor_k in st.session_state:
+                        del st.session_state[editor_k]
+                    st.success(f"Matched {len(selected_df)} line(s) to {rp.strftime('%B %Y')}")
+                    st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # render()
 # ---------------------------------------------------------------------------
@@ -383,52 +633,14 @@ def render():
         if df_unmatched.empty:
             st.success("No unmatched lines — all freight is period-matched.")
         else:
-            st.warning(f"{len(df_unmatched)} unmatched line(s) — ${df_unmatched['amount'].sum():,.2f} total")
-            st.dataframe(df_unmatched, use_container_width=True, hide_index=True)
-
             st.divider()
-            st.subheader("Manually assign a period")
-
-            row_labels = df_unmatched.apply(
-                lambda r: (
-                    f"{r['invoice_num']} | "
-                    f"{r['bill_date'].strftime('%Y-%m-%d') if pd.notna(r['bill_date']) else 'N/A'} | "
-                    f"{str(r['customer_full_name'])[:30]} | "
-                    f"{str(r['line_description'])[:40]}"
-                ),
-                axis=1,
-            ).tolist()
-
-            selected_label = st.selectbox("Select line", row_labels, key="sel_unmatched_line")
-            selected_idx   = row_labels.index(selected_label)
-            selected_row   = df_unmatched.iloc[selected_idx]
-
-            with st.form("form_assign_period"):
-                st.write(f"**Customer:** {selected_row['customer_full_name']}")
-                st.write(f"**Match type:** {selected_row['match_type'] or 'not configured'}")
-                st.write(f"**Description:** {selected_row['line_description']}")
-                st.write(f"**Amount:** ${selected_row['amount']:,.2f}")
-
-                recognized_period = st.date_input(
-                    "Recognized period — pick any day in the target month, normalized to 1st",
-                    value=selected_row["bill_date"].date() if pd.notna(selected_row["bill_date"]) else date.today(),
-                )
-                notes = st.text_input("Notes (optional)")
-
-                if st.form_submit_button("Save override"):
-                    rp = recognized_period.replace(day=1)
-                    upsert_match(
-                        engine,
-                        invoice_num        = selected_row["invoice_num"],
-                        line_description   = selected_row["line_description"],
-                        customer_ref_num   = selected_row.get("customer_ref_num"),
-                        customer_full_name = selected_row["customer_full_name"],
-                        recognized_period  = rp,
-                        notes              = notes,
-                    )
-                    refresh_mv(engine)
-                    st.success(f"Manually matched to {rp.strftime('%B %Y')}")
-                    st.rerun()
+            st.subheader("Bulk assign unmatched lines")
+            render_freight_bulk_assigner(
+                engine,
+                df_unmatched,
+                key_prefix="unmatched_all",
+                empty_msg="No unmatched lines.",
+            )
 
     # ── Tab 3: Project Invoice Lookup ───────────────────────────────────────
     with tab_project:
@@ -475,57 +687,15 @@ def render():
 
         st.divider()
         st.subheader("Unmatched Project Freight Lines")
-        st.caption("Check lines to bulk-assign a recognized period.")
+        st.caption("Filter, select, and bulk-assign a recognized period.")
 
         df_proj_unmatched = load_unmatched_project_freight(engine)
-
-        if df_proj_unmatched.empty:
-            st.success("No unmatched project freight lines.")
-        else:
-            st.warning(f"{len(df_proj_unmatched)} unmatched line(s) — ${df_proj_unmatched['amount'].sum():,.2f} total")
-
-            # Checkbox selection via data_editor
-            df_proj_unmatched.insert(0, "select", False)
-
-            edited = st.data_editor(
-                df_proj_unmatched,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "select": st.column_config.CheckboxColumn("Select", default=False),
-                },
-                disabled=[c for c in df_proj_unmatched.columns if c != "select"],
-                key="proj_unmatched_editor",
-            )
-
-            selected_rows = edited[edited["select"] == True]
-
-            if not selected_rows.empty:
-                st.info(f"{len(selected_rows)} line(s) selected — ${selected_rows['amount'].sum():,.2f} total")
-
-                with st.form("form_bulk_assign"):
-                    bulk_period = st.date_input(
-                        "Recognized period — normalized to 1st of month",
-                        value=date.today().replace(day=1),
-                        key="bulk_period_input",
-                    )
-                    bulk_notes = st.text_input("Notes (optional)", key="bulk_notes")
-
-                    if st.form_submit_button("Save override for selected"):
-                        rp = bulk_period.replace(day=1)
-                        for _, row in selected_rows.iterrows():
-                            upsert_match(
-                                engine,
-                                invoice_num        = row["invoice_num"],
-                                line_description   = row["line_description"],
-                                customer_ref_num   = row.get("customer_ref_num"),
-                                customer_full_name = row["customer_full_name"],
-                                recognized_period  = rp,
-                                notes              = bulk_notes,
-                            )
-                        refresh_mv(engine)
-                        st.success(f"Matched {len(selected_rows)} line(s) to {rp.strftime('%B %Y')}")
-                        st.rerun()
+        render_freight_bulk_assigner(
+            engine,
+            df_proj_unmatched,
+            key_prefix="project_unmatched",
+            empty_msg="No unmatched project freight lines.",
+        )
 
     # ── Tab 4: All freight lines ────────────────────────────────────────────
     with tab_all:
