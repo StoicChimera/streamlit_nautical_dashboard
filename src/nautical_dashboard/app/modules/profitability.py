@@ -57,40 +57,6 @@ def load_sga_breakdown(_engine, year: int, month: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def load_sga_labor_total(_engine, year: int, month: int) -> float:
-    """
-    Total labor SG&A actually hitting current P&L for the period.
-
-    Pulls from stg_labor_applied (the post-allocation truth) filtered to
-    sources that hit the income statement (period_allocation, fifo,
-    fulfillment_wip_applied), and joins to mv_program_profitability so we
-    only count labor for programs with current-period revenue — matching
-    how mv_program_profitability.applied_sga is computed.
-
-    Stranded direct_sga labor (current_fulfillment_wip — no revenue
-    program to absorb it) is excluded; it sits as WIP on the balance
-    sheet and surfaces in the Labor Fulfillment WIP section.
-    """
-    period = f"{year}-{month:02d}"
-    df = pd.read_sql(
-        text("""
-            SELECT COALESCE(SUM(la.applied_cost), 0) AS total
-            FROM stg_labor_applied la
-            WHERE la.accrual_period = :period
-              AND la.labor_type = 'direct_sga'
-              AND la.source IN ('period_allocation', 'fifo', 'fulfillment_wip_applied')
-              AND EXISTS (
-                  SELECT 1 FROM mv_program_profitability mv
-                  WHERE mv.month_start = TO_DATE(la.accrual_period, 'YYYY-MM')
-                    AND mv.customer_program = la.program
-              )
-        """),
-        _engine,
-        params={"period": period},
-    )
-    return float(df["total"].iloc[0])
-
-@st.cache_data(ttl=60, show_spinner=False)
 def load_sga_warehouse_total(_engine, year: int, month: int) -> float:
     """Total warehouse SG&A allocation for the period."""
     month_start = pd.Timestamp(year=year, month=month, day=1).date()
@@ -110,7 +76,6 @@ def load_sga_warehouse_total(_engine, year: int, month: int) -> float:
 def _render_consolidated_pnl(
     df: pd.DataFrame,
     sga_df: pd.DataFrame,
-    labor_sga: float,
     warehouse_sga: float,
     period_label: str,
 ) -> None:
@@ -139,7 +104,7 @@ def _render_consolidated_pnl(
     else:
         sga_categories = []
 
-    total_sga  = sum(amt for _, amt in sga_categories) + labor_sga + warehouse_sga
+    total_sga  = sum(amt for _, amt in sga_categories) + warehouse_sga
     net_profit = gross_profit - total_sga
     net_margin = net_profit / revenue if revenue else 0
 
@@ -168,8 +133,6 @@ def _render_consolidated_pnl(
     ]
     for cat, amt in sga_categories:
         rows.append((f"  {cat}", amt, _pct(amt)))
-    if labor_sga:
-        rows.append(("  Salaries (SG&A)",  labor_sga,     _pct(labor_sga)))
     if warehouse_sga:
         rows.append(("  Warehouse (SG&A)", warehouse_sga, _pct(warehouse_sga)))
     rows.extend([
@@ -1228,14 +1191,13 @@ def render():
         return
 
     sga_breakdown       = load_sga_breakdown(engine, year, month)
-    sga_labor_total     = load_sga_labor_total(engine, year, month)
     sga_warehouse_total = load_sga_warehouse_total(engine, year, month)
 
     # ── Consolidated P&L ────────────────────────────────────────────────────
     st.divider()
     
     _render_consolidated_pnl(
-        df, sga_breakdown, sga_labor_total, sga_warehouse_total, month_label
+        df, sga_breakdown, sga_warehouse_total, month_label
     )
 
     st.divider()
