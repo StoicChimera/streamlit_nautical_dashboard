@@ -1385,57 +1385,29 @@ def get_wip_summary(period: str) -> pd.DataFrame:
     """), engine, params={"period": period})
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_outstanding_wip_all_periods() -> pd.DataFrame:
+    """
+    Production WIP outstanding across all periods. Reads directly from
+    stg_labor_applied (source = 'production_wip') so values match the
+    Period Summary view's Production WIP figure exactly — no float
+    drift from independently re-deriving units * cost_per_unit at the
+    layer grain.
+
+    Returns one row per (accrual_period, cost_center, customer_program)
+    with units_remaining and outstanding_wip columns to match the
+    pre-refactor row shape.
+    """
     return pd.read_sql(text("""
-        WITH layers AS (
-            SELECT 
-                accrual_period, cost_center, customer_program, output_type,
-                iso_week, units_produced, cost_per_unit,
-                units_produced * cost_per_unit AS layer_pool
-            FROM stg_wip_production_layers
-        ),
-        consumed AS (
-            SELECT
-                f.cost_center,
-                f.iso_week_produced AS iso_week,
-                f.output_type,
-                COALESCE(
-                    (SELECT a.canonical_name 
-                     FROM dim_customer_alias a 
-                     WHERE LOWER(a.alias) = LOWER(f.customer_program)
-                       AND a.active = TRUE 
-                       AND COALESCE(a.exclude, FALSE) = FALSE
-                     LIMIT 1),
-                    f.customer_program
-                ) AS canonical_program,
-                SUM(f.units_applied) AS units_consumed,
-                SUM(f.applied_cost)  AS cost_consumed
-            FROM stg_wip_fifo_applied f
-            GROUP BY 1, 2, 3, 4
-        )
         SELECT
-            l.accrual_period,
-            l.cost_center,
-            l.customer_program,
-            SUM(l.units_produced) - COALESCE(SUM(c.units_consumed), 0) AS units_remaining,
-            SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0)      AS outstanding_wip
-        FROM layers l
-        LEFT JOIN consumed c
-            ON c.cost_center = l.cost_center
-           AND c.iso_week    = l.iso_week
-           AND c.output_type = l.output_type
-           AND c.canonical_program = COALESCE(
-                (SELECT a.canonical_name 
-                 FROM dim_customer_alias a 
-                 WHERE LOWER(a.alias) = LOWER(l.customer_program)
-                   AND a.active = TRUE 
-                   AND COALESCE(a.exclude, FALSE) = FALSE
-                 LIMIT 1),
-                l.customer_program
-            )
+            accrual_period,
+            bucket           AS cost_center,
+            program          AS customer_program,
+            SUM(COALESCE(wip_units_remaining, 0)) AS units_remaining,
+            SUM(applied_cost) AS outstanding_wip
+        FROM stg_labor_applied
+        WHERE source = 'production_wip'
         GROUP BY 1, 2, 3
-        HAVING SUM(l.layer_pool) - COALESCE(SUM(c.cost_consumed), 0) > 0
+        HAVING SUM(applied_cost) > 0
         ORDER BY 1, 2, 3
     """), engine)
 
