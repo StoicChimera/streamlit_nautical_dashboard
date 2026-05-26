@@ -4535,7 +4535,7 @@ def get_outstanding_fulfillment_wip_all_periods() -> pd.DataFrame:
            AND a.cost_center   = o.cost_center
            AND a.program       = o.program
            AND a.labor_type    = o.labor_type
-        WHERE o.original_amount - COALESCE(a.applied_amount, 0) >= 1.00
+        WHERE o.original_amount - COALESCE(a.applied_amount, 0) > 0
         ORDER BY o.origin_period, o.program
     """), engine)
 
