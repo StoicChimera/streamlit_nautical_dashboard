@@ -2113,13 +2113,28 @@ def _check_identity_holds(period: str, threshold) -> dict:
                         f.customer_program
                       )
                  WHERE f.accrual_period = :period
-                   AND l.accrual_period < :period) AS fifo_from_prior
+                   AND l.accrual_period < :period) AS fifo_from_prior,
+
+                -- Fulfillment WIP pulled forward from prior periods.
+                -- Auto-apply (and manual apply) write rows with source =
+                -- 'fulfillment_wip_applied' to the current period whose
+                -- ORIGIN was an earlier period's current_fulfillment_wip.
+                -- The origin period is encoded in activity_driver as
+                -- 'WIP from YYYY-MM: ...'. This applied amount has no
+                -- matching incurred this period, so back it out of the
+                -- identity (same shape as fifo_from_prior).
+                (SELECT COALESCE(SUM(applied_cost), 0)
+                 FROM stg_labor_applied
+                 WHERE accrual_period = :period
+                   AND source = 'fulfillment_wip_applied'
+                   AND activity_driver ~ '^WIP from \d{4}-\d{2}:') AS fulfillment_wip_from_prior
         )
         SELECT
             incurred,
             applied,
             fifo_from_prior,
-            ROUND((applied - incurred - fifo_from_prior)::numeric, 2) AS variance
+            fulfillment_wip_from_prior,
+            ROUND((applied - incurred - fifo_from_prior - fulfillment_wip_from_prior)::numeric, 2) AS variance
         FROM metrics
     """), engine, params={"period": period})
 
@@ -2136,11 +2151,12 @@ def _check_identity_holds(period: str, threshold) -> dict:
         "severity":     severity,
         "metric_value": variance,
         "details": [{
-            "incurred":         float(row["incurred"] or 0),
-            "applied":          float(row["applied"] or 0),
-            "fifo_from_prior":  float(row["fifo_from_prior"] or 0),
-            "variance":         variance,
-            "tolerance":        tolerance,
+            "incurred":                    float(row["incurred"] or 0),
+            "applied":                     float(row["applied"] or 0),
+            "fifo_from_prior":             float(row["fifo_from_prior"] or 0),
+            "fulfillment_wip_from_prior":  float(row["fulfillment_wip_from_prior"] or 0),
+            "variance":                    variance,
+            "tolerance":                   tolerance,
         }],
     }
 
