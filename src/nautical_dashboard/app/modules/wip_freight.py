@@ -279,7 +279,7 @@ def render():
         "Unmatched Lines",
         "Project Invoice Lookup",
         "All Freight Lines",
-        "Manage Overrides",
+        "Manage Applied Lines",
         "Customer Types",
     ])
 
@@ -556,8 +556,8 @@ def render():
 
     # ── Tab 5: Manage manual overrides ─────────────────────────────────────
     with tab_manage:
-        st.subheader("Manual Overrides — dim_freight_matching")
-        st.caption("Lines where automated matching failed and a period was manually assigned.")
+        st.subheader("Manage Applied Lines — dim_freight_matching")
+        st.caption("Freight lines that were manually assigned a period. Edit or delete assignments here.")
 
         df_matches = load_existing_matches(engine)
 
