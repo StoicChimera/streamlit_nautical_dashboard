@@ -264,7 +264,7 @@ def render_container_unload_tab(period: str, reviewer_name: str) -> None:
         options=["direct", "allocate"],
         format_func=lambda m: (
             "Direct — one customer" if m == "direct"
-            else "Allocate — generic demo supplies (spread across demo customers)"
+            else "Allocate — generic demo supplies"
         ),
         horizontal=True,
         key=f"cu_mode_{period}",
