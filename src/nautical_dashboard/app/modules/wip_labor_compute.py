@@ -105,8 +105,145 @@ def _get_receipts_by_iso_week(period: str, include_v6: bool) -> pd.DataFrame:
     return pd.read_sql(sql, engine, params={"period": period})
 
 
+# ---------------------------------------------------------------------------
+# Container unload pool spread (allocate-mode containers)
+# ---------------------------------------------------------------------------
+
+# Window for the demo-units rolling average used to spread generic
+# (allocate-mode) demo-supply containers across demo customers.
+# Set to 1 to use current-period demo units only.
+CONTAINER_POOL_WINDOW_MONTHS = 3
+
+
+def _demo_pool_weights(period: str) -> pd.DataFrame:
+    """Per-demo-customer share of trailing-N-month demo units.
+
+    Returns columns: customer, weight  (weights sum to 1.0).
+    Smartsheet `customer` is normalized through dim_customer_alias to the
+    canonical customer_name, scoped to active demo-subclass customers, so the
+    emitted names match the dispatch's `customer` keying.
+
+    Empty frame if no demo units in the window.
+    """
+    window = CONTAINER_POOL_WINDOW_MONTHS
+    sql = text("""
+        WITH bounds AS (
+            SELECT
+                (date_trunc('month', to_date(:period, 'YYYY-MM'))
+                    - make_interval(months => :window - 1))::date AS start_d,
+                (date_trunc('month', to_date(:period, 'YYYY-MM'))
+                    + interval '1 month - 1 day')::date           AS end_d
+        ),
+        demo_customers AS (
+            SELECT customer_name
+            FROM dim_customer
+            WHERE active = TRUE
+              AND is_revenue_customer = TRUE
+              AND roll_up_for_cost = FALSE
+              AND activity_subclass = 'Demo'
+        ),
+        units AS (
+            SELECT
+                COALESCE(a.canonical_name, s.customer) AS customer,
+                SUM(
+                    CASE
+                        WHEN NULLIF(TRIM(s.number_of_cases_completed::text), '') ~ '^[0-9]+(\.[0-9]+)?$'
+                        THEN s.number_of_cases_completed::numeric
+                        ELSE 0
+                    END
+                ) AS units
+            FROM stg_smartsheet_demo s
+            LEFT JOIN dim_customer_alias a
+                   ON LOWER(a.alias) = LOWER(s.customer)
+                  AND a.active = TRUE
+            CROSS JOIN bounds b
+            WHERE NULLIF(TRIM(s.normalized_date::text), '') IS NOT NULL
+              AND s.normalized_date::date BETWEEN b.start_d AND b.end_d
+              AND NULLIF(TRIM(s.number_of_cases_completed::text), '') IS NOT NULL
+            GROUP BY 1
+        )
+        SELECT u.customer, u.units
+        FROM units u
+        JOIN demo_customers d ON LOWER(d.customer_name) = LOWER(u.customer)
+        WHERE u.units > 0
+    """)
+    df = pd.read_sql(sql, engine, params={"period": period, "window": window})
+    if df.empty:
+        return df
+    total = df["units"].sum()
+    if total <= 0:
+        return df.iloc[0:0]
+    df["weight"] = df["units"] / total
+    return df[["customer", "weight"]]
+
+
+def _get_container_pool_by_iso_week(period: str) -> pd.DataFrame:
+    """Allocate-mode container pallets exploded across demo customers.
+
+    Returns columns: iso_week, customer, units — same shape as the direct
+    container driver, so the two concat cleanly. Pool pallets stay in the
+    week the container physically landed; only the customer split uses the
+    rolling demo-units weights.
+
+    If allocate containers exist but no demo units fall in the window, falls
+    back to an even split across active demo customers so the labor is not
+    re-stranded, and prints a warning.
+    """
+    pool_sql = text("""
+        SELECT iso_week, SUM(pallet_count)::numeric AS pool_pallets
+        FROM stg_labor_container_unload
+        WHERE accrual_period = :period
+          AND alloc_mode = 'allocate'
+        GROUP BY iso_week
+        HAVING SUM(pallet_count) > 0
+    """)
+    pool = pd.read_sql(pool_sql, engine, params={"period": period})
+    if pool.empty:
+        return pd.DataFrame(columns=["iso_week", "customer", "units"])
+
+    weights = _demo_pool_weights(period)
+
+    if weights.empty:
+        # Fallback: even split across active demo customers.
+        demo = pd.read_sql(text("""
+            SELECT customer_name AS customer
+            FROM dim_customer
+            WHERE active = TRUE
+              AND is_revenue_customer = TRUE
+              AND roll_up_for_cost = FALSE
+              AND activity_subclass = 'Demo'
+        """), engine)
+        if demo.empty:
+            print(
+                f"[container-pool] WARNING period {period}: allocate containers "
+                f"present but no demo customers found — pool pallets dropped."
+            )
+            return pd.DataFrame(columns=["iso_week", "customer", "units"])
+        n = len(demo)
+        weights = demo.assign(weight=1.0 / n)
+        print(
+            f"[container-pool] WARNING period {period}: no demo units in trailing "
+            f"{CONTAINER_POOL_WINDOW_MONTHS}mo window — pool spread evenly across "
+            f"{n} demo customers."
+        )
+
+    # Cartesian product of weeks x weighted customers
+    pool["_k"] = 1
+    weights = weights.copy()
+    weights["_k"] = 1
+    merged = pool.merge(weights, on="_k").drop(columns="_k")
+    merged["units"] = merged["pool_pallets"] * merged["weight"]
+    out = merged[["iso_week", "customer", "units"]]
+    return out[out["units"] > 0].reset_index(drop=True)
+
+
 def _get_container_unload_by_iso_week(period: str) -> pd.DataFrame:
-    """stg_labor_container_unload pallet_count rolled up. Columns: iso_week, customer, units."""
+    """stg_labor_container_unload pallet_count rolled up. Columns: iso_week, customer, units.
+
+    Direct-mode containers attribute to their customer. Allocate-mode
+    containers are exploded across demo customers by trailing-3mo demo units
+    via _get_container_pool_by_iso_week and concatenated in.
+    """
     sql = text("""
         SELECT
             u.iso_week,
@@ -117,10 +254,22 @@ def _get_container_unload_by_iso_week(period: str) -> pd.DataFrame:
           ON c.canonical_key = u.customer_canonical_key
          AND c.active = TRUE
         WHERE u.accrual_period = :period
+          AND u.alloc_mode = 'direct'
         GROUP BY 1, 2
         HAVING SUM(u.pallet_count) > 0
     """)
-    return pd.read_sql(sql, engine, params={"period": period})
+    direct = pd.read_sql(sql, engine, params={"period": period})
+    pool = _get_container_pool_by_iso_week(period)
+
+    if direct.empty and pool.empty:
+        return direct
+    combined = pd.concat([direct, pool], ignore_index=True)
+    # Collapse any week+customer overlap (a demo customer could appear in both
+    # a direct container and the pool) into one summed row.
+    return (
+        combined.groupby(["iso_week", "customer"], as_index=False)["units"]
+        .sum()
+    )
 
 
 def _get_shipments_period(period: str, include_v6: bool) -> pd.DataFrame:

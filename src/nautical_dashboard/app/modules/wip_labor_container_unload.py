@@ -71,7 +71,7 @@ def _derive_period_and_week(received: date) -> tuple[str, int]:
 def get_container_unload(period: str) -> pd.DataFrame:
     sql = text("""
         SELECT container_id, date_received, pallet_count,
-               customer_canonical_key, accrual_period, iso_week,
+               customer_canonical_key, alloc_mode, accrual_period, iso_week,
                notes, set_by, set_at
         FROM stg_labor_container_unload
         WHERE accrual_period = :period
@@ -87,7 +87,8 @@ def upsert_container_unload(
     container_id: str,
     date_received: date,
     pallet_count: int,
-    customer_canonical_key: str,
+    alloc_mode: str,
+    customer_canonical_key: str | None,
     notes: str,
     set_by: str,
 ) -> None:
@@ -95,15 +96,16 @@ def upsert_container_unload(
         raise ValueError("container_id is required.")
     if pallet_count < 0:
         raise ValueError("pallet_count must be >= 0.")
-    if not customer_canonical_key:
-        raise ValueError("customer is required.")
+    if alloc_mode not in ("direct", "allocate"):
+        raise ValueError(f"alloc_mode must be 'direct' or 'allocate', got {alloc_mode!r}")
+    if alloc_mode == "direct" and not customer_canonical_key:
+        raise ValueError("direct containers require a customer.")
+    if alloc_mode == "allocate" and customer_canonical_key:
+        raise ValueError("allocate containers must not have a customer.")
     if not set_by or not set_by.strip():
         raise ValueError("set_by is required.")
 
-    # Container IDs are ISO 6346 — always uppercase. Normalize to avoid
-    # case-sensitive duplicates (e.g. BSDU125481 vs bsdu125481).
     normalized_id = container_id.strip().upper()
-
     period, iso_week = _derive_period_and_week(date_received)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -111,16 +113,17 @@ def upsert_container_unload(
         conn.execute(text("""
             INSERT INTO stg_labor_container_unload
                 (container_id, date_received, pallet_count,
-                 customer_canonical_key, accrual_period, iso_week,
+                 customer_canonical_key, alloc_mode, accrual_period, iso_week,
                  notes, set_by, set_at)
             VALUES
                 (:container_id, :date_received, :pallet_count,
-                 :customer_canonical_key, :accrual_period, :iso_week,
+                 :customer_canonical_key, :alloc_mode, :accrual_period, :iso_week,
                  :notes, :set_by, :set_at)
             ON CONFLICT (container_id) DO UPDATE SET
                 date_received          = EXCLUDED.date_received,
                 pallet_count           = EXCLUDED.pallet_count,
                 customer_canonical_key = EXCLUDED.customer_canonical_key,
+                alloc_mode             = EXCLUDED.alloc_mode,
                 accrual_period         = EXCLUDED.accrual_period,
                 iso_week               = EXCLUDED.iso_week,
                 notes                  = EXCLUDED.notes,
@@ -131,6 +134,7 @@ def upsert_container_unload(
             "date_received":          date_received,
             "pallet_count":           int(pallet_count),
             "customer_canonical_key": customer_canonical_key,
+            "alloc_mode":             alloc_mode,
             "accrual_period":         period,
             "iso_week":               int(iso_week),
             "notes":                  (notes or "").strip() or None,
@@ -162,7 +166,8 @@ def _lookup_container_by_id(container_id: str) -> dict | None:
     with engine.begin() as conn:
         row = conn.execute(text("""
             SELECT container_id, date_received, pallet_count,
-                   customer_canonical_key, accrual_period, iso_week, notes
+                   customer_canonical_key, alloc_mode,
+                   accrual_period, iso_week, notes
             FROM stg_labor_container_unload
             WHERE UPPER(container_id) = :container_id
             LIMIT 1
@@ -223,9 +228,12 @@ def render_container_unload_tab(period: str, reviewer_name: str) -> None:
         k3.metric("Customers", distinct_customers)
 
         display = existing.copy()
-        display["Customer"]      = display["customer_canonical_key"].map(
-            lambda k: key_to_label.get(k, k)
+        display["Customer"] = display.apply(
+            lambda r: "Demo Pool (allocate)" if r["alloc_mode"] == "allocate"
+            else key_to_label.get(r["customer_canonical_key"], r["customer_canonical_key"]),
+            axis=1,
         )
+        display["Mode"]          = display["alloc_mode"]
         display["Date Received"] = pd.to_datetime(display["date_received"]).dt.strftime("%Y-%m-%d")
         display["ISO Week"]      = display["iso_week"]
         display["Pallets"]       = display["pallet_count"].map(_units)
@@ -235,7 +243,7 @@ def render_container_unload_tab(period: str, reviewer_name: str) -> None:
         st.dataframe(
             display[[
                 "container_id", "Date Received", "ISO Week",
-                "Customer", "Pallets", "Notes", "Set By",
+                "Mode", "Customer", "Pallets", "Notes", "Set By",
             ]].rename(columns={"container_id": "Container ID"}),
             use_container_width=True,
             hide_index=True,
@@ -251,6 +259,23 @@ def render_container_unload_tab(period: str, reviewer_name: str) -> None:
         "that row. Period and ISO week are derived from the receive date."
     )
 
+    alloc_mode = st.radio(
+        "Allocation mode",
+        options=["direct", "allocate"],
+        format_func=lambda m: (
+            "Direct — one customer" if m == "direct"
+            else "Allocate — generic demo supplies (spread across demo customers)"
+        ),
+        horizontal=True,
+        key=f"cu_mode_{period}",
+    )
+    if alloc_mode == "allocate":
+        st.caption(
+            "Allocate containers carry no single customer. Pallets pool and "
+            "spread across demo customers by trailing-3-month demo units at "
+            "allocation time."
+        )
+
     col_id, col_date, col_cust = st.columns([2, 2, 3])
     with col_id:
         container_id = st.text_input(
@@ -260,7 +285,6 @@ def render_container_unload_tab(period: str, reviewer_name: str) -> None:
         )
     with col_date:
         default_date = date.today()
-        # If period is in the past, default to the 1st of that month
         try:
             period_year, period_month = int(period[:4]), int(period[5:7])
             default_date = date(period_year, period_month, 1)
@@ -272,11 +296,20 @@ def render_container_unload_tab(period: str, reviewer_name: str) -> None:
             key=f"cu_date_{period}",
         )
     with col_cust:
-        selected_customer = st.selectbox(
-            "Customer",
-            options=customer_options,
-            key=f"cu_customer_{period}",
-        )
+        if alloc_mode == "direct":
+            selected_customer = st.selectbox(
+                "Customer",
+                options=customer_options,
+                key=f"cu_customer_{period}",
+            )
+        else:
+            selected_customer = None
+            st.selectbox(
+                "Customer",
+                options=["— spread across demo customers —"],
+                disabled=True,
+                key=f"cu_customer_disabled_{period}",
+            )
 
     col_pallets, col_notes = st.columns([1, 4])
     with col_pallets:
@@ -358,11 +391,14 @@ def render_container_unload_tab(period: str, reviewer_name: str) -> None:
                         container_id=container_id,
                         date_received=date_received,
                         pallet_count=pallet_count,
-                        customer_canonical_key=label_to_key[selected_customer],
+                        alloc_mode=alloc_mode,
+                        customer_canonical_key=(
+                            label_to_key[selected_customer]
+                            if alloc_mode == "direct" else None
+                        ),
                         notes=notes,
                         set_by=reviewer_name,
                     )
-                    # Clear the date-confirm checkbox so it doesn't persist to the next save
                     confirm_k = f"cu_confirm_date_{period}"
                     if confirm_k in st.session_state:
                         del st.session_state[confirm_k]
