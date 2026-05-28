@@ -2539,7 +2539,7 @@ def _activity_dfs(period: str) -> dict[str, pd.DataFrame]:
     }
 
 
-@st.cache_data(ttl=600, show_spinner="Computing employee allocations...")
+@st.cache_data(ttl=120, show_spinner="Computing employee allocations...")
 def _cached_employee_alloc_with_warnings(period: str):
     """
     Single underlying compute slot for this module.
@@ -2610,6 +2610,25 @@ def _load_employee_alloc_from_persisted(period: str) -> pd.DataFrame:
     return df
 
 
+def _clear_employee_alloc_caches() -> None:
+    """Bust the full employee-allocation compute chain so the next render
+    rebuilds against current driver data (containers, returns, e-comm config,
+    revenue, demo/ogp/ow units, etc.). The compute slot is cached with a
+    10-min TTL and does not self-invalidate when driver inputs change
+    underneath it, so any code path that mutates driver data must call this
+    to avoid serving a stale build.
+
+    Note: container data is read fresh inside build_employee_allocations
+    (not cached at the reader level), so clearing the compute slot alone is
+    sufficient for container changes. The activity feeder caches are cleared
+    here too so the same button handles demo/ogp/ow/receiving/shipments/
+    inventory and revenue updates."""
+    _cached_employee_alloc_with_warnings.clear()
+    _cached_employee_alloc.clear()
+    _activity_dfs.clear()
+    get_revenue_by_program.clear()
+
+    
 def compute_cogs_allocation(pools_df: pd.DataFrame, activity: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """
     Deprecated under 1b.3 — returns empty DataFrame.
@@ -3816,10 +3835,21 @@ def render_allocation_tab(period: str, reviewer_name: str, cost_type_filter: str
         st.dataframe(totals, use_container_width=True, hide_index=True)
         st.metric("Grand Total Allocated", f"${grand:,.2f}")
 
-    # =========================================================================
+   # =========================================================================
     # COMMIT
     # =========================================================================
     st.markdown("---")
+
+    col_recompute, _ = st.columns([2, 6])
+    with col_recompute:
+        if st.button("Recompute Allocation", key="recompute_alloc_btn", use_container_width=True):
+            _clear_employee_alloc_caches()
+            st.rerun()
+    st.caption(
+        "Recompute after adding containers, returns, or other driver data so "
+        "the summary reflects the latest inputs."
+    )
+    st.markdown("")
 
     # Surface any lines that had no driver data this period
     if alloc_warnings:
