@@ -399,45 +399,91 @@ def load_program_labor_employees(_engine, program: str, year: int, month: int) -
 def load_program_labor_weekly(_engine, program: str, year: int, month: int) -> pd.DataFrame:
     """
     Weekly prorated labor cost for the program, scoped to the selected month.
-    Joins raw weekly tables (stg_labor_direct_hire, stg_labor_temp) to the
-    per-employee allocation (stg_labor_employee_allocation) where
-    target_program matches. Returns empty df for bucketed programs that have
-    no direct employee allocation.
+
+    For each raw weekly row (stg_labor_direct_hire / stg_labor_temp), we expand
+    the row across its pay_period_start..pay_period_end range as a daily series,
+    intersect it with the selected month, then aggregate to ISO week. This
+    removes the bi-weekly-pay artifact where check dates create false spikes:
+    each actual workweek gets its proportional share of the bi-weekly check.
+
+    Joined to stg_labor_employee_allocation on employee_name + accrual_period
+    so we get the per-employee target_program weight.
     """
     period = f"{year}-{month:02d}"
+    month_start = pd.Timestamp(year=year, month=month, day=1).date()
+    month_end_dt = pd.Timestamp(year=year, month=month, day=1) + pd.offsets.MonthEnd(0)
+    month_end = month_end_dt.date()
 
     return pd.read_sql(
         text("""
-            WITH dh AS (
+            WITH dh_daily AS (
                 SELECT
-                    DATE_TRUNC('week', dh.pay_period_end)::date AS week_start,
-                    'Direct Hire'::text AS labor_type,
-                    SUM(dh.total_labor_cost
-                        * COALESCE(dh.proration_ratio, 1.0)
-                        * COALESCE(ea.allocation_pct, 0)) AS weekly_cost
+                    dh.employee_name,
+                    dh.total_labor_cost,
+                    dh.pay_period_start,
+                    dh.pay_period_end,
+                    GREATEST(dh.pay_period_start, :month_start) AS overlap_start,
+                    LEAST(dh.pay_period_end, :month_end)        AS overlap_end,
+                    (dh.pay_period_end - dh.pay_period_start + 1) AS period_days
                 FROM stg_labor_direct_hire dh
-                JOIN stg_labor_employee_allocation ea
-                  ON ea.employee_name = dh.employee_name
-                 AND ea.accrual_period = dh.accrual_period
                 WHERE dh.accrual_period = :period
-                  AND ea.target_program = :program
+                  AND dh.pay_period_start IS NOT NULL
                   AND dh.pay_period_end IS NOT NULL
+            ),
+            dh_expanded AS (
+                SELECT
+                    d.employee_name,
+                    day::date AS work_day,
+                    d.total_labor_cost / NULLIF(d.period_days, 0) AS daily_cost
+                FROM dh_daily d
+                CROSS JOIN LATERAL generate_series(d.overlap_start, d.overlap_end, INTERVAL '1 day') day
+                WHERE d.overlap_start <= d.overlap_end
+            ),
+            dh AS (
+                SELECT
+                    DATE_TRUNC('week', e.work_day)::date AS week_start,
+                    'Direct Hire'::text AS labor_type,
+                    SUM(e.daily_cost * COALESCE(ea.allocation_pct, 0)) AS weekly_cost
+                FROM dh_expanded e
+                JOIN stg_labor_employee_allocation ea
+                  ON ea.employee_name = e.employee_name
+                 AND ea.accrual_period = :period
+                WHERE ea.target_program = :program
                 GROUP BY 1
+            ),
+            tmp_daily AS (
+                SELECT
+                    t.employee_name,
+                    t.total_labor_cost,
+                    t.pay_period_start,
+                    t.pay_period_end,
+                    GREATEST(t.pay_period_start, :month_start) AS overlap_start,
+                    LEAST(t.pay_period_end, :month_end)        AS overlap_end,
+                    (t.pay_period_end - t.pay_period_start + 1) AS period_days
+                FROM stg_labor_temp t
+                WHERE t.accrual_period = :period
+                  AND t.pay_period_start IS NOT NULL
+                  AND t.pay_period_end IS NOT NULL
+            ),
+            tmp_expanded AS (
+                SELECT
+                    d.employee_name,
+                    day::date AS work_day,
+                    d.total_labor_cost / NULLIF(d.period_days, 0) AS daily_cost
+                FROM tmp_daily d
+                CROSS JOIN LATERAL generate_series(d.overlap_start, d.overlap_end, INTERVAL '1 day') day
+                WHERE d.overlap_start <= d.overlap_end
             ),
             tmp AS (
                 SELECT
-                    DATE_TRUNC('week', t.pay_period_end)::date AS week_start,
+                    DATE_TRUNC('week', e.work_day)::date AS week_start,
                     'Temp'::text AS labor_type,
-                    SUM(t.total_labor_cost
-                        * COALESCE(t.proration_ratio, 1.0)
-                        * COALESCE(ea.allocation_pct, 0)) AS weekly_cost
-                FROM stg_labor_temp t
+                    SUM(e.daily_cost * COALESCE(ea.allocation_pct, 0)) AS weekly_cost
+                FROM tmp_expanded e
                 JOIN stg_labor_employee_allocation ea
-                  ON ea.employee_name = t.employee_name
-                 AND ea.accrual_period = t.accrual_period
-                WHERE t.accrual_period = :period
-                  AND ea.target_program = :program
-                  AND t.pay_period_end IS NOT NULL
+                  ON ea.employee_name = e.employee_name
+                 AND ea.accrual_period = :period
+                WHERE ea.target_program = :program
                 GROUP BY 1
             )
             SELECT week_start, labor_type, weekly_cost FROM dh
@@ -446,7 +492,12 @@ def load_program_labor_weekly(_engine, program: str, year: int, month: int) -> p
             ORDER BY week_start, labor_type
         """),
         _engine,
-        params={"period": period, "program": program},
+        params={
+            "period": period,
+            "program": program,
+            "month_start": month_start,
+            "month_end": month_end,
+        },
     )
 
 
