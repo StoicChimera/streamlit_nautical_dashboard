@@ -157,13 +157,26 @@ def build_program_snapshot(
                     color="red", label="Spike (>25% above rolling avg)",
                     zorder=5, linewidths=2)
 
-        ax.set_xlabel("Week")
-        ax.set_ylabel("Labor Cost")
+        import matplotlib.dates as mdates
+
+        # Use ONLY the actual data points as x-tick locations
+        ax.set_xticks(trend.index)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+        ax.set_ylabel("Labor Cost ($)")
         ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
-        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15),
-                ncol=4, fontsize=8, frameon=False)
+
+        # Legend ABOVE the chart, not below — avoids axis label collision
+        ax.legend(
+            loc="upper center",
+            bbox_to_anchor=(0.5, 1.18),
+            ncol=4,
+            fontsize=7,
+            frameon=False,
+        )
         ax.grid(True, alpha=0.3)
-        fig.autofmt_xdate(rotation=0)
+
+        # Rotate labels just enough to fit, no overlapping
+        plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8)
         plt.tight_layout()
 
         chart_path = os.path.join(out_dir, f"weekly_chart_{_dt.now().timestamp()}.png")
@@ -351,7 +364,7 @@ def build_program_snapshot(
             story.append(Spacer(1, 0.15 * inch))
 
     story.append(PageBreak())
-    
+
     # ── Week-over-Week trend ──────────────────────────────────────
     story.append(Spacer(1, 0.2 * inch))
     story.append(Paragraph("<b>Week-over-Week Labor Trend</b>", label_style))
