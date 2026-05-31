@@ -52,13 +52,19 @@ from reportlab.platypus import (
 # =====================================================================
 # CONFIG (used when running this file as a one-off script)
 # =====================================================================
-PROGRAM = "Life Time"
-PERIOD = "2026-02"
-PERIOD_LABEL = "February 2026"
+PROGRAM      = os.environ.get("PROGRAM", "Life Time")
+PERIOD       = os.environ.get("PERIOD", "2026-02")
+PERIOD_LABEL = os.environ.get(
+    "PERIOD_LABEL",
+    pd.to_datetime(PERIOD + "-01").strftime("%B %Y"),
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-OUT_PATH = BASE_DIR / "Life_Time_External_GP_Only.pdf"
+BASE_DIR  = Path(__file__).resolve().parent
 LOGO_PATH = BASE_DIR / "logo_nautical.png"
+
+# Output filename derives from program name automatically
+_safe_name = PROGRAM.replace(" ", "_").replace("/", "_").replace(".", "")
+OUT_PATH = BASE_DIR / f"{_safe_name}_External_{PERIOD}.pdf"
 
 
 # =====================================================================
@@ -378,8 +384,13 @@ def _render_weekly_chart_to_image(weekly_df: pd.DataFrame, out_dir: str) -> Opti
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
     ax.set_ylabel("Labor Cost ($)")
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, 1.18),
-              ncol=4, fontsize=8, frameon=False)
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.25),  
+        ncol=5,                        
+        fontsize=7,                    
+        frameon=False,
+    )
     ax.grid(True, alpha=0.3)
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right", fontsize=8)
     plt.tight_layout()

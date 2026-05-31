@@ -145,9 +145,9 @@ def _render_weekly_chart_to_image(weekly_df: pd.DataFrame, out_dir: str) -> Opti
 
     ax.legend(
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.18),
-        ncol=4,
-        fontsize=8,
+        bbox_to_anchor=(0.5, 1.25),
+        ncol=5,                       
+        fontsize=7,                   
         frameon=False,
     )
     ax.grid(True, alpha=0.3)
