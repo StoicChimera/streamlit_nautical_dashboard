@@ -33,6 +33,10 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import tempfile
 
 
 def _dollar(v) -> str:
@@ -60,10 +64,13 @@ def build_program_snapshot(
     wip: dict,
     labor_employee_df: pd.DataFrame = None,
     logo_path: Optional[str] = None,
+    labor_weekly_df: Optional[pd.DataFrame] = None,   # NEW
 ) -> str:
     
     if labor_employee_df is None:
         labor_employee_df = pd.DataFrame()
+    if labor_weekly_df is None:
+        labor_weekly_df = pd.DataFrame()
 
     styles = getSampleStyleSheet()
     ts = _dt.now().strftime("%Y-%m-%d %H:%M")
@@ -112,6 +119,56 @@ def build_program_snapshot(
             ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
         ]))
         return t
+
+    def _render_weekly_chart_to_image(weekly_df: pd.DataFrame, out_dir: str) -> Optional[str]:
+        """
+        Renders the weekly trend chart to a PNG and returns the path.
+        Returns None if weekly_df is empty.
+        """
+        if weekly_df.empty:
+            return None
+
+        trend = weekly_df.pivot_table(
+            index="week_start",
+            columns="labor_type",
+            values="weekly_cost",
+            aggfunc="sum",
+        ).fillna(0).sort_index()
+        trend["Total"] = trend.sum(axis=1)
+        trend["Rolling_4wk_Avg"] = trend["Total"].rolling(window=4, min_periods=1).mean()
+        trend["Spike"] = trend["Total"] > (trend["Rolling_4wk_Avg"] * 1.25)
+
+        fig, ax = plt.subplots(figsize=(9, 3.5))
+
+        for col in trend.columns:
+            if col in ("Rolling_4wk_Avg", "Spike", "Total"):
+                continue
+            ax.plot(trend.index, trend[col], marker="o", label=col, linewidth=1.5)
+
+        ax.plot(trend.index, trend["Total"], marker="o", label="Total",
+                linewidth=2, color="#1f77b4")
+        ax.plot(trend.index, trend["Rolling_4wk_Avg"], linestyle="--",
+                color="gray", label="4-wk Rolling Avg", linewidth=1.2)
+
+        spikes = trend[trend["Spike"]]
+        if not spikes.empty:
+            ax.scatter(spikes.index, spikes["Total"], marker="x", s=120,
+                    color="red", label="Spike (>25% above rolling avg)",
+                    zorder=5, linewidths=2)
+
+        ax.set_xlabel("Week")
+        ax.set_ylabel("Labor Cost")
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"${x:,.0f}"))
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.15),
+                ncol=4, fontsize=8, frameon=False)
+        ax.grid(True, alpha=0.3)
+        fig.autofmt_xdate(rotation=0)
+        plt.tight_layout()
+
+        chart_path = os.path.join(out_dir, f"weekly_chart_{_dt.now().timestamp()}.png")
+        fig.savefig(chart_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        return chart_path
 
     # ---- Cover ----
     if logo_path and os.path.exists(logo_path):
@@ -291,6 +348,69 @@ def build_program_snapshot(
                     story.append(et)
 
             story.append(Spacer(1, 0.15 * inch))
+
+    # ── Week-over-Week trend ──────────────────────────────────────
+    story.append(Spacer(1, 0.2 * inch))
+    story.append(Paragraph("<b>Week-over-Week Labor Trend</b>", label_style))
+    story.append(Spacer(1, 0.04 * inch))
+
+    caption_style = styles["Normal"].clone("WeeklyCaption")
+    caption_style.fontSize = 7
+    caption_style.textColor = colors.HexColor("#666666")
+    story.append(Paragraph(
+        "Shows only employees directly allocated to this program via the labor review process. "
+        "Bucket-allocated labor (Demo, OGP, Overwrap, Operations, etc.) is excluded. "
+        "Week labels follow ISO weeks (Monday start).",
+        caption_style,
+    ))
+    story.append(Spacer(1, 0.08 * inch))
+
+    if labor_weekly_df.empty:
+        story.append(Paragraph(
+            "No direct employee allocations for this program. "
+            "Weekly trends only show for programs with direct labor.",
+            cell_style,
+        ))
+    else:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            chart_path = _render_weekly_chart_to_image(labor_weekly_df, tmpdir)
+            if chart_path and os.path.exists(chart_path):
+                chart_img = Image(chart_path)
+                chart_img._restrictSize(9.5 * inch, 3.5 * inch)
+                chart_img.hAlign = "LEFT"
+                story.append(chart_img)
+                story.append(Spacer(1, 0.1 * inch))
+
+        # Data table
+        trend = labor_weekly_df.pivot_table(
+            index="week_start",
+            columns="labor_type",
+            values="weekly_cost",
+            aggfunc="sum",
+        ).fillna(0).sort_index()
+        trend["Total"] = trend.sum(axis=1)
+        trend["Rolling_4wk_Avg"] = trend["Total"].rolling(window=4, min_periods=1).mean()
+        trend["Spike"] = trend["Total"] > (trend["Rolling_4wk_Avg"] * 1.25)
+
+        wk_cols = [c for c in trend.columns if c not in ("Rolling_4wk_Avg", "Spike")]
+        headers = ["Week"] + wk_cols + ["4-wk Rolling Avg", "Spike"]
+
+        rows_data = []
+        for week, row in trend.iterrows():
+            week_str = pd.to_datetime(week).strftime("%Y-%m-%d")
+            line = [week_str]
+            for c in wk_cols:
+                line.append(_dollar(row[c]))
+            line.append(_dollar(row["Rolling_4wk_Avg"]))
+            line.append("Spike" if row["Spike"] else "")
+            rows_data.append(line)
+
+        wt = _simple_table(
+            headers,
+            rows_data,
+            [1.0 * inch] + [1.1 * inch] * len(wk_cols) + [1.2 * inch, 0.7 * inch],
+        )
+        story.append(wt)
 
     story.append(PageBreak())
 
