@@ -983,7 +983,7 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
             st.plotly_chart(fig, use_container_width=True)
 
             trend_display = trend.copy()
-            trend_display.index = trend_display.index.strftime("%Y-%m-%d")
+            trend_display.index = pd.to_datetime(trend_display.index).strftime("%Y-%m-%d")
             for col in trend_display.columns:
                 if col == "Spike":
                     trend_display[col] = trend_display[col].map(lambda x: "Spike" if x else "")
