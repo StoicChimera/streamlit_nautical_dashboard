@@ -32,6 +32,7 @@ from reportlab.platypus import (
     Spacer,
     Table,
     TableStyle,
+    KeepTogether,
 )
 import matplotlib
 matplotlib.use("Agg")
@@ -138,7 +139,7 @@ def build_program_snapshot(
         trend["Rolling_4wk_Avg"] = trend["Total"].rolling(window=4, min_periods=1).mean()
         trend["Spike"] = trend["Total"] > (trend["Rolling_4wk_Avg"] * 1.25)
 
-        fig, ax = plt.subplots(figsize=(9, 3.5))
+        fig, ax = plt.subplots(figsize=(7, 2.8))
 
         for col in trend.columns:
             if col in ("Rolling_4wk_Avg", "Spike", "Total"):
@@ -349,6 +350,8 @@ def build_program_snapshot(
 
             story.append(Spacer(1, 0.15 * inch))
 
+    story.append(PageBreak())
+    
     # ── Week-over-Week trend ──────────────────────────────────────
     story.append(Spacer(1, 0.2 * inch))
     story.append(Paragraph("<b>Week-over-Week Labor Trend</b>", label_style))
@@ -376,7 +379,7 @@ def build_program_snapshot(
             chart_path = _render_weekly_chart_to_image(labor_weekly_df, tmpdir)
             if chart_path and os.path.exists(chart_path):
                 chart_img = Image(chart_path)
-                chart_img._restrictSize(9.5 * inch, 3.5 * inch)
+                chart_img._restrictSize(7.0 * inch, 2.8 * inch)
                 chart_img.hAlign = "LEFT"
                 story.append(chart_img)
                 story.append(Spacer(1, 0.1 * inch))
