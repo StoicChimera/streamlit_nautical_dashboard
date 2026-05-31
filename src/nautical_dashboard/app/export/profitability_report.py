@@ -1,3 +1,30 @@
+"""
+profitability_report.py
+=======================
+
+Builds the full period profitability report PDF.
+
+Pages:
+  1  — Cover
+  2  — Full profitability summary
+  3  — Experiential breakdown
+  4  — SCAAS breakdown
+  5  — Production breakdown
+  6  — Other Fulfillment breakdown
+  7  — SG&A category breakdown
+  8  — Production activity (3-month comparison)
+  9  — Labor spike flags (operational signal)
+  10 — WIP Summary
+  11 — Warehouse Allocation
+  12 — Labor — Direct Hire by program
+  13 — Labor — Temp by program
+
+Layout: all tables anchored to a single CONTENT_WIDTH grid (10 inches
+for landscape LETTER with 0.5" margins). Column widths are expressed as
+ratios of CONTENT_WIDTH so every table aligns to the same boundaries
+regardless of column count.
+"""
+
 from __future__ import annotations
 
 import os
@@ -21,32 +48,38 @@ from reportlab.platypus import (
     TableStyle,
 )
 
-"""
-profitability_report.py
-=======================
 
-Builds the full period profitability report PDF.
+# =====================================================================
+# Grid system
+# =====================================================================
+PAGE_SIZE     = landscape(LETTER)
+PAGE_MARGIN   = 0.5 * inch
+CONTENT_WIDTH = PAGE_SIZE[0] - (2 * PAGE_MARGIN)  # 10.0 inches
 
-Pages:
-  1  — Cover
-  2  — Full profitability summary
-  3  — Experiential breakdown
-  4  — SCAAS breakdown
-  5  — Production breakdown
-  6  — Other Fulfillment breakdown
-  7  — SG&A category breakdown
-  8  — Production activity (3-month comparison)
-  9  — WIP Summary
-  10 — Warehouse Allocation
-  11 — Labor — Direct Hire by program
-  12 — Labor — Temp by program
-"""
+SPACE_XS = 0.05 * inch
+SPACE_S  = 0.10 * inch
+SPACE_M  = 0.20 * inch
+SPACE_L  = 0.30 * inch
+
+BRAND_NAVY    = colors.HexColor("#003366")
+BRAND_BLUE    = colors.HexColor("#1f77b4")
+BRAND_LIGHT   = colors.HexColor("#e6f2ff")
+BRAND_TOTAL   = colors.HexColor("#eef3ff")
+BRAND_GRAY    = colors.HexColor("#555555")
+BRAND_FAINT   = colors.HexColor("#999999")
+BRAND_NEG     = colors.HexColor("#B00020")
+ROW_ALT       = colors.HexColor("#f7f9fc")
 
 
-# =====================================================
-# Helpers
-# =====================================================
+def _cols(*ratios) -> list:
+    """Compute column widths from ratios; normalizes to fill CONTENT_WIDTH."""
+    total = sum(ratios)
+    return [(r / total) * CONTENT_WIDTH for r in ratios]
 
+
+# =====================================================================
+# Format helpers
+# =====================================================================
 def _dollar(v) -> str:
     try:
         return f"${float(v):,.2f}"
@@ -75,10 +108,15 @@ def _safe_float(v) -> float:
         return 0.0
 
 
+def _base_cell_style(styles, name: str = "BaseCell", font_size: int = 8, leading: int = 9):
+    s = styles["Normal"].clone(name)
+    s.fontSize = font_size
+    s.leading = leading
+    return s
+
+
 def _neg_red(val: str, styles) -> Paragraph:
-    text_style = styles["Normal"].clone("CellText")
-    text_style.fontSize = 8
-    text_style.leading = 9
+    text_style = _base_cell_style(styles, "NegCell", 8, 9)
     text_style.textColor = colors.black
     try:
         num = float(str(val).replace("$", "").replace(",", "").replace("%", ""))
@@ -89,47 +127,57 @@ def _neg_red(val: str, styles) -> Paragraph:
     return Paragraph(str(val), text_style)
 
 
-def _base_cell_style(styles, name: str = "BaseCell", font_size: int = 8, leading: int = 9):
-    s = styles["Normal"].clone(name)
-    s.fontSize = font_size
-    s.leading = leading
-    return s
-
-
 def _section_heading(styles, text: str) -> list:
     heading_style = styles["Heading2"].clone(f"H2_{text[:20]}")
-    heading_style.fontSize = 11
-    return [Paragraph(text, heading_style), Spacer(1, 0.1 * inch)]
+    heading_style.fontSize = 13
+    heading_style.leading = 16
+    heading_style.textColor = BRAND_NAVY
+    heading_style.spaceBefore = 0
+    heading_style.spaceAfter = 4
+    return [
+        Paragraph(text, heading_style),
+        HRFlowable(
+            width=CONTENT_WIDTH, thickness=0.5, color=BRAND_NAVY,
+            spaceBefore=0, spaceAfter=SPACE_S, hAlign="LEFT",
+        ),
+    ]
 
 
-def _standard_table(rows, col_widths, header_bg="#003366", header_fg=colors.white,
-                    zebra=True, numeric_cols=None, font_size=8):
+def _data_table(rows, col_ratios, styles, header_bg=BRAND_NAVY,
+                header_fg=colors.white, font_size=8, numeric_cols=None):
+    """
+    Build a table with column widths derived from ratios summing to ~1.0,
+    so every table fills CONTENT_WIDTH exactly and left-aligns to the
+    page margin.
+    """
     if numeric_cols is None:
         numeric_cols = []
 
-    tbl = Table(rows, colWidths=col_widths, repeatRows=1)
+    col_widths = _cols(*col_ratios)
+    tbl = Table(rows, colWidths=col_widths, repeatRows=1, hAlign="LEFT")
+
     cmds = [
-        ("FONT",           (0, 0), (-1, 0), "Helvetica-Bold", font_size),
-        ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor(header_bg)),
-        ("TEXTCOLOR",      (0, 0), (-1, 0), header_fg),
-        ("GRID",           (0, 0), (-1, -1), 0.25, colors.lightgrey),
-        ("FONT",           (0, 1), (-1, -1), "Helvetica", font_size),
-        ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",     (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING",  (0, 0), (-1, -1), 2),
+        ("FONT",          (0, 0), (-1, 0),  "Helvetica-Bold", font_size),
+        ("BACKGROUND",    (0, 0), (-1, 0),  header_bg),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),  header_fg),
+        ("GRID",          (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
+        ("FONT",          (0, 1), (-1, -1), "Helvetica", font_size),
+        ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 4),
     ]
-    if zebra:
-        cmds.append(("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.white]))
     for idx in numeric_cols:
         cmds.append(("ALIGN", (idx, 0), (idx, -1), "RIGHT"))
     tbl.setStyle(TableStyle(cmds))
     return tbl
 
 
-# =====================================================
-# Main profitability tables
-# =====================================================
-
+# =====================================================================
+# Profitability summary tables
+# =====================================================================
 def _profitability_table(df: pd.DataFrame, styles, title: str) -> list:
     story = []
     story.extend(_section_heading(styles, title))
@@ -186,6 +234,7 @@ def _profitability_table(df: pd.DataFrame, styles, title: str) -> list:
                 out.append(Paragraph(fmt, cell_style))
         rows.append(out)
 
+    # Totals
     totals = []
     for col in display_cols:
         if col == "customer_program":
@@ -203,27 +252,27 @@ def _profitability_table(df: pd.DataFrame, styles, title: str) -> list:
             totals.append(Paragraph("", cell_style))
     rows.append(totals)
 
-    first_w = 2.0 * inch
-    remaining = (10.8 * inch - first_w) / max(len(display_cols) - 1, 1)
-    col_widths = [first_w] + [remaining] * (len(display_cols) - 1)
+    # Column ratios: program name gets 18%, rest split evenly
+    n_other = len(display_cols) - 1
+    other_ratio = (1.0 - 0.18) / n_other if n_other > 0 else 0
+    ratios = [0.18] + [other_ratio] * n_other
 
     numeric_indices = [i for i, c in enumerate(display_cols) if c in dollar_cols | pct_cols]
-    t = _standard_table(rows, col_widths=col_widths, numeric_cols=numeric_indices, font_size=7)
+    t = _data_table(rows, col_ratios=ratios, styles=styles,
+                    numeric_cols=numeric_indices, font_size=7)
     t.setStyle(TableStyle([
-        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#eef3ff")),
+        ("BACKGROUND", (0, -1), (-1, -1), BRAND_TOTAL),
         ("FONT",       (0, -1), (-1, -1), "Helvetica-Bold", 7),
         ("ALIGN",      (0, 0), (0, -1), "LEFT"),
     ]))
-
     story.append(t)
-    story.append(Spacer(1, 0.2 * inch))
+    story.append(Spacer(1, SPACE_M))
     return story
 
 
-# =====================================================
-# SG&A
-# =====================================================
-
+# =====================================================================
+# SG&A category breakdown
+# =====================================================================
 def _sga_breakdown_table(sga_df: pd.DataFrame, styles, title: str) -> list:
     story = []
     story.extend(_section_heading(styles, title))
@@ -232,42 +281,26 @@ def _sga_breakdown_table(sga_df: pd.DataFrame, styles, title: str) -> list:
         story.append(Paragraph("No SG&A breakdown available for this period.", styles["Normal"]))
         return story
 
-    cell_style = _base_cell_style(styles, "SgaCell", 8, 9)
-    cell_style.textColor = colors.black
-
-    header_style = _base_cell_style(styles, "SgaHeaderCell", 8, 9)
-    header_style.textColor = colors.white
-
-    money_style = _base_cell_style(styles, "SgaMoneyCell", 8, 9)
-    money_style.textColor = colors.black
-
-    header_map = {
-        "category": "Category",
-        "Total": "Total",
-    }
-
     def _fmt_month(col):
         try:
             return pd.to_datetime(col).strftime("%b %Y")
-        except:
+        except Exception:
             return col
 
+    header_map = {"category": "Category", "Total": "Total"}
     display_cols = list(sga_df.columns)
-    pretty_headers = [
-        header_map.get(col, _fmt_month(col))
-        for col in display_cols
-    ]
+    pretty_headers = [header_map.get(col, _fmt_month(col)) for col in display_cols]
 
-    rows = [[Paragraph(f"<b>{c}</b>", header_style) for c in pretty_headers]]
+    cell_style = _base_cell_style(styles, "SgaCell", 8, 9)
 
+    rows = [pretty_headers]
     for _, row in sga_df.iterrows():
         out = []
         for col in display_cols:
             if col == "category":
                 out.append(Paragraph(str(row[col]), cell_style))
             else:
-                val = _dollar(row[col])
-                out.append(_neg_red(val, styles))
+                out.append(_neg_red(_dollar(row[col]), styles))
         rows.append(out)
 
     total_row = []
@@ -275,35 +308,23 @@ def _sga_breakdown_table(sga_df: pd.DataFrame, styles, title: str) -> list:
         if col == "category":
             total_row.append(Paragraph("<b>TOTAL</b>", cell_style))
         else:
-            total_row.append(Paragraph(f"<b>{_dollar(sga_df[col].sum())}</b>", money_style))
+            total_row.append(Paragraph(f"<b>{_dollar(sga_df[col].sum())}</b>", cell_style))
     rows.append(total_row)
 
-    first_w = 3.0 * inch
-    remaining = (10.8 * inch - first_w) / max(len(display_cols) - 1, 1)
-    widths = [first_w] + [remaining] * (len(display_cols) - 1)
+    # Column ratios: category 35%, rest split evenly
+    n_other = len(display_cols) - 1
+    other_ratio = (1.0 - 0.35) / n_other if n_other > 0 else 0
+    ratios = [0.35] + [other_ratio] * n_other
 
-    tbl = Table(rows, colWidths=widths, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("FONT",           (0, 0), (-1, 0), "Helvetica-Bold", 8),
-        ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
-        ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#003366")),
-        ("FONT",           (0, 1), (-1, -2), "Helvetica", 8),
-        ("FONT",           (0, -1), (-1, -1), "Helvetica-Bold", 8),
-        ("BACKGROUND",     (0, -1), (-1, -1), colors.HexColor("#eef3ff")),
-        ("TEXTCOLOR",      (0, 1), (-1, -1), colors.black),
-        ("GRID",           (0, 0), (-1, -1), 0.35, colors.HexColor("#c9d2dc")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.whitesmoke, colors.HexColor("#f7f9fc")]),
-        ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",     (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
-        ("LEFTPADDING",    (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
-        ("ALIGN",          (0, 0), (0, -1), "LEFT"),
-        ("ALIGN",          (1, 0), (-1, -1), "RIGHT"),
+    numeric_indices = list(range(1, len(display_cols)))
+    t = _data_table(rows, col_ratios=ratios, styles=styles,
+                    numeric_cols=numeric_indices, font_size=8)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, -1), (-1, -1), BRAND_TOTAL),
+        ("FONT",       (0, -1), (-1, -1), "Helvetica-Bold", 8),
     ]))
-
-    story.append(tbl)
-    story.append(Spacer(1, 0.15 * inch))
+    story.append(t)
+    story.append(Spacer(1, SPACE_S))
 
     if "Total" in sga_df.columns:
         top3 = sga_df.sort_values("Total", ascending=False).head(3)
@@ -318,10 +339,9 @@ def _sga_breakdown_table(sga_df: pd.DataFrame, styles, title: str) -> list:
     return story
 
 
-# =====================================================
-# Production activity 3 month comparison
-# =====================================================
-
+# =====================================================================
+# Production activity 3-month comparison
+# =====================================================================
 def _production_activity_table(prod_df: pd.DataFrame, styles, title: str) -> list:
     story = []
     story.extend(_section_heading(styles, title))
@@ -330,33 +350,24 @@ def _production_activity_table(prod_df: pd.DataFrame, styles, title: str) -> lis
         story.append(Paragraph("No production activity comparison available.", styles["Normal"]))
         return story
 
-    cell_style = _base_cell_style(styles, "Prod3MoCell", 8, 9)
-    cell_style.textColor = colors.black
-
-    header_style = _base_cell_style(styles, "Prod3MoHeaderCell", 8, 9)
-    header_style.textColor = colors.white
-
     header_map = {
         "activity_type": "Activity",
         "MoM Δ": "MoM Change",
         "MoM %": "MoM %",
     }
 
-    # dynamic month headers (2026-01 → Jan 2026)
     def _fmt_month(col):
         try:
             return pd.to_datetime(col).strftime("%b %Y")
-        except:
+        except Exception:
             return col
 
     display_cols = list(prod_df.columns)
-    pretty_headers = [
-        header_map.get(col, _fmt_month(col))
-        for col in display_cols
-    ]
+    pretty_headers = [header_map.get(col, _fmt_month(col)) for col in display_cols]
 
-    rows = [[Paragraph(f"<b>{c}</b>", header_style) for c in pretty_headers]]
+    cell_style = _base_cell_style(styles, "Prod3MoCell", 8, 9)
 
+    rows = [pretty_headers]
     for _, row in prod_df.iterrows():
         out = []
         for col in display_cols:
@@ -370,105 +381,156 @@ def _production_activity_table(prod_df: pd.DataFrame, styles, title: str) -> lis
                 out.append(Paragraph(_whole(row[col]), cell_style))
         rows.append(out)
 
-    first_w = 2.8 * inch
-    remaining = (10.8 * inch - first_w) / max(len(display_cols) - 1, 1)
-    widths = [first_w] + [remaining] * (len(display_cols) - 1)
+    n_other = len(display_cols) - 1
+    other_ratio = (1.0 - 0.30) / n_other if n_other > 0 else 0
+    ratios = [0.30] + [other_ratio] * n_other
 
-    tbl = Table(rows, colWidths=widths, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ("FONT",           (0, 0), (-1, 0), "Helvetica-Bold", 8),
-        ("TEXTCOLOR",      (0, 0), (-1, 0), colors.white),
-        ("BACKGROUND",     (0, 0), (-1, 0), colors.HexColor("#003366")),
-        ("FONT",           (0, 1), (-1, -1), "Helvetica", 8),
-        ("TEXTCOLOR",      (0, 1), (-1, -1), colors.black),
-        ("GRID",           (0, 0), (-1, -1), 0.35, colors.HexColor("#c9d2dc")),
-        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.whitesmoke, colors.HexColor("#f7f9fc")]),
-        ("VALIGN",         (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING",     (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING",  (0, 0), (-1, -1), 4),
-        ("LEFTPADDING",    (0, 0), (-1, -1), 6),
-        ("RIGHTPADDING",   (0, 0), (-1, -1), 6),
-        ("ALIGN",          (0, 0), (0, -1), "LEFT"),
-        ("ALIGN",          (1, 0), (-1, -1), "RIGHT"),
-    ]))
-
-    story.append(tbl)
-    story.append(Spacer(1, 0.15 * inch))
+    numeric_indices = list(range(1, len(display_cols)))
+    t = _data_table(rows, col_ratios=ratios, styles=styles,
+                    numeric_cols=numeric_indices, font_size=8)
+    story.append(t)
+    story.append(Spacer(1, SPACE_S))
 
     note_style = _base_cell_style(styles, "Prod3MoNote", 8, 9)
     note_style.textColor = colors.HexColor("#444444")
     story.append(Paragraph(
-        "Production activity compares Demo Kits, OGP Units, and Overwrap Units across the latest three months.",
-        note_style
+        "Production activity compares Demo Kits, OGP Units, and Overwrap Units "
+        "across the latest three months.",
+        note_style,
     ))
     return story
 
 
-# =====================================================
-# Existing sections
-# =====================================================
+# =====================================================================
+# Labor spike flags  (NEW)
+# =====================================================================
+def _spike_flags_table(spike_df: pd.DataFrame, styles, title: str) -> list:
+    story = []
+    story.extend(_section_heading(styles, title))
 
+    caption_style = _base_cell_style(styles, "SpikeCaption", 8, 10)
+    caption_style.textColor = colors.HexColor("#444444")
+    story.append(Paragraph(
+        "Each row is a week where a program's directly-allocated labor cost "
+        "exceeded its trailing 4-week rolling average by more than 25%. "
+        "Bucket-allocated labor (Demo, OGP, Overwrap, Operations, etc.) is "
+        "excluded because it uses monthly-grain drivers. Sorted by severity.",
+        caption_style,
+    ))
+    story.append(Spacer(1, SPACE_S))
+
+    if spike_df.empty:
+        ok_style = _base_cell_style(styles, "SpikeOk", 9, 11)
+        ok_style.textColor = colors.HexColor("#1a7a3a")
+        story.append(Paragraph(
+            "No labor spikes flagged across any program this period.",
+            ok_style,
+        ))
+        return story
+
+    cell_style = _base_cell_style(styles, "SpikeCell", 8, 9)
+
+    rows = [["Program", "Spike Week", "Total Cost", "4-wk Rolling Avg", "% Above Avg"]]
+    for _, row in spike_df.iterrows():
+        rows.append([
+            Paragraph(str(row["program"]), cell_style),
+            Paragraph(str(row["spike_week"]), cell_style),
+            Paragraph(_dollar(row["total_cost"]), cell_style),
+            Paragraph(_dollar(row["rolling_avg"]), cell_style),
+            Paragraph(f'<font color="#B00020"><b>+{_safe_float(row["pct_above_avg"]):.1f}%</b></font>', cell_style),
+        ])
+
+    t = _data_table(
+        rows,
+        col_ratios=[0.35, 0.15, 0.18, 0.18, 0.14],
+        styles=styles,
+        numeric_cols=[2, 3, 4],
+        font_size=8,
+    )
+    story.append(t)
+    return story
+
+
+# =====================================================================
+# WIP summary
+# =====================================================================
 def _wip_table(wip: dict, styles) -> list:
     story = []
     story.extend(_section_heading(styles, "WIP Balance Summary"))
 
     cell_style = _base_cell_style(styles, "WipCell", 8, 9)
+    label_style = _base_cell_style(styles, "WipLabel", 9, 11)
+    label_style.textColor = BRAND_NAVY
 
     sections = [
-        ("Labor — Production WIP",  wip.get("labor_production", pd.DataFrame()), "customer_program", "wip_balance"),
-        ("Labor — Fulfillment WIP", wip.get("labor_fulfillment", pd.DataFrame()), "customer_program", "wip_balance"),
-        ("Warehouse WIP",           wip.get("warehouse", pd.DataFrame()), "customer_program", "wip_balance"),
-        ("Freight WIP",             wip.get("freight", pd.DataFrame()), "customer_program", "wip_balance"),
+        ("Labor — Production WIP",  wip.get("labor_production", pd.DataFrame())),
+        ("Labor — Fulfillment WIP", wip.get("labor_fulfillment", pd.DataFrame())),
+        ("Warehouse WIP",           wip.get("warehouse", pd.DataFrame())),
+        ("Freight WIP",             wip.get("freight", pd.DataFrame())),
     ]
 
-    for section_title, df, program_col, balance_col in sections:
+    for section_title, df in sections:
         if df.empty:
-            story.append(Paragraph(f"<b>{section_title} — $0.00</b>", cell_style))
+            story.append(Paragraph(
+                f'<b>{section_title} — $0.00</b>', label_style,
+            ))
             story.append(Paragraph("No outstanding WIP.", cell_style))
-            story.append(Spacer(1, 0.1 * inch))
+            story.append(Spacer(1, SPACE_S))
             continue
 
-        if program_col not in df.columns or balance_col not in df.columns:
+        if "customer_program" not in df.columns or "wip_balance" not in df.columns:
             continue
 
-        grouped = df.groupby(program_col, as_index=False)[balance_col].sum()
-        grouped = grouped.sort_values(balance_col, ascending=False)
-        total = float(grouped[balance_col].sum())
+        grouped = df.groupby("customer_program", as_index=False)["wip_balance"].sum()
+        grouped = grouped.sort_values("wip_balance", ascending=False)
+        total = float(grouped["wip_balance"].sum())
 
-        story.append(Paragraph(f"<b>{section_title} — {_dollar(total)}</b>", cell_style))
-        story.append(Spacer(1, 0.04 * inch))
+        story.append(Paragraph(
+            f'<b>{section_title} — {_dollar(total)}</b>', label_style,
+        ))
+        story.append(Spacer(1, SPACE_XS))
 
         rows = [["Program", "WIP Balance"]]
         for _, row in grouped.iterrows():
             rows.append([
-                Paragraph(str(row[program_col]), cell_style),
-                Paragraph(_dollar(row[balance_col]), cell_style),
+                Paragraph(str(row["customer_program"]), cell_style),
+                Paragraph(_dollar(row["wip_balance"]), cell_style),
             ])
 
-        t = _standard_table(rows, [5.5 * inch, 1.5 * inch], numeric_cols=[1], font_size=8)
-        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e6f2ff")),
-                               ("TEXTCOLOR",  (0, 0), (-1, 0), colors.HexColor("#003366"))]))
+        t = _data_table(
+            rows, col_ratios=[0.78, 0.22], styles=styles,
+            header_bg=BRAND_LIGHT, header_fg=BRAND_NAVY,
+            numeric_cols=[1], font_size=8,
+        )
         story.append(t)
-        story.append(Spacer(1, 0.15 * inch))
+        story.append(Spacer(1, SPACE_S))
 
     return story
 
 
+# =====================================================================
+# Warehouse allocation
+# =====================================================================
 def _warehouse_table(wh_df: pd.DataFrame, styles) -> list:
     story = []
     story.extend(_section_heading(styles, "Warehouse Allocation"))
 
     if wh_df.empty:
-        story.append(Paragraph("No committed warehouse allocation for this period.", styles["Normal"]))
+        story.append(Paragraph("No committed warehouse allocation for this period.",
+                               styles["Normal"]))
         return story
 
     cell_style = _base_cell_style(styles, "WhCell", 8, 9)
+    label_style = _base_cell_style(styles, "WhLabel", 9, 11)
+    label_style.textColor = BRAND_NAVY
+
     total = float(wh_df["allocation_amount"].sum())
     story.append(Paragraph(f"Total Allocated: {_dollar(total)}", cell_style))
-    story.append(Spacer(1, 0.08 * inch))
+    story.append(Spacer(1, SPACE_S))
 
-    story.append(Paragraph("<b>By Bucket</b>", cell_style))
-    story.append(Spacer(1, 0.04 * inch))
+    # By Bucket
+    story.append(Paragraph("<b>By Bucket</b>", label_style))
+    story.append(Spacer(1, SPACE_XS))
 
     bucket_summary = wh_df.groupby(
         ["program_bucket", "category", "cost_type"], as_index=False
@@ -489,17 +551,16 @@ def _warehouse_table(wh_df: pd.DataFrame, styles) -> list:
             Paragraph(_dollar(row["allocation_amount"]), cell_style),
         ])
 
-    bt = _standard_table(
-        brows,
-        [2.2 * inch, 1.0 * inch, 0.8 * inch, 0.8 * inch, 0.7 * inch, 1.0 * inch],
-        numeric_cols=[3, 4, 5],
-        font_size=8,
+    bt = _data_table(
+        brows, col_ratios=[0.28, 0.15, 0.12, 0.13, 0.13, 0.19],
+        styles=styles, numeric_cols=[3, 4, 5], font_size=8,
     )
     story.append(bt)
-    story.append(Spacer(1, 0.15 * inch))
+    story.append(Spacer(1, SPACE_M))
 
-    story.append(Paragraph("<b>By Program</b>", cell_style))
-    story.append(Spacer(1, 0.04 * inch))
+    # By Program
+    story.append(Paragraph("<b>By Program</b>", label_style))
+    story.append(Spacer(1, SPACE_XS))
 
     prog_summary = wh_df.groupby(["customer_program"], as_index=False)["allocation_amount"].sum()
     prog_summary = prog_summary.sort_values("allocation_amount", ascending=False)
@@ -511,11 +572,15 @@ def _warehouse_table(wh_df: pd.DataFrame, styles) -> list:
             Paragraph(_dollar(row["allocation_amount"]), cell_style),
         ])
 
-    pt = _standard_table(prows, [5.5 * inch, 1.5 * inch], numeric_cols=[1], font_size=8)
+    pt = _data_table(prows, col_ratios=[0.78, 0.22], styles=styles,
+                     numeric_cols=[1], font_size=8)
     story.append(pt)
     return story
 
 
+# =====================================================================
+# Labor by type (Direct Hire / Temp)
+# =====================================================================
 def _labor_table(labor_df: pd.DataFrame, employee_df: pd.DataFrame, styles, title: str) -> list:
     story = []
     story.extend(_section_heading(styles, title))
@@ -527,13 +592,12 @@ def _labor_table(labor_df: pd.DataFrame, employee_df: pd.DataFrame, styles, titl
     cell_style = _base_cell_style(styles, "LaborCell", 8, 9)
     sub_style = _base_cell_style(styles, "LaborSubCell", 7, 8)
     sub_style.textColor = colors.HexColor("#444444")
-
-    label_style = _base_cell_style(styles, "LaborLabel", 7, 8)
-    label_style.textColor = colors.HexColor("#003366")
+    label_style = _base_cell_style(styles, "LaborLabel", 8, 10)
+    label_style.textColor = BRAND_NAVY
 
     total = float(labor_df["allocated_cost"].sum())
     story.append(Paragraph(f"Total: {_dollar(total)}", cell_style))
-    story.append(Spacer(1, 0.08 * inch))
+    story.append(Spacer(1, SPACE_S))
 
     summary = labor_df.sort_values(["program", "source_bucket"])
     sum_rows = [["Program", "Cost Center", "Allocated"]]
@@ -544,15 +608,16 @@ def _labor_table(labor_df: pd.DataFrame, employee_df: pd.DataFrame, styles, titl
             Paragraph(_dollar(row["allocated_cost"]), cell_style),
         ])
 
-    stbl = _standard_table(sum_rows, [3.5 * inch, 2.0 * inch, 1.5 * inch], numeric_cols=[2], font_size=8)
+    stbl = _data_table(sum_rows, col_ratios=[0.50, 0.30, 0.20], styles=styles,
+                       numeric_cols=[2], font_size=8)
     story.append(stbl)
 
     if employee_df.empty:
         return story
 
-    story.append(Spacer(1, 0.2 * inch))
-    story.append(Paragraph("<b>Employee Detail by Program</b>", cell_style))
-    story.append(Spacer(1, 0.08 * inch))
+    story.append(Spacer(1, SPACE_M))
+    story.append(Paragraph("<b>Employee Detail by Program</b>", label_style))
+    story.append(Spacer(1, SPACE_S))
 
     ltype = labor_df["labor_type"].iloc[0] if "labor_type" in labor_df.columns else None
     emp_filtered = employee_df[employee_df["labor_type"] == ltype].copy() if ltype else employee_df.copy()
@@ -577,7 +642,7 @@ def _labor_table(labor_df: pd.DataFrame, employee_df: pd.DataFrame, styles, titl
             f'<font color="#003366"><b>{program}</b></font>  —  {_dollar(prog_total)}',
             label_style,
         ))
-        story.append(Spacer(1, 0.03 * inch))
+        story.append(Spacer(1, SPACE_XS))
 
         emp_rows = [["Employee", "Role", "Cost Center", "Driver", "Weight", "Allocated"]]
         for _, er in prog_df.sort_values("allocated_cost", ascending=False).iterrows():
@@ -591,27 +656,24 @@ def _labor_table(labor_df: pd.DataFrame, employee_df: pd.DataFrame, styles, titl
                 Paragraph(_dollar(er.get("allocated_cost", 0)), sub_style),
             ])
 
-        et = _standard_table(
+        et = _data_table(
             emp_rows,
-            [1.8 * inch, 1.2 * inch, 1.3 * inch, 1.5 * inch, 0.8 * inch, 0.9 * inch],
-            header_bg="#e6f2ff",
-            header_fg=colors.HexColor("#003366"),
+            col_ratios=[0.22, 0.16, 0.18, 0.20, 0.10, 0.14],
+            styles=styles,
+            header_bg=BRAND_LIGHT,
+            header_fg=BRAND_NAVY,
             numeric_cols=[4, 5],
             font_size=7,
         )
-        et.setStyle(TableStyle([
-            ("LEFTPADDING", (0, 0), (-1, -1), 3),
-        ]))
         story.append(et)
-        story.append(Spacer(1, 0.1 * inch))
+        story.append(Spacer(1, SPACE_S))
 
     return story
 
 
-# =====================================================
+# =====================================================================
 # Main builder
-# =====================================================
-
+# =====================================================================
 def build_profitability_report(
     out_path: str,
     period_label: str,
@@ -628,61 +690,64 @@ def build_profitability_report(
     temp_df: pd.DataFrame,
     employee_df: pd.DataFrame | None = None,
     logo_path: Optional[str] = None,
+    spike_flags_df: pd.DataFrame | None = None,
 ) -> str:
+
+    if spike_flags_df is None:
+        spike_flags_df = pd.DataFrame(columns=[
+            "program", "spike_week", "total_cost", "rolling_avg", "pct_above_avg",
+        ])
+
     styles = getSampleStyleSheet()
     ts = _dt.now().strftime("%Y-%m-%d %H:%M")
 
     doc = SimpleDocTemplate(
         out_path,
-        pagesize=landscape(LETTER),
-        leftMargin=0.5 * inch,
-        rightMargin=0.5 * inch,
-        topMargin=0.5 * inch,
-        bottomMargin=0.5 * inch,
+        pagesize=PAGE_SIZE,
+        leftMargin=PAGE_MARGIN,
+        rightMargin=PAGE_MARGIN,
+        topMargin=PAGE_MARGIN,
+        bottomMargin=PAGE_MARGIN,
     )
 
     story = []
 
+    # ---- Cover styles ----
     title_style = ParagraphStyle(
-        "CoverTitle",
-        parent=styles["Title"],
-        fontSize=28,
-        leading=34,
-        textColor=colors.HexColor("#003366"),
-        alignment=TA_LEFT,
+        "CoverTitle", parent=styles["Title"],
+        fontSize=28, leading=34, textColor=BRAND_NAVY, alignment=TA_LEFT,
     )
     sub_style = ParagraphStyle(
-        "CoverSub",
-        parent=styles["Normal"],
-        fontSize=12,
-        textColor=colors.HexColor("#555555"),
-        alignment=TA_LEFT,
+        "CoverSub", parent=styles["Normal"],
+        fontSize=12, textColor=BRAND_GRAY, alignment=TA_LEFT,
     )
     ts_style = ParagraphStyle(
-        "CoverTS",
-        parent=styles["Normal"],
-        fontSize=9,
-        textColor=colors.HexColor("#999999"),
-        alignment=TA_LEFT,
+        "CoverTS", parent=styles["Normal"],
+        fontSize=9, textColor=BRAND_FAINT, alignment=TA_LEFT,
     )
 
-    # ---- Cover ----
+    # =================================================================
+    # Cover
+    # =================================================================
     if logo_path and os.path.exists(logo_path):
         logo = Image(logo_path)
         logo._restrictSize(2.0 * inch, 1.2 * inch)
         logo.hAlign = "LEFT"
         story.append(logo)
-        story.append(Spacer(1, 0.3 * inch))
+        story.append(Spacer(1, SPACE_L))
 
-    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#003366")))
-    story.append(Spacer(1, 0.4 * inch))
+    story.append(HRFlowable(
+        width=CONTENT_WIDTH, thickness=1.5, color=BRAND_NAVY, hAlign="LEFT",
+    ))
+    story.append(Spacer(1, SPACE_L))
     story.append(Paragraph("Program Profitability Report", title_style))
-    story.append(Spacer(1, 0.15 * inch))
+    story.append(Spacer(1, SPACE_S))
     story.append(Paragraph(period_label, sub_style))
-    story.append(Spacer(1, 0.1 * inch))
+    story.append(Spacer(1, SPACE_S))
     story.append(Paragraph(f"Generated: {ts}", ts_style))
-    story.append(Spacer(1, 0.3 * inch))
+    story.append(Spacer(1, SPACE_L))
 
+    # Cover summary metrics
     if not full_df.empty:
         total_rev = _safe_float(full_df["revenue"].sum())
         total_gp = _safe_float(full_df["gross_profit"].sum())
@@ -691,30 +756,33 @@ def build_profitability_report(
         metric_style = _base_cell_style(styles, "MetricStyle", 11, 13)
         metrics = [
             ["Total Revenue", _dollar(total_rev)],
-            ["Total GP", _dollar(total_gp)],
-            ["GP Margin", _pct(total_gp / total_rev) if total_rev else "—"],
-            ["Total Net", _dollar(total_net)],
-            ["Net Margin", _pct(total_net / total_rev) if total_rev else "—"],
-            ["Programs", str(full_df["customer_program"].nunique())],
+            ["Total GP",      _dollar(total_gp)],
+            ["GP Margin",     _pct(total_gp / total_rev) if total_rev else "—"],
+            ["Total Net",     _dollar(total_net)],
+            ["Net Margin",    _pct(total_net / total_rev) if total_rev else "—"],
+            ["Programs",      str(full_df["customer_program"].nunique())],
         ]
 
         mt = Table(
-            [[Paragraph(f"<b>{m[0]}</b>", metric_style), Paragraph(m[1], metric_style)] for m in metrics],
-            colWidths=[3.0 * inch, 2.0 * inch],
+            [[Paragraph(f"<b>{m[0]}</b>", metric_style),
+              Paragraph(m[1], metric_style)] for m in metrics],
+            colWidths=[CONTENT_WIDTH * 0.30, CONTENT_WIDTH * 0.20],
             hAlign="LEFT",
         )
         mt.setStyle(TableStyle([
-            ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("ALIGN",         (1, 0), (1, -1), "RIGHT"),
+            ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-            ("LINEBELOW", (0, 0), (-1, -2), 0.25, colors.lightgrey),
+            ("LINEBELOW",     (0, 0), (-1, -2), 0.25, colors.lightgrey),
         ]))
         story.append(mt)
 
     story.append(PageBreak())
 
-    # ---- Core profitability ----
+    # =================================================================
+    # Core profitability tables
+    # =================================================================
     story.extend(_profitability_table(full_df, styles, f"Full Program Summary — {period_label}"))
     story.append(PageBreak())
 
@@ -730,25 +798,37 @@ def build_profitability_report(
     story.extend(_profitability_table(other_df, styles, f"Other Fulfillment Programs — {period_label}"))
     story.append(PageBreak())
 
-    # ---- New sections ----
-    story.extend(_sga_breakdown_table(sga_breakdown_df, styles, f"SG&A Category Breakdown — {period_label}"))
+    # =================================================================
+    # Operational signal sections
+    # =================================================================
+    story.extend(_sga_breakdown_table(sga_breakdown_df, styles,
+                                      f"SG&A Category Breakdown — {period_label}"))
     story.append(PageBreak())
 
     story.extend(_production_activity_table(
-        production_activity_3mo_df,
-        styles,
-        f"Production Activity — 3 Month Comparison ({period_label})"
+        production_activity_3mo_df, styles,
+        f"Production Activity — 3 Month Comparison ({period_label})",
     ))
     story.append(PageBreak())
 
-    # ---- WIP / Warehouse ----
+    story.extend(_spike_flags_table(
+        spike_flags_df, styles,
+        f"Labor Spike Flags — {period_label}",
+    ))
+    story.append(PageBreak())
+
+    # =================================================================
+    # WIP / Warehouse
+    # =================================================================
     story.extend(_wip_table(wip, styles))
     story.append(PageBreak())
 
     story.extend(_warehouse_table(warehouse_df, styles))
     story.append(PageBreak())
 
-    # ---- Labor ----
+    # =================================================================
+    # Labor detail
+    # =================================================================
     emp = employee_df if employee_df is not None else pd.DataFrame()
 
     dh = direct_hire_df[direct_hire_df["labor_type"] == "direct_cogs"].copy() if not direct_hire_df.empty else pd.DataFrame()
@@ -760,18 +840,22 @@ def build_profitability_report(
     tmp_emp = emp[emp["labor_type"] == "temp"].copy() if not emp.empty else pd.DataFrame()
     story.extend(_labor_table(tmp, tmp_emp, styles, "Labor — Temp by Program"))
 
-    # ---- Footer ----
+    # =================================================================
+    # Footer
+    # =================================================================
     footer_style = ParagraphStyle(
-        "Footer",
-        parent=styles["Normal"],
-        fontSize=8,
-        textColor=colors.HexColor("#999999"),
-        alignment=TA_CENTER,
+        "Footer", parent=styles["Normal"],
+        fontSize=8, textColor=BRAND_FAINT, alignment=TA_CENTER,
     )
-    story.append(Spacer(1, 0.3 * inch))
-    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.lightgrey,
-                            spaceBefore=0, spaceAfter=0.1 * inch))
-    story.append(Paragraph(f"Nautical Manufacturing & Fulfillment LLC — Confidential — {ts}", footer_style))
+    story.append(Spacer(1, SPACE_L))
+    story.append(HRFlowable(
+        width=CONTENT_WIDTH, thickness=0.5, color=colors.lightgrey,
+        spaceBefore=0, spaceAfter=SPACE_S, hAlign="LEFT",
+    ))
+    story.append(Paragraph(
+        f"Nautical Manufacturing & Fulfillment LLC — Confidential — {ts}",
+        footer_style,
+    ))
 
     doc.build(story)
     return os.path.abspath(out_path)

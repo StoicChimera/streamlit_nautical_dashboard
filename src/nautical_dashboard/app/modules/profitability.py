@@ -502,6 +502,83 @@ def load_program_labor_weekly(_engine, program: str, year: int, month: int) -> p
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def load_period_spike_flags(_engine, year: int, month: int) -> pd.DataFrame:
+    """
+    Compute weekly labor spike flags across ALL programs that have direct
+    employee allocations in the selected period. A spike is any week where
+    the program's total weekly labor cost exceeds 1.25x the trailing
+    4-week rolling average.
+
+    Returns a tidy DataFrame, one row per (program, spike_week):
+        program | spike_week | total_cost | rolling_avg | pct_above_avg
+    Sorted by pct_above_avg descending.
+    """
+    period = f"{year}-{month:02d}"
+
+    # First find all programs with direct allocations in this period
+    progs = pd.read_sql(
+        text("""
+            SELECT DISTINCT target_program
+            FROM stg_labor_employee_allocation
+            WHERE accrual_period = :period
+              AND target_program IS NOT NULL
+            ORDER BY target_program
+        """),
+        _engine,
+        params={"period": period},
+    )
+
+    if progs.empty:
+        return pd.DataFrame(columns=[
+            "program", "spike_week", "total_cost", "rolling_avg", "pct_above_avg",
+        ])
+
+    flagged_rows = []
+    for program in progs["target_program"]:
+        weekly = load_program_labor_weekly(_engine, program, year, month)
+        if weekly.empty:
+            continue
+
+        trend = (
+            weekly.pivot_table(
+                index="week_start",
+                columns="labor_type",
+                values="weekly_cost",
+                aggfunc="sum",
+            )
+            .fillna(0)
+            .sort_index()
+        )
+        trend["Total"] = trend.sum(axis=1)
+        trend["Rolling_4wk_Avg"] = trend["Total"].rolling(window=4, min_periods=1).mean()
+        trend["Spike"] = trend["Total"] > (trend["Rolling_4wk_Avg"] * 1.25)
+
+        spikes = trend[trend["Spike"]]
+        for week, row in spikes.iterrows():
+            rolling = float(row["Rolling_4wk_Avg"])
+            total = float(row["Total"])
+            pct_above = ((total / rolling) - 1.0) * 100 if rolling > 0 else 0.0
+            flagged_rows.append({
+                "program":       program,
+                "spike_week":    pd.to_datetime(week).strftime("%Y-%m-%d"),
+                "total_cost":    total,
+                "rolling_avg":   rolling,
+                "pct_above_avg": pct_above,
+            })
+
+    if not flagged_rows:
+        return pd.DataFrame(columns=[
+            "program", "spike_week", "total_cost", "rolling_avg", "pct_above_avg",
+        ])
+
+    return (
+        pd.DataFrame(flagged_rows)
+        .sort_values("pct_above_avg", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def load_program_warehouse(_engine, program: str, year: int, month: int) -> pd.DataFrame:
     month_start = pd.Timestamp(year=year, month=month, day=1).date()
     return pd.read_sql(
@@ -1331,6 +1408,9 @@ def render():
 
                 production_activity_3mo_df = production_activity_3mo_df.reset_index()
 
+                # ── Labor spike flags ─────────────────────────────────
+                spike_flags_df = load_period_spike_flags(engine, year, month)
+
                 build_profitability_report(
                     out_path        = tmp_path,
                     period_label    = month_label,
@@ -1339,11 +1419,9 @@ def render():
                     scaas_df        = scaas_df,
                     production_df   = prod_df,
                     other_df        = other_df,
-
-                    # NEW
                     sga_breakdown_df          = sga_breakdown_df,
                     production_activity_3mo_df= production_activity_3mo_df,
-
+                    spike_flags_df            = spike_flags_df,
                     wip             = wip,
                     warehouse_df    = wh_df,
                     direct_hire_df  = labor_df,
