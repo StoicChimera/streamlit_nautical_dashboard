@@ -396,6 +396,61 @@ def load_program_labor_employees(_engine, program: str, year: int, month: int) -
 
 
 @st.cache_data(ttl=60, show_spinner=False)
+def load_program_labor_weekly(_engine, program: str, year: int, month: int) -> pd.DataFrame:
+    """
+    Weekly prorated labor cost for the program, scoped to the selected month.
+    Joins raw weekly tables (stg_labor_direct_hire, stg_labor_temp) to the
+    per-employee allocation (stg_labor_employee_allocation) where
+    target_program matches. Returns empty df for bucketed programs that have
+    no direct employee allocation.
+    """
+    period = f"{year}-{month:02d}"
+
+    return pd.read_sql(
+        text("""
+            WITH dh AS (
+                SELECT
+                    DATE_TRUNC('week', dh.pay_period_end)::date AS week_start,
+                    'Direct Hire'::text AS labor_type,
+                    SUM(dh.total_labor_cost
+                        * COALESCE(dh.proration_ratio, 1.0)
+                        * COALESCE(ea.allocation_pct, 0)) AS weekly_cost
+                FROM stg_labor_direct_hire dh
+                JOIN stg_labor_employee_allocation ea
+                  ON ea.employee_name = dh.employee_name
+                 AND ea.accrual_period = dh.accrual_period
+                WHERE dh.accrual_period = :period
+                  AND ea.target_program = :program
+                  AND dh.pay_period_end IS NOT NULL
+                GROUP BY 1
+            ),
+            tmp AS (
+                SELECT
+                    DATE_TRUNC('week', t.pay_period_end)::date AS week_start,
+                    'Temp'::text AS labor_type,
+                    SUM(t.total_labor_cost
+                        * COALESCE(t.proration_ratio, 1.0)
+                        * COALESCE(ea.allocation_pct, 0)) AS weekly_cost
+                FROM stg_labor_temp t
+                JOIN stg_labor_employee_allocation ea
+                  ON ea.employee_name = t.employee_name
+                 AND ea.accrual_period = t.accrual_period
+                WHERE t.accrual_period = :period
+                  AND ea.target_program = :program
+                  AND t.pay_period_end IS NOT NULL
+                GROUP BY 1
+            )
+            SELECT week_start, labor_type, weekly_cost FROM dh
+            UNION ALL
+            SELECT week_start, labor_type, weekly_cost FROM tmp
+            ORDER BY week_start, labor_type
+        """),
+        _engine,
+        params={"period": period, "program": program},
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
 def load_program_warehouse(_engine, program: str, year: int, month: int) -> pd.DataFrame:
     month_start = pd.Timestamp(year=year, month=month, day=1).date()
     return pd.read_sql(
@@ -757,6 +812,7 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                 snap_wip    = load_program_wip(engine, selected, year, month)
                 pnl_row     = df[df["customer_program"] == selected].iloc[0] if not df[df["customer_program"] == selected].empty else None
                 logo_path   = os.path.join(os.path.dirname(__file__), "../export/logo_nautical.png")
+                snap_weekly = load_program_labor_weekly(engine, selected, year, month)
 
                 with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
                     tmp_path = f.name
@@ -774,6 +830,7 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                     wip               = snap_wip,
                     labor_employee_df = snap_emp,
                     logo_path         = logo_path,
+                    labor_weekly_df   = snap_weekly,
                 )
 
                 with open(tmp_path, "rb") as f:
@@ -874,6 +931,69 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                                 use_container_width=True,
                                 hide_index=True,
                             )
+
+        # ── Weekly trend ──────────────────────────────────────────
+        st.markdown("**Week-over-Week Labor Trend**")
+        weekly_df = load_program_labor_weekly(engine, selected, year, month)
+
+        if weekly_df.empty:
+            st.info(
+                "No direct employee allocations for this program. "
+                "Weekly trends only show for programs with direct labor "
+                "(bucket-allocated programs use monthly-grain drivers)."
+            )
+        else:
+            trend = weekly_df.pivot_table(
+                index="week_start",
+                columns="labor_type",
+                values="weekly_cost",
+                aggfunc="sum",
+            ).fillna(0).sort_index()
+            trend["Total"] = trend.sum(axis=1)
+            trend["Rolling_4wk_Avg"] = trend["Total"].rolling(window=4, min_periods=1).mean()
+            trend["Spike"] = trend["Total"] > (trend["Rolling_4wk_Avg"] * 1.25)
+
+            fig = go.Figure()
+            for col in trend.columns:
+                if col in ("Rolling_4wk_Avg", "Spike"):
+                    continue
+                fig.add_trace(go.Scatter(
+                    x=trend.index, y=trend[col],
+                    mode="lines+markers", name=col,
+                ))
+            fig.add_trace(go.Scatter(
+                x=trend.index, y=trend["Rolling_4wk_Avg"],
+                mode="lines", name="4-wk Rolling Avg",
+                line=dict(dash="dash", color="gray"),
+            ))
+            spikes = trend[trend["Spike"]]
+            if not spikes.empty:
+                fig.add_trace(go.Scatter(
+                    x=spikes.index, y=spikes["Total"],
+                    mode="markers", name="Spike (>25% above rolling avg)",
+                    marker=dict(symbol="x", size=14, color="red"),
+                ))
+            fig.update_layout(
+                height=350,
+                yaxis_tickformat="$,.0f",
+                xaxis_title="Week",
+                yaxis_title="Labor Cost",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            trend_display = trend.copy()
+            trend_display.index = trend_display.index.strftime("%Y-%m-%d")
+            for col in trend_display.columns:
+                if col == "Spike":
+                    trend_display[col] = trend_display[col].map(lambda x: "Spike" if x else "")
+                else:
+                    trend_display[col] = trend_display[col].map(lambda x: f"${float(x):,.2f}")
+            st.dataframe(
+                trend_display.reset_index().rename(columns={"week_start": "Week"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
     # ---- Warehouse ----
     with tab_warehouse:
