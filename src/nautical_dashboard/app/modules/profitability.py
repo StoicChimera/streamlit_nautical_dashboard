@@ -985,6 +985,13 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
 
         # ── Weekly trend ──────────────────────────────────────────
         st.markdown("**Week-over-Week Labor Trend**")
+        st.caption(
+            "Shows only employees directly allocated to this program via the labor review process. "
+            "Bucket-allocated labor (Demo, OGP, Overwrap, Operations, etc.) is excluded because "
+            "those use monthly-grain activity drivers. Week labels follow ISO weeks "
+            "(Monday start), so a partial week at the start or end of the month may "
+            "carry a label outside the selected month."
+        )
         weekly_df = load_program_labor_weekly(engine, selected, year, month)
 
         if weekly_df.empty:
