@@ -166,8 +166,16 @@ def render_topline_overview():
             .sum()
         )
 
-        prior = rollup_monthly[rollup_monthly["month"] == prior_month].copy()
-        curr = rollup_monthly[rollup_monthly["month"] == current_month].copy()
+        # Only count a customer as "billed" in a month if NET billing is positive.
+        # Without this, $0 lines and reversals leave a customer in the prior-month
+        # set (surfacing as a $0/negative "missed" row) or falsely mark them present
+        # in the current month.
+        prior = rollup_monthly[
+            (rollup_monthly["month"] == prior_month) & (rollup_monthly["total_billed"] > 0)
+        ].copy()
+        curr = rollup_monthly[
+            (rollup_monthly["month"] == current_month) & (rollup_monthly["total_billed"] > 0)
+        ].copy()
 
         if prior.empty:
             st.info(f"No billing found in {prior_month}.")
