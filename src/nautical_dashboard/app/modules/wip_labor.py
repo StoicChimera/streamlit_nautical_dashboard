@@ -2625,7 +2625,12 @@ def _clear_employee_alloc_caches() -> None:
     inventory and revenue updates."""
     _cached_employee_alloc_with_warnings.clear()
     _cached_employee_alloc.clear()
-    _activity_dfs.clear()
+    get_demo_units.clear()
+    get_ogp_units.clear()
+    get_ow_units.clear()
+    get_receiving_units.clear()
+    get_shipment_units.clear()
+    get_inventory_units.clear()
     get_revenue_by_program.clear()
 
     
