@@ -8,6 +8,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
+from app.modules.wip_labor import is_period_committed
 
 load_dotenv()
 
@@ -59,6 +60,81 @@ def load_sga_breakdown(_engine, year: int, month: int) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def load_sga_warehouse_total(_engine, year: int, month: int) -> float:
     """Total warehouse SG&A allocation for the period."""
+    month_start = pd.Timestamp(year=year, month=month, day=1).date()
+    df = pd.read_sql(
+        text("""
+            SELECT COALESCE(SUM(allocation_amount), 0) AS total
+            FROM stg_warehouse_allocation
+            WHERE month_start = :m
+              AND cost_type = 'sga'
+        """),
+        _engine,
+        params={"m": month_start},
+    )
+    return float(df["total"].iloc[0])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_sga_breakdown_gated(_engine, year: int, month: int) -> pd.DataFrame:
+    """Non-labor SGA category totals.
+ 
+    Committed period -> frozen snapshot (stg_sga_applied_snapshot).
+    Open period      -> live (vw_sga_transactions), identical to load_sga_breakdown.
+ 
+    Returns the same shape either way: columns [category, total], sorted desc.
+    """
+    period = f"{year}-{month:02d}"
+ 
+    if is_period_committed(period):
+        return pd.read_sql(
+            text("""
+                SELECT category, amount AS total
+                FROM stg_sga_applied_snapshot
+                WHERE accrual_period = :period
+                  AND sga_source = 'nonlabor_category'
+                ORDER BY total DESC
+            """),
+            _engine,
+            params={"period": period},
+        )
+ 
+    # Open period — live read (unchanged from load_sga_breakdown)
+    return pd.read_sql(
+        text("""
+            SELECT category, SUM(amount) AS total
+            FROM vw_sga_transactions
+            WHERE accrual_period = :period
+            GROUP BY category
+            ORDER BY total DESC
+        """),
+        _engine,
+        params={"period": period},
+    )
+ 
+ 
+@st.cache_data(ttl=60, show_spinner=False)
+def load_sga_warehouse_gated(_engine, year: int, month: int) -> float:
+    """Warehouse SGA scalar.
+ 
+    Committed period -> frozen snapshot. Open period -> live, identical to
+    load_sga_warehouse_total.
+    """
+    period = f"{year}-{month:02d}"
+ 
+    if is_period_committed(period):
+        df = pd.read_sql(
+            text("""
+                SELECT COALESCE(SUM(amount), 0) AS total
+                FROM stg_sga_applied_snapshot
+                WHERE accrual_period = :period
+                  AND sga_source = 'warehouse'
+            """),
+            _engine,
+            params={"period": period},
+        )
+        return float(df["total"].iloc[0])
+ 
+    # Open period — live read (unchanged from load_sga_warehouse_total)
     month_start = pd.Timestamp(year=year, month=month, day=1).date()
     df = pd.read_sql(
         text("""
@@ -1262,6 +1338,21 @@ def render():
             st.cache_data.clear()
             st.rerun()
 
+    _period = f"{year}-{month:02d}"
+    if is_period_committed(_period):
+         with col_spacer:
+             if st.button("Re-snapshot SGA", help=(
+                 "Re-freezes this committed period's SGA from current GL. "
+                 "Use only for a deliberate prior-period restatement."
+             )):
+                 from app.modules.wip_labor import snapshot_sga
+                 with engine.begin() as conn:
+                     snapshot_sga(conn, _period, "manual_resnapshot")
+                 load_sga_breakdown_gated.clear()
+                 load_sga_warehouse_gated.clear()
+                 st.success(f"Re-snapshotted SGA for {_period}.")
+                 st.rerun()
+
     with col_export:
         if st.button("Export Report Package"):
             from app.export.profitability_report import build_profitability_report
@@ -1446,8 +1537,8 @@ def render():
         st.warning("No data for this period.")
         return
 
-    sga_breakdown       = load_sga_breakdown(engine, year, month)
-    sga_warehouse_total = load_sga_warehouse_total(engine, year, month)
+    sga_breakdown       = load_sga_breakdown_gated(engine, year, month)
+    sga_warehouse_total = load_sga_warehouse_gated(engine, year, month)
 
     # ── Consolidated P&L ────────────────────────────────────────────────────
     st.divider()

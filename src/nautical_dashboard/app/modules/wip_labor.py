@@ -789,6 +789,65 @@ def ensure_allocation_table():
         """))
 
 
+def snapshot_sga(conn, period: str, committed_by: str):
+    """Freeze the period's non-labor SGA + warehouse SGA into
+    stg_sga_applied_snapshot, inside the caller's transaction.
+ 
+    Mirrors exactly the two live queries the Consolidated P&L consumes:
+      - non-labor SGA categories: vw_sga_transactions grouped by category
+      - warehouse SGA scalar:     stg_warehouse_allocation cost_type='sga'
+ 
+    Labor SGA is intentionally NOT snapshotted here — it is already frozen in
+    stg_labor_applied. The P&L read path sums frozen non-labor (this table) +
+    frozen warehouse (this table) + frozen labor (stg_labor_applied).
+ 
+    Idempotent: deletes the period's rows first, so commit / re-snapshot /
+    recommit always produces a clean current freeze.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+ 
+    conn.execute(
+        text("DELETE FROM stg_sga_applied_snapshot WHERE accrual_period = :period"),
+        {"period": period},
+    )
+
+    conn.execute(
+        text("""
+            INSERT INTO stg_sga_applied_snapshot
+                (accrual_period, sga_source, category, amount, committed_by, committed_at)
+            SELECT
+                :period            AS accrual_period,
+                'nonlabor_category' AS sga_source,
+                category,
+                SUM(amount)        AS amount,
+                :committed_by      AS committed_by,
+                :committed_at      AS committed_at
+            FROM vw_sga_transactions
+            WHERE accrual_period = :period
+            GROUP BY category
+        """),
+        {"period": period, "committed_by": committed_by, "committed_at": now},
+    )
+
+    conn.execute(
+        text("""
+            INSERT INTO stg_sga_applied_snapshot
+                (accrual_period, sga_source, category, amount, committed_by, committed_at)
+            SELECT
+                :period             AS accrual_period,
+                'warehouse'         AS sga_source,
+                'Warehouse (SG&A)'  AS category,
+                COALESCE(SUM(allocation_amount), 0) AS amount,
+                :committed_by       AS committed_by,
+                :committed_at       AS committed_at
+            FROM stg_warehouse_allocation
+            WHERE month_start = TO_DATE(:period, 'YYYY-MM')
+              AND cost_type = 'sga'
+        """),
+        {"period": period, "committed_by": committed_by, "committed_at": now},
+    )
+
+
 def commit_allocation(rows: list[dict], period: str, committed_by: str):
     now = datetime.now(timezone.utc).isoformat()
     ensure_allocation_table()
@@ -811,6 +870,23 @@ def commit_allocation(rows: list[dict], period: str, committed_by: str):
                 """),
                 {**r, "period": period, "committed_by": committed_by, "committed_at": now},
             )
+ 
+        # --- SGA FREEZE: snapshot non-labor + warehouse SGA in the same txn so
+        #     the locked period's Consolidated P&L stops reading live GL. ---
+        snapshot_sga(conn, period, committed_by)
+ 
+    # Bust the gated P&L loaders so the just-committed period immediately shows
+    # the frozen snapshot instead of a live read.
+    try:
+        from app.modules.profitability import (
+            load_sga_breakdown_gated,
+            load_sga_warehouse_gated,
+        )
+        load_sga_breakdown_gated.clear()
+        load_sga_warehouse_gated.clear()
+    except Exception:
+        pass
+
 
 
 def unlock_allocation(period: str):
@@ -845,6 +921,10 @@ def unlock_allocation(period: str):
         #    after this delete; safe to remove first.
         conn.execute(
             text("DELETE FROM stg_labor_applied WHERE accrual_period = :period"),
+            {"period": period},
+        )
+        conn.execute(
+            text("DELETE FROM stg_sga_applied_snapshot WHERE accrual_period = :period"),
             {"period": period},
         )
 
@@ -885,13 +965,21 @@ def unlock_allocation(period: str):
             text("DELETE FROM stg_labor_incurred WHERE accrual_period = :period"),
             {"period": period},
         )
-
         # 5. The committed allocation lock itself.
         conn.execute(
             text("DELETE FROM stg_labor_allocation WHERE accrual_period = :period"),
             {"period": period},
         )
-
+        
+    try:
+        from app.modules.profitability import (
+        load_sga_breakdown_gated,
+            load_sga_warehouse_gated,
+        )
+        load_sga_breakdown_gated.clear()
+        load_sga_warehouse_gated.clear()
+    except Exception:
+        pass
 
 def write_production_layers(period: str, committed_by: str):
     """
