@@ -8,7 +8,7 @@ import streamlit as st
 import plotly.graph_objects as go
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
-from nautical_dashboard.app.modules.wip_labor import is_period_committed
+from nautical_dashboard.app.modules.wip_labor_allocation import is_period_committed
 
 load_dotenv()
 
