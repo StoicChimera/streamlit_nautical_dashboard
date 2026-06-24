@@ -1043,7 +1043,7 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
     col_snap, _ = st.columns([2, 6])
     with col_snap:
         if st.button(f"Export Snapshot — {selected}", key="btn_export_snapshot"):
-            from app.export.program_snapshot import build_program_snapshot
+            from nautical_dashboard.app.export.program_snapshot import build_program_snapshot
 
             with st.spinner("Building snapshot..."):
                 snap_labor  = load_program_labor(engine, selected, year, month)
@@ -1381,7 +1381,7 @@ def render():
                  "Re-freezes this committed period's SGA from current GL. "
                  "Use only for a deliberate prior-period restatement."
              )):
-                 from app.modules.wip_labor import snapshot_sga
+                 from nautical_dashboard.app.modules.wip_labor import snapshot_sga
                  with engine.begin() as conn:
                      snapshot_sga(conn, _period, "manual_resnapshot")
                  load_sga_breakdown_gated.clear()
@@ -1391,8 +1391,8 @@ def render():
 
     with col_export:
         if st.button("Export Report Package"):
-            from app.export.profitability_report import build_profitability_report
-            from app.export.program_snapshot import build_program_snapshot
+            from nautical_dashboard.app.export.profitability_report import build_profitability_report
+            from nautical_dashboard.app.export.program_snapshot import build_program_snapshot
 
             with st.spinner("Building report..."):
                 flags       = load_customer_flags(engine)
