@@ -149,16 +149,24 @@ def load_sga_warehouse_gated(_engine, year: int, month: int) -> float:
     return float(df["total"].iloc[0])
 
 
+BELOW_LINE_CATEGORIES = {"Interest & Financing"}
+ 
+ 
 def _render_consolidated_pnl(
     df: pd.DataFrame,
     sga_df: pd.DataFrame,
     warehouse_sga: float,
     period_label: str,
 ) -> None:
-    """Standard income statement rollup across all programs for the period."""
+    """Standard income statement rollup across all programs for the period.
+ 
+    Interest & Financing (and any other BELOW_LINE_CATEGORIES) are presented
+    below Total SG&A in an Other Income / (Expense) section, with an
+    Operating Income subtotal in between — traditional P&L structure.
+    """
     if df.empty:
         return
-
+ 
     revenue       = float(df["revenue"].sum())
     temp_labor    = float(df["temp_labor"].sum())
     direct_hire   = float(df["direct_hire"].sum())
@@ -171,25 +179,38 @@ def _render_consolidated_pnl(
                      + commission + freight + applied_wh)
     gross_profit  = revenue - total_cogs
     gp_margin     = gross_profit / revenue if revenue else 0
-
+ 
+    # Split SGA categories: operating (in Total SG&A) vs. below-the-line.
+    operating_sga_categories = []
+    below_line_categories = []
     if not sga_df.empty:
-        sga_categories = [
-            (str(r["category"]), float(r["total"]))
-            for _, r in sga_df.iterrows()
-        ]
-    else:
-        sga_categories = []
-
-    total_sga  = sum(amt for _, amt in sga_categories) + warehouse_sga
-    net_profit = gross_profit - total_sga
+        for _, r in sga_df.iterrows():
+            cat = str(r["category"])
+            amt = float(r["total"])
+            if cat in BELOW_LINE_CATEGORIES:
+                below_line_categories.append((cat, amt))
+            else:
+                operating_sga_categories.append((cat, amt))
+ 
+    # Total SG&A = operating categories + warehouse SGA (interest excluded).
+    total_sga = sum(amt for _, amt in operating_sga_categories) + warehouse_sga
+ 
+    operating_income = gross_profit - total_sga
+ 
+    # Other Income / (Expense): below-the-line items. Interest is an expense,
+    # so it reduces net profit (subtracted), matching prior behavior.
+    total_other = sum(amt for _, amt in below_line_categories)
+ 
+    net_profit = operating_income - total_other
     net_margin = net_profit / revenue if revenue else 0
-
+    op_margin  = operating_income / revenue if revenue else 0
+ 
     def _pct(v: float) -> str:
         return f"{(v / revenue * 100):.1f}%" if revenue else "—"
-
+ 
     def _amt(v: float) -> str:
         return f"${v:,.2f}"
-
+ 
     rows = [
         ("Revenue",                revenue,       "100.0%"),
         ("", None, ""),
@@ -207,16 +228,29 @@ def _render_consolidated_pnl(
         ("", None, ""),
         ("Operating Expenses",     None,          ""),
     ]
-    for cat, amt in sga_categories:
+    for cat, amt in operating_sga_categories:
         rows.append((f"  {cat}", amt, _pct(amt)))
     if warehouse_sga:
         rows.append(("  Warehouse (SG&A)", warehouse_sga, _pct(warehouse_sga)))
     rows.extend([
-        ("Total SG&A",             total_sga,     _pct(total_sga)),
+        ("Total SG&A",             total_sga,        _pct(total_sga)),
+        ("", None, ""),
+        ("Operating Income",       operating_income, f"{op_margin*100:.1f}%"),
+    ])
+ 
+    # Other Income / (Expense) section — only render if there are items.
+    if below_line_categories:
+        rows.append(("", None, ""))
+        rows.append(("Other Income / (Expense)", None, ""))
+        for cat, amt in below_line_categories:
+            rows.append((f"  {cat}", amt, _pct(amt)))
+        rows.append(("Total Other Income / (Expense)", total_other, _pct(total_other)))
+ 
+    rows.extend([
         ("", None, ""),
         ("Net Profit",             net_profit,    f"{net_margin*100:.1f}%"),
     ])
-
+ 
     pnl_df = pd.DataFrame([
         {
             "Line Item":     label,
@@ -225,15 +259,17 @@ def _render_consolidated_pnl(
         }
         for label, amount, pct in rows
     ])
-
+ 
     st.subheader(f"Consolidated P&L — {period_label}")
-
+ 
     def _highlight_pnl(row):
         label = str(row["Line Item"])
         styles = [""] * len(row)
-        if label in ("Revenue", "Gross Profit", "Net Profit", "Total COGS", "Total SG&A"):
+        if label in ("Revenue", "Gross Profit", "Net Profit", "Total COGS",
+                     "Total SG&A", "Operating Income",
+                     "Total Other Income / (Expense)"):
             styles = ["font-weight: bold"] * len(row)
-        if label in ("Gross Profit", "Net Profit"):
+        if label in ("Gross Profit", "Net Profit", "Operating Income"):
             try:
                 amt = float(row["Amount"].replace("$", "").replace(",", ""))
                 if amt < 0:
@@ -241,7 +277,7 @@ def _render_consolidated_pnl(
             except Exception:
                 pass
         return styles
-
+ 
     styled = pnl_df.style.apply(_highlight_pnl, axis=1)
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
