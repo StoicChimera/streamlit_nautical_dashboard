@@ -429,20 +429,26 @@ def build_program_snapshot(
                     else:
                         emp_rows = []
                         for _, er in emp_sub.sort_values("allocated_cost", ascending=False).iterrows():
-                            weight_txt = (
-                                f"{float(er.get('weight', 0)):.2%}"
-                                if er.get("weight") is not None else ""
+                            # "% of Salary" = this slice's allocated cost / the
+                            # employee's full period pay. Constant denominator per
+                            # employee, so multiple lines for the same person sum
+                            # to that person's total share of the program.
+                            _sal = er.get("employee_period_salary")
+                            _alloc = er.get("allocated_cost", 0)
+                            pct_salary_txt = (
+                                f"{float(_alloc) / float(_sal):.1%}"
+                                if pd.notna(_sal) and float(_sal or 0) != 0 else ""
                             )
                             emp_rows.append([
                                 str(er.get("employee", "")),
                                 str(er.get("role", "")),
                                 str(er.get("cost_center", "")),
                                 str(er.get("activity_driver", "")),
-                                weight_txt,
-                                _dollar(er.get("allocated_cost", 0)),
+                                pct_salary_txt,
+                                _dollar(_alloc),
                             ])
                         story.append(_employee_table(
-                            ["Employee", "Role", "Cost Center", "Driver", "Weight", "Allocated"],
+                            ["Employee", "Role", "Cost Center", "Driver", "% of Salary", "Allocated"],
                             emp_rows,
                             col_ratios=[0.22, 0.16, 0.18, 0.20, 0.10, 0.14],
                         ))

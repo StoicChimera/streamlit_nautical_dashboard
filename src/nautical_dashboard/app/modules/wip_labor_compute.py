@@ -19,9 +19,16 @@ Key design points:
 
 Output schema mirrors the old build_employee_heuristic_allocations for
 downstream compatibility (write_labor_incurred, write_production_layers,
-build_program_reconciliation, render_allocation_tab), with two additions:
+build_program_reconciliation, render_allocation_tab), with these additions:
   - cost_type: 'COGS' or 'SGA' (from dim_cost_center)
   - iso_week:  int or None (None for period-level drivers)
+  - employee_period_salary: float, the employee's FULL period pay (sum of
+    their weekly costs). Constant across all of that employee's rows. This
+    is the denominator for the "% of Salary" column on labor reports:
+        % of salary to a program = SUM(allocated_cost for emp+program)
+                                    / employee_period_salary
+    It is robust to dropped no-driver lines (those go to warnings, not output),
+    because it comes from the raw weekly cost, not from the emitted rows.
 """
 
 import os
@@ -761,7 +768,7 @@ def build_employee_allocations(
     Returns columns:
         target_program, employee_name, labor_source, source_bucket,
         source_assignment, role_detail, cost_type, weight, activity_driver,
-        activity_value, allocated_cost, iso_week
+        activity_value, allocated_cost, iso_week, employee_period_salary
 
     Weekly fanout ONLY for production drivers (Demo/OGP/OW) since they feed
     stg_wip_production_layers for FIFO matching. All other drivers dispatch
@@ -773,6 +780,10 @@ def build_employee_allocations(
     labor_source is 'Direct COGS', 'Direct SG&A', or 'Temp' for display compat.
     cost_type is 'COGS' or 'SGA'.
     iso_week is int for production drivers, None for everything else.
+    employee_period_salary is the employee's FULL period pay (sum of their
+    weekly costs), constant across all of that employee's rows. It is the
+    denominator for the "% of Salary" reporting column and is robust to
+    dropped no-driver lines (those never emit rows, but salary stays whole).
 
     If return_warnings=True, returns (rows_df, warnings_list). Otherwise just rows_df.
     Each warning dict: {employee_name, role_name, cost_center, driver_key, cost}.
@@ -889,7 +900,8 @@ def build_employee_allocations(
 
         labor_source_label = _labor_source_label(src, cost_type)
         employee_weeks = weekly_costs.get((emp, src), {})
-        total_line_cost = sum(employee_weeks.values()) * pct
+        emp_salary = sum(employee_weeks.values())   # full period pay (the % of salary denominator)
+        total_line_cost = emp_salary * pct
 
         if total_line_cost <= 0:
             continue
@@ -899,18 +911,19 @@ def build_employee_allocations(
         # ------------------------------------------------------------
         if line["line_type"] == "direct_program":
             rows.append({
-                "target_program":    str(line["target_program"]),
-                "employee_name":     emp,
-                "labor_source":      labor_source_label,
-                "source_bucket":     str(line["target_program"]),
-                "source_assignment": "",
-                "role_detail":       role_name,
-                "cost_type":         cost_type,
-                "weight":            1.0,
-                "activity_driver":   "Direct Assignment",
-                "activity_value":    total_line_cost,
-                "allocated_cost":    round(total_line_cost, 2),
-                "iso_week":          None,
+                "target_program":         str(line["target_program"]),
+                "employee_name":          emp,
+                "labor_source":           labor_source_label,
+                "source_bucket":          str(line["target_program"]),
+                "source_assignment":      "",
+                "role_detail":            role_name,
+                "cost_type":              cost_type,
+                "weight":                 1.0,
+                "activity_driver":        "Direct Assignment",
+                "activity_value":         total_line_cost,
+                "allocated_cost":         round(total_line_cost, 2),
+                "iso_week":               None,
+                "employee_period_salary": emp_salary,
             })
             continue
 
@@ -947,18 +960,19 @@ def build_employee_allocations(
                 any_week_had_activity = True
                 for d in distributed:
                     rows.append({
-                        "target_program":    d["target_program"],
-                        "employee_name":     emp,
-                        "labor_source":      labor_source_label,
-                        "source_bucket":     cc_name,
-                        "source_assignment": "",
-                        "role_detail":       role_name,
-                        "cost_type":         cost_type,
-                        "weight":            d["weight"],
-                        "activity_driver":   d["driver_label"],
-                        "activity_value":    d["activity_value"],
-                        "allocated_cost":    round(d["allocated_cost"], 2),
-                        "iso_week":          iso_week,
+                        "target_program":         d["target_program"],
+                        "employee_name":          emp,
+                        "labor_source":           labor_source_label,
+                        "source_bucket":          cc_name,
+                        "source_assignment":      "",
+                        "role_detail":            role_name,
+                        "cost_type":              cost_type,
+                        "weight":                 d["weight"],
+                        "activity_driver":        d["driver_label"],
+                        "activity_value":         d["activity_value"],
+                        "allocated_cost":         round(d["allocated_cost"], 2),
+                        "iso_week":               iso_week,
+                        "employee_period_salary": emp_salary,
                     })
             if not any_week_had_activity:
                 warnings.append({
@@ -987,18 +1001,19 @@ def build_employee_allocations(
                 continue
             for d in distributed:
                 rows.append({
-                    "target_program":    d["target_program"],
-                    "employee_name":     emp,
-                    "labor_source":      labor_source_label,
-                    "source_bucket":     cc_name,
-                    "source_assignment": "",
-                    "role_detail":       role_name,
-                    "cost_type":         cost_type,
-                    "weight":            d["weight"],
-                    "activity_driver":   d["driver_label"],
-                    "activity_value":    d["activity_value"],
-                    "allocated_cost":    round(d["allocated_cost"], 2),
-                    "iso_week":          None,
+                    "target_program":         d["target_program"],
+                    "employee_name":          emp,
+                    "labor_source":           labor_source_label,
+                    "source_bucket":          cc_name,
+                    "source_assignment":      "",
+                    "role_detail":            role_name,
+                    "cost_type":              cost_type,
+                    "weight":                 d["weight"],
+                    "activity_driver":        d["driver_label"],
+                    "activity_value":         d["activity_value"],
+                    "allocated_cost":         round(d["allocated_cost"], 2),
+                    "iso_week":               None,
+                    "employee_period_salary": emp_salary,
                 })
 
     result = pd.DataFrame(rows) if rows else pd.DataFrame()

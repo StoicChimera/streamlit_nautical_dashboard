@@ -1654,22 +1654,22 @@ def write_labor_incurred_employee(period: str, locked_by: str, employee_alloc_df
     """Persists employee-level fan-out to stg_labor_incurred_employee."""
     if employee_alloc_df.empty:
         return
-
+ 
     now = datetime.now(timezone.utc).isoformat()
-
+ 
     df = employee_alloc_df.copy()
     df["labor_type"] = df["labor_source"].map({
         "Direct COGS": "direct_cogs",
         "Temp":        "temp",
         "Direct SG&A": "direct_sga",
     })
-
+ 
     df = df[~df["target_program"].isin(
         ["NO ACTIVITY DATA", "NO PROGRAM DATA", "NO REVENUE DATA"]
     )].copy()
     df = df[~df["target_program"].str.startswith("UNKNOWN DRIVER:", na=False)]
     df = df[~df["target_program"].str.startswith("NO DRIVER:", na=False)]
-
+ 
     with engine.begin() as conn:
         conn.execute(
             text("DELETE FROM stg_labor_incurred_employee WHERE accrual_period = :period"),
@@ -1681,34 +1681,38 @@ def write_labor_incurred_employee(period: str, locked_by: str, employee_alloc_df
                     (accrual_period, source_bucket, target_program, labor_type,
                      employee_name, labor_source, role_detail,
                      activity_driver, activity_value, weight, allocated_cost,
+                     employee_period_salary,
                      locked, locked_by, locked_at)
                 VALUES
                     (:period, :source_bucket, :target_program, :labor_type,
                      :employee_name, :labor_source, :role_detail,
                      :activity_driver, :activity_value, :weight, :allocated_cost,
+                     :employee_period_salary,
                      TRUE, :locked_by, :locked_at)
                 ON CONFLICT (accrual_period, source_bucket, target_program, labor_type, employee_name)
                 DO UPDATE SET
-                    activity_driver = EXCLUDED.activity_driver,
-                    activity_value  = EXCLUDED.activity_value,
-                    weight          = EXCLUDED.weight,
-                    allocated_cost  = EXCLUDED.allocated_cost,
-                    locked_by       = EXCLUDED.locked_by,
-                    locked_at       = EXCLUDED.locked_at
+                    activity_driver        = EXCLUDED.activity_driver,
+                    activity_value         = EXCLUDED.activity_value,
+                    weight                 = EXCLUDED.weight,
+                    allocated_cost         = EXCLUDED.allocated_cost,
+                    employee_period_salary = EXCLUDED.employee_period_salary,
+                    locked_by              = EXCLUDED.locked_by,
+                    locked_at              = EXCLUDED.locked_at
             """), {
-                "period":          period,
-                "source_bucket":   str(r["source_bucket"]),
-                "target_program":  str(r["target_program"]),
-                "labor_type":      str(r["labor_type"]),
-                "employee_name":   str(r["employee_name"]),
-                "labor_source":    str(r["labor_source"]),
-                "role_detail":     str(r.get("role_detail") or ""),
-                "activity_driver": str(r.get("activity_driver") or ""),
-                "activity_value":  float(r.get("activity_value") or 0),
-                "weight":          float(r.get("weight") or 0),
-                "allocated_cost":  float(r.get("allocated_cost") or 0),
-                "locked_by":       locked_by,
-                "locked_at":       now,
+                "period":                 period,
+                "source_bucket":          str(r["source_bucket"]),
+                "target_program":         str(r["target_program"]),
+                "labor_type":             str(r["labor_type"]),
+                "employee_name":          str(r["employee_name"]),
+                "labor_source":           str(r["labor_source"]),
+                "role_detail":            str(r.get("role_detail") or ""),
+                "activity_driver":        str(r.get("activity_driver") or ""),
+                "activity_value":         float(r.get("activity_value") or 0),
+                "weight":                 float(r.get("weight") or 0),
+                "allocated_cost":         float(r.get("allocated_cost") or 0),
+                "employee_period_salary": float(r.get("employee_period_salary") or 0),
+                "locked_by":              locked_by,
+                "locked_at":              now,
             })
 
 
@@ -2575,7 +2579,7 @@ def _load_employee_alloc_from_persisted(period: str) -> pd.DataFrame:
     Returns the equivalent of employee_alloc_df, read directly from
     stg_labor_incurred_employee. Used by the Allocation tab when the period
     is locked, so the locked view does not recompute from raw inputs.
-
+ 
     Shape match notes:
       - cost_type is derived from labor_type
           ('direct_cogs', 'temp') -> 'COGS'
@@ -2584,6 +2588,8 @@ def _load_employee_alloc_from_persisted(period: str) -> pd.DataFrame:
         commit; the locked rendering path does not surface the weekly
         Activity Driver Overview, so this is fine.
       - source_assignment is set to '' to match the unlocked-path shape.
+      - employee_period_salary carries the full period pay so downstream
+        reports can render the "% of Salary" column from the locked snapshot.
     """
     df = pd.read_sql(text("""
         SELECT
@@ -2597,6 +2603,7 @@ def _load_employee_alloc_from_persisted(period: str) -> pd.DataFrame:
             activity_value,
             weight,
             allocated_cost,
+            employee_period_salary,
             CASE
                 WHEN labor_type IN ('direct_cogs', 'temp') THEN 'COGS'
                 WHEN labor_type = 'direct_sga'             THEN 'SGA'

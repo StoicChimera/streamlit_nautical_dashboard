@@ -644,16 +644,25 @@ def _labor_table(labor_df: pd.DataFrame, employee_df: pd.DataFrame, styles, titl
         ))
         story.append(Spacer(1, SPACE_XS))
 
-        emp_rows = [["Employee", "Role", "Cost Center", "Driver", "Weight", "Allocated"]]
+        emp_rows = [["Employee", "Role", "Cost Center", "Driver", "% of Salary", "Allocated"]]
         for _, er in prog_df.sort_values("allocated_cost", ascending=False).iterrows():
-            weight_txt = f"{float(er.get('weight', 0)):.2%}" if pd.notna(er.get("weight")) else ""
+            # "% of Salary" = this slice's allocated cost / the employee's full
+            # period pay (employee_period_salary). Constant denominator per
+            # employee, so if a person hits this program through two cost
+            # centers their two lines sum to their total share of the program.
+            _sal = er.get("employee_period_salary")
+            _alloc = er.get("allocated_cost", 0)
+            pct_salary_txt = (
+                f"{float(_alloc) / float(_sal):.1%}"
+                if pd.notna(_sal) and float(_sal or 0) != 0 else ""
+            )
             emp_rows.append([
                 Paragraph(str(er.get("employee_name", "")), sub_style),
                 Paragraph(str(er.get("role_detail", "")), sub_style),
                 Paragraph(str(er.get("source_bucket", "")), sub_style),
                 Paragraph(str(er.get("activity_driver", "")), sub_style),
-                Paragraph(weight_txt, sub_style),
-                Paragraph(_dollar(er.get("allocated_cost", 0)), sub_style),
+                Paragraph(pct_salary_txt, sub_style),
+                Paragraph(_dollar(_alloc), sub_style),
             ])
 
         et = _data_table(
