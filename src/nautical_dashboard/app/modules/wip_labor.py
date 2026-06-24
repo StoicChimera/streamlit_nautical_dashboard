@@ -223,10 +223,19 @@ def get_labor_applied(period: str) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def check_ukg_coverage(period: str) -> dict:
     """
-    Returns coverage status for the period.
-    Checks that both boundary paychecks are present in stg_labor_direct_hire.
-    prior_tail  = PPE started before month start but prorated into this period
-    following_head = PPE ends after month end but prorated into this period
+    Returns coverage status for the period from stg_labor_direct_hire.
+
+    A month-boundary is covered in one of two ways:
+      1. Straddle — a pay period spans the boundary and is prorated into this
+         period (row tagged accrual_period = period):
+            prior_tail     = PPE starts before month start, tagged this period
+            following_head = PPE ends after month end,    tagged this period
+      2. Clean break — the bi-weekly cycle aligns exactly to the month boundary
+         this month (a check ends on the last day, the next starts on the 1st).
+         No straddling paycheck exists, so the straddle counts are legitimately
+         zero and must NOT trip a "missing paycheck" warning:
+            clean_break_start = a check tagged this period starts on the 1st
+            clean_break_end   = a check tagged this period ends on month-end
     """
     df = pd.read_sql(
         text("""
@@ -235,15 +244,27 @@ def check_ukg_coverage(period: str) -> dict:
                            AND accrual_period = :period THEN 1 END) AS prior_tail,
                 COUNT(CASE WHEN pay_period_end > (DATE_TRUNC('month', TO_DATE(:period, 'YYYY-MM'))
                                                   + INTERVAL '1 month - 1 day')::date
-                           AND accrual_period = :period THEN 1 END) AS following_head
+                           AND accrual_period = :period THEN 1 END) AS following_head,
+                COUNT(CASE WHEN pay_period_start = DATE_TRUNC('month', TO_DATE(:period, 'YYYY-MM'))::date
+                           AND accrual_period = :period THEN 1 END) AS clean_break_start,
+                COUNT(CASE WHEN pay_period_end = (DATE_TRUNC('month', TO_DATE(:period, 'YYYY-MM'))
+                                                  + INTERVAL '1 month - 1 day')::date
+                           AND accrual_period = :period THEN 1 END) AS clean_break_end
             FROM stg_labor_direct_hire
             WHERE accrual_period = :period
         """),
         engine,
         params={"period": period},
     )
-    prior_ok    = int(df["prior_tail"].iloc[0]) > 0
-    following_ok = int(df["following_head"].iloc[0]) > 0
+    prior_tail        = int(df["prior_tail"].iloc[0])
+    following_head    = int(df["following_head"].iloc[0])
+    clean_break_start = int(df["clean_break_start"].iloc[0])
+    clean_break_end   = int(df["clean_break_end"].iloc[0])
+
+    # Covered if a straddler was prorated in, OR the calendar broke cleanly
+    # on the boundary (in which case no straddler exists to load).
+    prior_ok     = prior_tail     > 0 or clean_break_start > 0
+    following_ok = following_head > 0 or clean_break_end   > 0
 
     year, month = int(period[:4]), int(period[5:7])
     next_month  = (month % 12) + 1
@@ -251,11 +272,16 @@ def check_ukg_coverage(period: str) -> dict:
     next_month_name = datetime(next_year, next_month, 1).strftime("%B")
 
     return {
-        "prior_ok":       prior_ok,
-        "following_ok":   following_ok,
-        "all_ok":         prior_ok and following_ok,
+        "prior_ok":        prior_ok,
+        "following_ok":    following_ok,
+        "all_ok":          prior_ok and following_ok,
         "next_month_name": next_month_name,
-        "period":         period,
+        "period":          period,
+        # diagnostics, in case this ever misfires again
+        "prior_tail":        prior_tail,
+        "following_head":    following_head,
+        "clean_break_start": clean_break_start,
+        "clean_break_end":   clean_break_end,
     }
 
     
