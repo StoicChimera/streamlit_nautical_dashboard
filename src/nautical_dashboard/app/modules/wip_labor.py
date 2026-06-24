@@ -878,7 +878,7 @@ def commit_allocation(rows: list[dict], period: str, committed_by: str):
     # Bust the gated P&L loaders so the just-committed period immediately shows
     # the frozen snapshot instead of a live read.
     try:
-        from app.modules.profitability import (
+        from nautical_dashboard.app.modules.profitability import (
             load_sga_breakdown_gated,
             load_sga_warehouse_gated,
         )
@@ -972,7 +972,7 @@ def unlock_allocation(period: str):
         )
         
     try:
-        from app.modules.profitability import (
+        from nautical_dashboard.app.modules.profitability import (
         load_sga_breakdown_gated,
             load_sga_warehouse_gated,
         )

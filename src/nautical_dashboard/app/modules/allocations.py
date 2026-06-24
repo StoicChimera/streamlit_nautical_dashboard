@@ -727,7 +727,7 @@ def _render_commit_section(month_start: date, total_wh_cost: float, reviewer: st
             committed_at = datetime.now(timezone.utc).isoformat()
 
             with st.spinner("Computing allocation..."):
-                from app.modules.allocation_engine import compute_warehouse_allocation as _compute
+                from nautical_dashboard.app.modules.allocation_engine import compute_warehouse_allocation as _compute
                 shared_rows, diagnostics = _compute(month_start, reviewer, total_sqft_override=total_sqft)
 
                 if "error" in diagnostics:
