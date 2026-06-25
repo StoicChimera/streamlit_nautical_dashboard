@@ -44,13 +44,12 @@ if not SUPABASE_CONN:
 engine = create_engine(SUPABASE_CONN)
 
 
-# Drivers that need ISO-week fanout. Only production drivers qualify, because
-# they feed stg_wip_production_layers which keys off iso_week for FIFO matching.
-# All other drivers dispatch at period level — weekly fanout would just create
-# duplicate rows that get summed back in stg_labor_incurred anyway.
-_WEEKLY_DRIVERS = {
-    "units_demo", "units_ogp", "units_ow",
-}
+# Empty: demo/ogp/ow moved to period-level distribution. Labor assigned for a
+# month is spread across that month's TOTAL production, not split into ISO weeks.
+# Partial-month production (weeks with zero output) used to strand the empty
+# weeks' cost as unallocated; the monthly review % already captures partial
+# effort, so month-grain distribution is the correct grain.
+_WEEKLY_DRIVERS: set[str] = set()
 
 _ALTRIA_CAP = 0.10
 
@@ -651,6 +650,24 @@ def _distribute_period(
     restrictions: list[str] | None,
 ) -> list[dict]:
     """Dispatch for drivers that are period-level (no weekly resolution)."""
+    if driver_key == "units_demo":
+        act = activity.get("demo", pd.DataFrame())
+        if not act.empty:
+            act = act.groupby("customer", as_index=False)["units"].sum()
+        return _distribute_by_units(act, cost, restrictions, "Demo Kits")
+
+    if driver_key == "units_ogp":
+        act = activity.get("ogp", pd.DataFrame())
+        if not act.empty:
+            act = act.groupby("customer", as_index=False)["units"].sum()
+        return _distribute_by_units(act, cost, restrictions, "OGP Bags")
+
+    if driver_key == "units_ow":
+        act = activity.get("ow", pd.DataFrame())
+        if not act.empty:
+            act = act.groupby("customer", as_index=False)["units"].sum()
+        return _distribute_by_units(act, cost, restrictions, "OW Units")
+    
     if driver_key == "movable_units":
         act = activity.get("inventory", pd.DataFrame())
         return _distribute_by_units(act, cost, restrictions, "Pallets (3mo Avg)")
