@@ -412,11 +412,24 @@ def get_approved_cogs_pools(period: str) -> pd.DataFrame:
 @st.cache_data(ttl=60, show_spinner=False)
 def get_approved_sga_pool(period: str) -> float:
     sql = text("""
-        SELECT COALESCE(SUM(total_labor_cost), 0) AS pool
-        FROM stg_labor_direct_hire
-        WHERE accrual_period = :period
-          AND reviewed = TRUE
-          AND UPPER(COALESCE(nmf_role, '')) = 'SG&A'
+        WITH emp_role AS (
+            SELECT DISTINCT ON (ea.employee_name)
+                   ea.employee_name,
+                   r.cost_type
+            FROM stg_labor_employee_allocation ea
+            JOIN dim_nmf_role r
+              ON r.role_name = ea.role_name
+             AND r.active = TRUE
+            WHERE ea.accrual_period = :period
+              AND ea.labor_source  = 'direct'
+              AND ea.reviewed      = TRUE
+            ORDER BY ea.employee_name, ea.reviewed_at DESC NULLS LAST
+        )
+        SELECT COALESCE(SUM(d.total_labor_cost), 0) AS pool
+        FROM stg_labor_direct_hire d
+        JOIN emp_role er ON er.employee_name = d.employee_name
+        WHERE d.accrual_period = :period
+          AND er.cost_type = 'SGA'
     """)
     result = pd.read_sql(sql, engine, params={"period": period})
     return float(result["pool"].iloc[0])

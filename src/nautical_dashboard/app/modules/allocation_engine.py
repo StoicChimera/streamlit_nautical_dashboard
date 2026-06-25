@@ -623,18 +623,30 @@ def _get_ecomm_revenue_weights(period: str, revenue_df: pd.DataFrame) -> pd.Data
 def _get_office_headcount_split(period: str) -> tuple[float, float]:
     df = pd.read_sql(
         text("""
+            WITH emp_role AS (
+                -- one role per employee per month: latest reviewed allocation wins
+                SELECT DISTINCT ON (ea.employee_name)
+                       ea.employee_name,
+                       r.cost_type
+                FROM stg_labor_employee_allocation ea
+                JOIN dim_nmf_role r
+                  ON r.role_name = ea.role_name
+                 AND r.active = TRUE
+                WHERE ea.accrual_period = :period
+                  AND ea.labor_source  = 'direct'
+                  AND ea.reviewed      = TRUE
+                ORDER BY ea.employee_name, ea.reviewed_at DESC NULLS LAST
+            )
             SELECT
-                COUNT(CASE WHEN UPPER(COALESCE(nmf_role, '')) = 'SG&A' THEN 1 END) AS sga_count,
-                COUNT(CASE WHEN UPPER(COALESCE(nmf_role, '')) != 'SG&A' THEN 1 END) AS ops_count
-            FROM stg_labor_direct_hire
-            WHERE accrual_period = :period AND reviewed = TRUE
+                COUNT(*) FILTER (WHERE cost_type = 'SGA')  AS sga_count,
+                COUNT(*) FILTER (WHERE cost_type != 'SGA') AS ops_count
+            FROM emp_role
         """),
         engine,
         params={"period": period},
     )
     if df.empty:
         return (0.5, 0.5)
-
     ops = float(df["ops_count"].iloc[0] or 0)
     sga = float(df["sga_count"].iloc[0] or 0)
     total = ops + sga
