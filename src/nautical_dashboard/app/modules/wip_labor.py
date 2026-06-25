@@ -500,7 +500,6 @@ def get_demo_units(period: str) -> pd.DataFrame:
         WHERE s.accrual_month = :period
           AND s.number_of_cases_completed > 0
           AND s.normalized_date IS NOT NULL
-          AND TRIM(s.normalized_date) != ''
           AND COALESCE(a.exclude, FALSE) = FALSE
         GROUP BY 1, 2, 3
         ORDER BY 1, units DESC
@@ -1036,7 +1035,6 @@ def write_production_layers(period: str, committed_by: str):
         WHERE accrual_month = :period
           AND number_of_cases_completed > 0
           AND normalized_date IS NOT NULL
-          AND TRIM(normalized_date) != ''
         GROUP BY 1, 2
     """), engine, params={"period": period})
 

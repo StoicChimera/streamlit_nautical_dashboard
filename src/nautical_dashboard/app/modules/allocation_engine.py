@@ -531,7 +531,6 @@ def _get_demo_units(period: str, alias_map: dict) -> pd.DataFrame:
             WHERE s.accrual_month = :period
               AND s.number_of_cases_completed > 0
               AND s.normalized_date IS NOT NULL
-              AND TRIM(s.normalized_date) != ''
               AND COALESCE(a.exclude, FALSE) = FALSE
             GROUP BY 1
             HAVING SUM(s.number_of_cases_completed) > 0

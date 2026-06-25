@@ -164,9 +164,9 @@ def _demo_pool_weights(period: str) -> pd.DataFrame:
                    ON LOWER(a.alias) = LOWER(s.customer)
                   AND a.active = TRUE
             CROSS JOIN bounds b
-            WHERE NULLIF(TRIM(s.normalized_date::text), '') IS NOT NULL
-              AND s.normalized_date::date BETWEEN b.start_d AND b.end_d
-              AND NULLIF(TRIM(s.number_of_cases_completed::text), '') IS NOT NULL
+            WHERE s.normalized_date IS NOT NULL
+              AND s.normalized_date BETWEEN b.start_d AND b.end_d
+              AND s.number_of_cases_completed IS NOT NULL
             GROUP BY 1
         )
         SELECT u.customer, u.units
