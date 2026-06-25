@@ -99,7 +99,7 @@ def get_programs_for_cost_center(cost_center_name: str, period: str) -> list[str
     }
 
     revenue_all_centers = {
-        'IT', 'Marketing', 'Finance', 'Executive', 'Facilities',
+        'IT', 'Marketing', 'Finance', 'Executive', 'Facilities', 'Sales',
     }
 
     if name in subclass_map:
