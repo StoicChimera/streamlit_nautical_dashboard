@@ -1512,27 +1512,73 @@ def get_wip_summary(period: str) -> pd.DataFrame:
 
 def get_outstanding_wip_all_periods() -> pd.DataFrame:
     """
-    Production WIP outstanding across all periods. Reads directly from
-    stg_labor_applied (source = 'production_wip') so values match the
-    Period Summary view's Production WIP figure exactly — no float
-    drift from independently re-deriving units * cost_per_unit at the
-    layer grain.
+    Production WIP outstanding across all periods, computed LIVE from
+    stg_wip_production_layers minus all-time stg_wip_fifo_applied consumption,
+    with both sides canonicalized through dim_customer_alias.
 
-    Returns one row per (accrual_period, cost_center, customer_program)
-    with units_remaining and outstanding_wip columns to match the
-    pre-refactor row shape.
+    Replaces the prior snapshot read (SUM of stg_labor_applied production_wip
+    rows). That read drifted two ways: (1) a later period consuming an earlier
+    period's layer never decremented the earlier period's frozen snapshot row,
+    and (2) raw-vs-canonical name splits (e.g. 'Walmart OGP' vs
+    'Advantage - Walmart OGP') fractured both the stored snapshot and the
+    layer/consumption netting. Deriving live from the event tables and
+    canonicalizing both sides is immune to both. Rows under $1.00 dropped as
+    immaterial rounding residual.
+
+    Returns one row per (accrual_period, cost_center, customer_program) with
+    units_remaining and outstanding_wip, matching the prior row shape.
     """
     return pd.read_sql(text("""
+        WITH consumed AS (
+            SELECT
+                f.cost_center,
+                f.iso_week_produced AS iso_week,
+                f.output_type,
+                COALESCE(
+                    (SELECT a.canonical_name FROM dim_customer_alias a
+                     WHERE LOWER(a.alias) = LOWER(f.customer_program)
+                       AND a.active = TRUE
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    f.customer_program
+                ) AS canonical_program,
+                SUM(f.units_applied) AS units_consumed
+            FROM stg_wip_fifo_applied f
+            GROUP BY 1, 2, 3, 4
+        ),
+        layers_canon AS (
+            SELECT
+                l.accrual_period,
+                l.cost_center,
+                l.iso_week,
+                l.output_type,
+                l.units_produced,
+                l.cost_per_unit,
+                COALESCE(
+                    (SELECT a.canonical_name FROM dim_customer_alias a
+                     WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                       AND a.active = TRUE
+                       AND COALESCE(a.exclude, FALSE) = FALSE
+                     LIMIT 1),
+                    l.customer_program
+                ) AS canonical_program
+            FROM stg_wip_production_layers l
+        )
         SELECT
-            accrual_period,
-            bucket           AS cost_center,
-            program          AS customer_program,
-            SUM(COALESCE(wip_units_remaining, 0)) AS units_remaining,
-            SUM(applied_cost) AS outstanding_wip
-        FROM stg_labor_applied
-        WHERE source = 'production_wip'
+            lc.accrual_period,
+            lc.cost_center,
+            lc.canonical_program AS customer_program,
+            SUM(lc.units_produced - COALESCE(c.units_consumed, 0)) AS units_remaining,
+            SUM((lc.units_produced - COALESCE(c.units_consumed, 0)) * lc.cost_per_unit)
+                AS outstanding_wip
+        FROM layers_canon lc
+        LEFT JOIN consumed c
+            ON c.cost_center       = lc.cost_center
+           AND c.iso_week          = lc.iso_week
+           AND c.output_type       = lc.output_type
+           AND c.canonical_program = lc.canonical_program
         GROUP BY 1, 2, 3
-        HAVING SUM(applied_cost) > 0
+        HAVING SUM((lc.units_produced - COALESCE(c.units_consumed, 0)) * lc.cost_per_unit) > 1.00
         ORDER BY 1, 2, 3
     """), engine)
 
@@ -2071,7 +2117,14 @@ def write_labor_applied(period: str, locked_by: str):
                 SELECT
                     l.accrual_period,
                     l.cost_center,
-                    l.customer_program,
+                    COALESCE(
+                        (SELECT a.canonical_name FROM dim_customer_alias a
+                         WHERE LOWER(a.alias) = LOWER(l.customer_program)
+                           AND a.active = TRUE
+                           AND COALESCE(a.exclude, FALSE) = FALSE
+                         LIMIT 1),
+                        l.customer_program
+                    ) AS customer_program,
                     SUM(l.units_produced) - COALESCE(SUM(c.units_consumed), 0) AS units_unconsumed,
                     SUM(l.units_produced * l.cost_per_unit) 
                         - COALESCE(SUM(c.units_consumed * l.cost_per_unit), 0) AS cost_unconsumed
