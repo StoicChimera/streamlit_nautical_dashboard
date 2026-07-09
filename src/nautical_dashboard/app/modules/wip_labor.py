@@ -2199,6 +2199,7 @@ def run_close_checks(period: str, committed_by: str) -> list[dict]:
         ("orphan_invoices",                  _check_orphan_invoices,                 1000.0),
         ("future_period_consumption",        _check_future_period_consumption,       None),
         ("layers_without_smartsheet_basis",  _check_layers_without_smartsheet_basis, 500.0),
+        ("production_alias_strand",          _check_production_alias_strand,         1.00),
     ]
 
     with engine.begin() as conn:
@@ -2231,6 +2232,190 @@ def run_close_checks(period: str, committed_by: str) -> list[dict]:
             })
 
     return findings
+
+
+def _check_production_alias_strand(period: str, threshold) -> dict:
+    """
+    Detects alias/name mismatches between the LABOR side and the SMARTSHEET
+    side that would silently strand in write_production_layers.
+
+    Two directions, reported separately:
+
+      A (fail) — labor pool with no matching sheet customer.
+                 stg_labor_incurred (Demo/OGP/Overwrap) program that does not
+                 equal any aliased sheet customer for its bucket. This is the
+                 money-losing strand: pool booked, write_production_layers hits
+                 `continue`, no layer, dollars never reach WIP/FIFO.
+
+      B (warn) — sheet customer with no matching labor program.
+                 Aliased sheet customer producing units with no labor program
+                 equal to it in the same bucket. Usually benign (that customer's
+                 labor lives in a non-production bucket), so warn-only.
+
+    Fidelity note: this mirrors the WRITE PATH's alias join exactly —
+    active = TRUE, NO exclude filter — because write_production_layers itself
+    does not filter exclude. The display readers DO filter exclude; matching
+    them here would make the check disagree with what actually gets written.
+
+    Bucket-aware: each bucket is compared against its own sheet and customer
+    column. OW resolves customer via resolve_overwrap_customer().
+
+    Severity: A>threshold -> fail. B present -> warn. A wins if both.
+    threshold is the $ floor below which A is treated as rounding (pass).
+    """
+    floor = float(threshold) if threshold is not None else 1.00
+
+    # --- Direction A: labor pool with no matching sheet customer ---
+    a_df = pd.read_sql(text("""
+        WITH labor_side AS (
+            SELECT source_bucket AS cost_center,
+                   program,
+                   LOWER(program) AS match_key,
+                   SUM(allocated_cost) AS labor_pool
+            FROM stg_labor_incurred
+            WHERE accrual_period = :period
+              AND source_bucket IN ('Demo', 'OGP', 'Overwrap')
+              AND labor_type IN ('direct_cogs', 'temp')
+            GROUP BY 1, 2
+        ),
+        sheet_side AS (
+            -- Demo
+            SELECT 'Demo' AS cost_center,
+                   LOWER(COALESCE(a.canonical_name, s.customer)) AS match_key
+            FROM stg_smartsheet_demo s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.customer) AND a.active = TRUE
+            WHERE s.accrual_month = :period
+              AND s.number_of_cases_completed > 0
+              AND s.normalized_date IS NOT NULL
+            UNION
+            -- OGP
+            SELECT 'OGP',
+                   LOWER(COALESCE(a.canonical_name, s.job_name))
+            FROM stg_smartsheet_ogp s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.job_name) AND a.active = TRUE
+            WHERE s.accrual_month = :period
+              AND s.daily_production_complete > 0
+              AND s.date IS NOT NULL
+            UNION
+            -- Overwrap (customer resolved via SQL function, then aliased)
+            SELECT 'Overwrap',
+                   LOWER(COALESCE(
+                       (SELECT a.canonical_name FROM dim_customer_alias a
+                        WHERE LOWER(a.alias) = LOWER(
+                            resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
+                        ) AND a.active = TRUE
+                        LIMIT 1),
+                       resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
+                   ))
+            FROM stg_smartsheet_overwrap s
+            WHERE s.accrual_month = :period
+              AND s.units_produced > 0
+              AND s.date_finished IS NOT NULL
+              AND resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number) IS NOT NULL
+        )
+        SELECT l.cost_center,
+               l.program,
+               ROUND(l.labor_pool::numeric, 2) AS stranded_pool
+        FROM labor_side l
+        LEFT JOIN sheet_side s
+            ON s.cost_center = l.cost_center
+           AND s.match_key   = l.match_key
+        WHERE s.match_key IS NULL
+        ORDER BY stranded_pool DESC
+    """), engine, params={"period": period})
+
+    # --- Direction B: sheet customer with no matching labor program ---
+    b_df = pd.read_sql(text("""
+        WITH labor_side AS (
+            SELECT source_bucket AS cost_center,
+                   LOWER(program) AS match_key
+            FROM stg_labor_incurred
+            WHERE accrual_period = :period
+              AND source_bucket IN ('Demo', 'OGP', 'Overwrap')
+              AND labor_type IN ('direct_cogs', 'temp')
+            GROUP BY 1, 2
+        ),
+        sheet_side AS (
+            SELECT 'Demo' AS cost_center,
+                   COALESCE(a.canonical_name, s.customer) AS sheet_customer,
+                   LOWER(COALESCE(a.canonical_name, s.customer)) AS match_key,
+                   SUM(s.number_of_cases_completed) AS units
+            FROM stg_smartsheet_demo s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.customer) AND a.active = TRUE
+            WHERE s.accrual_month = :period
+              AND s.number_of_cases_completed > 0
+              AND s.normalized_date IS NOT NULL
+            GROUP BY 1, 2, 3
+            UNION ALL
+            SELECT 'OGP',
+                   COALESCE(a.canonical_name, s.job_name),
+                   LOWER(COALESCE(a.canonical_name, s.job_name)),
+                   SUM(s.daily_production_complete)
+            FROM stg_smartsheet_ogp s
+            LEFT JOIN dim_customer_alias a
+                ON LOWER(a.alias) = LOWER(s.job_name) AND a.active = TRUE
+            WHERE s.accrual_month = :period
+              AND s.daily_production_complete > 0
+              AND s.date IS NOT NULL
+            GROUP BY 1, 2, 3
+            UNION ALL
+            SELECT 'Overwrap',
+                   COALESCE(
+                       (SELECT a.canonical_name FROM dim_customer_alias a
+                        WHERE LOWER(a.alias) = LOWER(
+                            resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
+                        ) AND a.active = TRUE
+                        LIMIT 1),
+                       resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
+                   ),
+                   LOWER(COALESCE(
+                       (SELECT a.canonical_name FROM dim_customer_alias a
+                        WHERE LOWER(a.alias) = LOWER(
+                            resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
+                        ) AND a.active = TRUE
+                        LIMIT 1),
+                       resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number)
+                   )),
+                   SUM(s.units_produced)
+            FROM stg_smartsheet_overwrap s
+            WHERE s.accrual_month = :period
+              AND s.units_produced > 0
+              AND s.date_finished IS NOT NULL
+              AND resolve_overwrap_customer(s.customer, s.project_name, s.work_order_number) IS NOT NULL
+            GROUP BY 1, 2, 3
+        )
+        SELECT sh.cost_center,
+               sh.sheet_customer,
+               ROUND(SUM(sh.units)::numeric, 0) AS units_produced
+        FROM sheet_side sh
+        LEFT JOIN labor_side l
+            ON l.cost_center = sh.cost_center
+           AND l.match_key   = sh.match_key
+        WHERE l.match_key IS NULL
+        GROUP BY 1, 2
+        ORDER BY units_produced DESC
+    """), engine, params={"period": period})
+
+    stranded_total = float(a_df["stranded_pool"].sum()) if not a_df.empty else 0.0
+
+    a_details = [{**r, "direction": "A_labor_no_sheet"} for r in a_df.to_dict("records")]
+    b_details = [{**r, "direction": "B_sheet_no_labor"} for r in b_df.to_dict("records")]
+
+    if stranded_total > floor:
+        severity = "fail"
+    elif not b_df.empty:
+        severity = "warn"
+    else:
+        severity = "pass"
+
+    return {
+        "severity":     severity,
+        "metric_value": stranded_total,
+        "details":      a_details + b_details,
+    }
 
 
 def _check_scaffolding_test(period: str, threshold) -> dict:
