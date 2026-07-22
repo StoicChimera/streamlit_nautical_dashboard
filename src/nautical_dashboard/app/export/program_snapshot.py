@@ -175,12 +175,15 @@ def build_program_snapshot(
     labor_employee_df: pd.DataFrame = None,
     logo_path: Optional[str] = None,
     labor_weekly_df: Optional[pd.DataFrame] = None,
+    labor_flex_df: Optional[pd.DataFrame] = None,
 ) -> str:
 
     if labor_employee_df is None:
         labor_employee_df = pd.DataFrame()
     if labor_weekly_df is None:
         labor_weekly_df = pd.DataFrame()
+    if labor_flex_df is None:
+        labor_flex_df = pd.DataFrame()
 
     styles = getSampleStyleSheet()
     ts = _dt.now().strftime("%Y-%m-%d %H:%M")
@@ -510,6 +513,83 @@ def build_program_snapshot(
             ratios = [0.15] + [data_col_ratio] * n_data_cols + [0.10]
             story.append(_data_table(headers, rows_data, col_ratios=ratios))
 
+        # ─── Temp Labor vs Activity Flex ─────────────────────────────
+        if not labor_flex_df.empty:
+            story.append(PageBreak())
+            _section("Temp Labor vs Activity Flex")
+            story.append(Paragraph(
+                "Month-over-month change in temp labor against change in program "
+                "activity (units completed, bucketed by contract completion date). "
+                "GOOD means labor grew slower than activity, or shed faster "
+                "(favorable flex). WATCH means labor did not flex with activity. "
+                "OK means they moved together. 'pending' means temp labor is not "
+                "yet applied for the month. '(open)' means the period is not locked "
+                "and figures may still change.",
+                caption_style,
+            ))
+            story.append(Spacer(1, SPACE_S))
+
+            def _mlabel(p, committed):
+                try:
+                    lbl = pd.to_datetime(str(p) + "-01").strftime("%b %Y")
+                except Exception:
+                    lbl = str(p)
+                return lbl if committed else f"{lbl} (open)"
+
+            def _pct_plain(v):
+                return f"{float(v)*100:.1f}%" if v is not None and pd.notna(v) else ""
+
+            def _pct_signed(v):
+                return f"{float(v)*100:+.1f}%" if v is not None and pd.notna(v) else ""
+
+            def _units(v):
+                return f"{float(v):,.0f}" if v is not None and pd.notna(v) else ""
+
+            def _signal_cell(gap, missing):
+                if missing or gap is None or pd.isna(gap):
+                    return "pending"
+                g = float(gap)
+                if g >= 0.10:
+                    return '<font color="#B00020"><b>WATCH</b></font>'
+                if g <= -0.10:
+                    return '<font color="#1a7a3a"><b>GOOD</b></font>'
+                return '<font color="#555555">OK</font>'
+
+            # Levels
+            level_rows = []
+            for _, r in labor_flex_df.iterrows():
+                missing = bool(r["labor_missing"])
+                level_rows.append([
+                    _mlabel(r["period"], bool(r["is_committed"])),
+                    _dollar(r["billed_amount"]),
+                    "pending" if missing else _dollar(r["temp_labor"]),
+                    "pending" if missing else _pct_plain(r["temp_pct_sales"]),
+                    _units(r["activity_units"]),
+                ])
+            story.append(_data_table(
+                ["Month", "Billed Amount", "Temp Labor", "Temp % of Sales", "Activity Units"],
+                level_rows,
+                col_ratios=[0.22, 0.22, 0.18, 0.18, 0.20],
+            ))
+            story.append(Spacer(1, SPACE_M))
+
+            # Month-over-month flex
+            flex_rows = []
+            for _, r in labor_flex_df.iterrows():
+                missing = bool(r["labor_missing"])
+                flex_rows.append([
+                    _mlabel(r["period"], bool(r["is_committed"])),
+                    "pending" if missing else _pct_signed(r["temp_mom_pct"]),
+                    _pct_signed(r["activity_mom_pct"]),
+                    "pending" if missing else _pct_signed(r["flex_gap"]),
+                    _signal_cell(r["flex_gap"], missing),
+                ])
+            story.append(_data_table(
+                ["Month", "Temp Labor Change", "Activity Change", "Flex Gap", "Signal"],
+                flex_rows,
+                col_ratios=[0.24, 0.20, 0.20, 0.16, 0.20],
+            ))
+            
     story.append(PageBreak())
 
     # =================================================================
