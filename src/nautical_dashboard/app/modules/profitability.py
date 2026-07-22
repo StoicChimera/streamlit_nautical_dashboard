@@ -488,15 +488,16 @@ def load_program_labor_employees(_engine, program: str, year: int, month: int) -
     return pd.read_sql(
         text("""
             SELECT
-                source_bucket   AS cost_center,
+                source_bucket           AS cost_center,
                 labor_type,
                 labor_source,
-                employee_name   AS employee,
-                role_detail     AS role,
+                employee_name           AS employee,
+                role_detail             AS role,
                 activity_driver,
                 activity_value,
                 weight,
-                allocated_cost
+                allocated_cost,
+                employee_period_salary
             FROM stg_labor_incurred_employee
             WHERE accrual_period = :period
               AND target_program  = :program
@@ -1424,7 +1425,8 @@ def render():
                             activity_driver,
                             activity_value,
                             weight,
-                            allocated_cost
+                            allocated_cost,
+                            employee_period_salary
                         FROM stg_labor_incurred_employee
                         WHERE accrual_period = :period
                     """),
