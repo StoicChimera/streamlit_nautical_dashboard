@@ -555,15 +555,17 @@ def load_program_activity_flex(_engine, program: str, year: int, month: int) -> 
     if program in PRODUCTION_PROGRAMS:
         return pd.DataFrame()          # smartsheet producers: per-unit cost track
 
-    anchor       = pd.Timestamp(year=year, month=month, day=1)
-    window_start = (anchor - pd.DateOffset(months=4)).date()  # 5 months incl lookback
+    anchor        = pd.Timestamp(year=year, month=month, day=1)
+    anchor_period = anchor.strftime("%Y-%m-01")
 
     raw = pd.read_sql(
         text("""
             WITH months AS (
-                SELECT TO_CHAR(d, 'YYYY-MM') AS period
-                FROM generate_series(:window_start::date, :anchor::date,
-                                     INTERVAL '1 month') d
+                SELECT TO_CHAR(
+                    (CAST(:anchor_period AS date) - (n || ' months')::interval),
+                    'YYYY-MM'
+                ) AS period
+                FROM generate_series(0, 4) AS n
             ),
             activity AS (
                 SELECT
@@ -597,11 +599,7 @@ def load_program_activity_flex(_engine, program: str, year: int, month: int) -> 
             ORDER BY m.period
         """),
         _engine,
-        params={
-            "program":      program,
-            "window_start": window_start,
-            "anchor":       anchor.date(),
-        },
+        params={"program": program, "anchor_period": anchor_period},
     )
 
     if raw.empty:
@@ -1377,137 +1375,73 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                 hide_index=True,
             )
 
-        @st.cache_data(ttl=60, show_spinner=False)
-        def load_program_activity_flex(_engine, program: str, year: int, month: int) -> pd.DataFrame:
-            """
-            Rolling 4-month temp-labor-vs-activity flex for a single program.
-
-            Activity = SUM(qty) from PSD, bucketed by contract_completion_date (the
-            month the work was done, so it aligns with when labor is incurred), gated
-            to non-voided lines, joined to the program via the dim_customer crosswalk
-            (qbo_full_path -> customer_name).
-
-            Labor + sales = temp_labor / billed_amount from mv_program_profitability,
-            same program key.
-
-            Queries 5 months (4 display + 1 lookback so the leftmost month's MoM is
-            real), then drops the lookback. Returns an empty DataFrame when the flex
-            view does not apply to the program (no temp labor, experiential, or a
-            smartsheet-driven producer) — the renderer skips the section on empty.
-
-            All percentage columns are decimal ratios (0.505 = 50.5%).
-            """
-            # Scope guard. This flex view is for non-production programs only (SCAAS +
-            # direct customers: Altria, Life Time, Coke, AMT, GP Acoustics, LogIQ...).
-            # Production programs (experiential demo/OGP/overwrap, and the smartsheet
-            # producers) are handled separately via per-unit labor cost. Edit the set
-            # and the flag checks below to change scope.
-            PRODUCTION_PROGRAMS = {"Arrived Co", "RECESS Digital Inc."}
-
-            meta = pd.read_sql(
-                text("""
-                    SELECT allow_temp_labor, is_experiential
-                    FROM dim_customer
-                    WHERE customer_name = :program
-                    AND active = TRUE
-                    LIMIT 1
-                """),
-                _engine,
-                params={"program": program},
-            )
-            if meta.empty:
-                return pd.DataFrame()
-            if not bool(meta["allow_temp_labor"].iloc[0]):
-                return pd.DataFrame()          # e.g. Dorco: no temp labor -> section hidden
-            if bool(meta["is_experiential"].iloc[0]):
-                return pd.DataFrame()          # demo/OGP/other-fulfillment: production track
-            if program in PRODUCTION_PROGRAMS:
-                return pd.DataFrame()          # smartsheet producers: per-unit cost track
-
-            # Build the 5 month keys (4 display + 1 lookback) in Python so we never
-            # have to cast a bound param inline in SQL. Passing :window_start::date
-            # breaks because SQLAlchemy's ':' bind syntax collides with '::' casts.
-            anchor        = pd.Timestamp(year=year, month=month, day=1)
-            month_periods = [
-                (anchor - pd.DateOffset(months=i)).strftime("%Y-%m")
-                for i in range(4, -1, -1)                     # oldest -> newest, 5 total
-            ]
-
-            raw = pd.read_sql(
-                text("""
-                    WITH months AS (
-                        SELECT UNNEST(CAST(:periods AS text[])) AS period
-                    ),
-                    activity AS (
-                        SELECT
-                            TO_CHAR(psd.contract_completion_date, 'YYYY-MM') AS period,
-                            SUM(psd.qty) AS activity_units
-                        FROM stg_product_service_detail psd
-                        JOIN dim_customer dc
-                        ON dc.qbo_full_path = psd.customer_full_name
-                        WHERE dc.customer_name = :program
-                        AND psd.voided = 'No'
-                        AND psd.contract_completion_date IS NOT NULL
-                        GROUP BY 1
-                    ),
-                    labor AS (
-                        SELECT
-                            TO_CHAR(month_start, 'YYYY-MM') AS period,
-                            SUM(temp_labor)    AS temp_labor,
-                            SUM(billed_amount) AS billed_amount
-                        FROM mv_program_profitability
-                        WHERE customer_program = :program
-                        GROUP BY 1
-                    )
-                    SELECT
-                        m.period,
-                        COALESCE(l.billed_amount, 0)  AS billed_amount,
-                        COALESCE(l.temp_labor, 0)     AS temp_labor,
-                        COALESCE(a.activity_units, 0) AS activity_units
-                    FROM months m
-                    LEFT JOIN labor    l ON l.period = m.period
-                    LEFT JOIN activity a ON a.period = m.period
-                    ORDER BY m.period
-                """),
-                _engine,
-                params={"program": program, "periods": month_periods},
+        # ── Temp Labor vs Activity Flex ──────────────────────────
+        flex_df = load_program_activity_flex(engine, selected, year, month)
+        if not flex_df.empty:
+            st.markdown("**Temp Labor vs Activity Flex**")
+            st.caption(
+                "Month-over-month change in temp labor against change in program "
+                "activity (units completed, by contract completion date). GOOD = labor "
+                "flexed favorably (grew slower / shed faster than activity). WATCH = labor "
+                "did not flex with activity. OK = moved together. 'pending' = temp labor "
+                "not yet applied. '(open)' = period not locked, figures may change."
             )
 
-            if raw.empty:
-                return pd.DataFrame()
+            def _sig(gap, missing):
+                if missing or gap is None or pd.isna(gap):
+                    return "pending"
+                g = float(gap)
+                if g >= 0.10:
+                    return "WATCH"
+                if g <= -0.10:
+                    return "GOOD"
+                return "OK"
 
-            for c in ("billed_amount", "temp_labor", "activity_units"):
-                raw[c] = pd.to_numeric(raw[c], errors="coerce").fillna(0.0)
+            def _p(v):
+                return f"{float(v)*100:.1f}%" if pd.notna(v) else ""
 
-            raw["prior_temp"]     = raw["temp_labor"].shift(1)
-            raw["prior_activity"] = raw["activity_units"].shift(1)
+            def _ps(v):
+                return f"{float(v)*100:+.1f}%" if pd.notna(v) else ""
 
-            def _ratio(n, d):
-                return (n / d) if (d is not None and not pd.isna(d) and d != 0) else None
+            disp = flex_df.copy()
+            disp["Month"] = disp.apply(
+                lambda r: pd.to_datetime(str(r["period"]) + "-01").strftime("%b %Y")
+                + ("" if r["is_committed"] else " (open)"),
+                axis=1,
+            )
+            disp["Signal"] = disp.apply(
+                lambda r: _sig(r["flex_gap"], bool(r["labor_missing"])), axis=1)
+            disp["Billed Amount"] = disp["billed_amount"].map(lambda x: f"${float(x):,.2f}")
+            disp["Temp Labor"] = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else f"${float(r['temp_labor']):,.2f}", axis=1)
+            disp["Temp % of Sales"] = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else _p(r["temp_pct_sales"]), axis=1)
+            disp["Activity Units"] = disp["activity_units"].map(lambda x: f"{float(x):,.0f}")
+            disp["Temp Change"] = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else _ps(r["temp_mom_pct"]), axis=1)
+            disp["Activity Change"] = disp["activity_mom_pct"].map(_ps)
+            disp["Flex Gap"] = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else _ps(r["flex_gap"]), axis=1)
 
-            raw["temp_pct_sales"] = raw.apply(
-                lambda r: _ratio(r["temp_labor"], r["billed_amount"]), axis=1)
-            raw["temp_mom_pct"] = raw.apply(
-                lambda r: (_ratio(r["temp_labor"], r["prior_temp"]) - 1)
-                if _ratio(r["temp_labor"], r["prior_temp"]) is not None else None, axis=1)
-            raw["activity_mom_pct"] = raw.apply(
-                lambda r: (_ratio(r["activity_units"], r["prior_activity"]) - 1)
-                if _ratio(r["activity_units"], r["prior_activity"]) is not None else None, axis=1)
-            raw["flex_gap"] = raw.apply(
-                lambda r: (r["temp_mom_pct"] - r["activity_mom_pct"])
-                if pd.notna(r["temp_mom_pct"]) and pd.notna(r["activity_mom_pct"]) else None,
-                axis=1)
+            def _style_signal(val):
+                if val == "WATCH":
+                    return "color: #B00020; font-weight: bold"
+                if val == "GOOD":
+                    return "color: #1a7a3a; font-weight: bold"
+                if val == "OK":
+                    return "color: #555555"
+                return "color: #999999"
 
-            raw["labor_missing"] = (raw["temp_labor"] == 0) | (raw["billed_amount"] == 0)
-            raw["is_committed"]  = raw["period"].map(lambda p: bool(is_period_committed(p)))
-
-            out = raw.iloc[1:].reset_index(drop=True)   # drop lookback month
-            return out[[
-                "period", "billed_amount", "temp_labor", "activity_units",
-                "temp_pct_sales", "temp_mom_pct", "activity_mom_pct", "flex_gap",
-                "labor_missing", "is_committed",
+            show = disp[[
+                "Month", "Billed Amount", "Temp Labor", "Temp % of Sales",
+                "Activity Units", "Temp Change", "Activity Change",
+                "Flex Gap", "Signal",
             ]]
-
+            st.dataframe(
+                show.style.applymap(_style_signal, subset=["Signal"]),
+                use_container_width=True, hide_index=True,
+            )
+            
     # ---- Warehouse ----
     with tab_warehouse:
         wh_df = load_program_warehouse(engine, selected, year, month)
