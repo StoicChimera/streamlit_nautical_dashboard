@@ -1901,6 +1901,13 @@ def write_labor_applied(period: str, locked_by: str):
         # All fanned-out rows from stg_labor_allocation
         # Excludes WIP production buckets — those come from FIFO
         # Excludes fulfillment WIP — programs with no revenue this period
+        #
+        # Revenue gate reads vw_revenue_by_program (a PLAIN VIEW, always
+        # live), NOT mv_program_profitability. The MV is a refresh-on-demand
+        # reporting cache; gating a write path on it made this classification
+        # depend on when someone last clicked Refresh. The MV is built from
+        # this same view (its `revenue` CTE selects straight from it), so the
+        # comparison is identical — just never stale.
         # ----------------------------------------------------------------
         conn.execute(text("""
             INSERT INTO stg_labor_applied (
@@ -1927,9 +1934,9 @@ def write_labor_applied(period: str, locked_by: str):
             WHERE li.accrual_period = :period
             AND li.source_bucket NOT IN ('Demo', 'OGP', 'Overwrap')
             AND EXISTS (
-                SELECT 1 FROM mv_program_profitability mv
-                WHERE mv.month_start = TO_DATE(li.accrual_period, 'YYYY-MM')
-                AND mv.customer_program = li.program
+                SELECT 1 FROM vw_revenue_by_program vr
+                WHERE vr.month_start = TO_DATE(li.accrual_period, 'YYYY-MM')
+                AND vr.customer_program = li.program
             )
         """), {"period": period, "locked_by": locked_by, "locked_at": now})
 
@@ -1965,9 +1972,6 @@ def write_labor_applied(period: str, locked_by: str):
                 TRUE, :locked_by, :locked_at
             FROM stg_wip_fifo_applied f
             LEFT JOIN (
-                -- Per-program layer pool with units_remaining and wip_cost_remaining
-                -- computed from fifo_applied events (units_remaining is no longer
-                -- a stored column on stg_wip_production_layers).
                 SELECT
                     lay.accrual_period,
                     lay.cost_center,
@@ -2038,6 +2042,9 @@ def write_labor_applied(period: str, locked_by: str):
         # ----------------------------------------------------------------
         # Source 4 — current_fulfillment_wip
         # Current period programs with no revenue (fulfillment WIP)
+        #
+        # Exact inverse of Source 1's gate. Same live-view read — see the
+        # note on Source 1 for why this is not mv_program_profitability.
         # ----------------------------------------------------------------
         conn.execute(text("""
             INSERT INTO stg_labor_applied (
@@ -2064,9 +2071,9 @@ def write_labor_applied(period: str, locked_by: str):
             WHERE li.accrual_period = :period
             AND li.source_bucket NOT IN ('Demo', 'OGP', 'Overwrap')
             AND NOT EXISTS (
-                SELECT 1 FROM mv_program_profitability mv
-                WHERE mv.month_start = TO_DATE(li.accrual_period, 'YYYY-MM')
-                AND mv.customer_program = li.program
+                SELECT 1 FROM vw_revenue_by_program vr
+                WHERE vr.month_start = TO_DATE(li.accrual_period, 'YYYY-MM')
+                AND vr.customer_program = li.program
             )
         """), {"period": period, "locked_by": locked_by, "locked_at": now})
 
@@ -2143,10 +2150,6 @@ def write_labor_applied(period: str, locked_by: str):
                         l.customer_program
                     )
                 WHERE l.accrual_period = :period
-                  -- Canonicalization via dim_customer_alias (replaces inline CASE WHEN).
-                  -- Join includes output_type to handle same-week-same-program
-                  -- with multiple output types (e.g., AC/R Overwrap producing
-                  -- both 'overwrap' and 'packout' layers in week 9).
                 GROUP BY 1, 2, 3
                 HAVING SUM(l.units_produced * l.cost_per_unit) 
                        - COALESCE(SUM(c.units_consumed * l.cost_per_unit), 0) > 0.005
@@ -2200,6 +2203,7 @@ def run_close_checks(period: str, committed_by: str) -> list[dict]:
         ("future_period_consumption",        _check_future_period_consumption,       None),
         ("layers_without_smartsheet_basis",  _check_layers_without_smartsheet_basis, 500.0),
         ("production_alias_strand",          _check_production_alias_strand,         1.00),
+        ("revenue_labor_misclass",           _check_revenue_labor_misclass,          1.00),
     ]
 
     with engine.begin() as conn:
@@ -2890,6 +2894,53 @@ def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
         "details":      df.to_dict(orient="records"),
     }
 
+
+def _check_revenue_labor_misclass(period: str, threshold) -> dict:
+    """
+    Contradiction detector: labor classified as current_fulfillment_wip for a
+    program that DOES have revenue this period.
+
+    current_fulfillment_wip means "no revenue to apply against." If revenue
+    exists, that classification is wrong and the cost is sitting on the balance
+    sheet instead of the P&L — margin is overstated for the period.
+
+    This is what a stale mv_program_profitability read used to cause before the
+    gate moved to vw_revenue_by_program. Kept as a permanent tripwire: any row
+    here means the Source 1 / Source 4 split disagreed with live revenue.
+
+    threshold is the $ floor below which it is treated as rounding noise.
+    Any amount above it is a fail — this should never be non-zero.
+    """
+    floor = float(threshold) if threshold is not None else 1.00
+
+    df = pd.read_sql(text("""
+        SELECT
+            la.program,
+            la.bucket        AS cost_center,
+            la.labor_type,
+            ROUND(SUM(la.applied_cost)::numeric, 2) AS misclassified_cost,
+            ROUND(MAX(vr.revenue)::numeric, 2)      AS program_revenue
+        FROM stg_labor_applied la
+        JOIN vw_revenue_by_program vr
+          ON vr.month_start      = TO_DATE(la.accrual_period, 'YYYY-MM')
+         AND vr.customer_program = la.program
+        WHERE la.accrual_period = :period
+          AND la.source = 'current_fulfillment_wip'
+        GROUP BY 1, 2, 3
+        ORDER BY misclassified_cost DESC
+    """), engine, params={"period": period})
+
+    if df.empty:
+        return {"severity": "pass", "metric_value": 0, "details": []}
+
+    total = float(df["misclassified_cost"].sum())
+    severity = "fail" if total > floor else "warn"
+
+    return {
+        "severity":     severity,
+        "metric_value": total,
+        "details":      df.to_dict(orient="records"),
+    }
 
 # ---------------------------------------------------------------------------
 # Allocation compute
