@@ -1377,6 +1377,73 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                 hide_index=True,
             )
 
+        # ── Temp Labor vs Activity Flex ──────────────────────────
+        flex_df = load_program_activity_flex(engine, selected, year, month)
+        if not flex_df.empty:
+            st.markdown("**Temp Labor vs Activity Flex**")
+            st.caption(
+                "Month-over-month change in temp labor against change in program "
+                "activity (units completed, by contract completion date). GOOD = labor "
+                "flexed favorably (grew slower / shed faster than activity). WATCH = labor "
+                "did not flex with activity. OK = moved together. 'pending' = temp labor "
+                "not yet applied. '(open)' = period not locked, figures may change."
+            )
+
+            def _sig(gap, missing):
+                if missing or gap is None or pd.isna(gap):
+                    return "pending"
+                g = float(gap)
+                if g >= 0.10:
+                    return "WATCH"
+                if g <= -0.10:
+                    return "GOOD"
+                return "OK"
+
+            disp = flex_df.copy()
+            disp["Month"] = disp.apply(
+                lambda r: pd.to_datetime(str(r["period"]) + "-01").strftime("%b %Y")
+                + ("" if r["is_committed"] else " (open)"),
+                axis=1,
+            )
+            disp["Signal"] = disp.apply(
+                lambda r: _sig(r["flex_gap"], bool(r["labor_missing"])), axis=1)
+
+            def _p(v):  # plain pct
+                return f"{float(v)*100:.1f}%" if pd.notna(v) else ""
+            def _ps(v):  # signed pct
+                return f"{float(v)*100:+.1f}%" if pd.notna(v) else ""
+
+            disp["Billed Amount"]  = disp["billed_amount"].map(lambda x: f"${float(x):,.2f}")
+            disp["Temp Labor"]     = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else f"${float(r['temp_labor']):,.2f}", axis=1)
+            disp["Temp % of Sales"] = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else _p(r["temp_pct_sales"]), axis=1)
+            disp["Activity Units"] = disp["activity_units"].map(lambda x: f"{float(x):,.0f}")
+            disp["Temp Change"]    = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else _ps(r["temp_mom_pct"]), axis=1)
+            disp["Activity Change"] = disp["activity_mom_pct"].map(_ps)
+            disp["Flex Gap"]       = disp.apply(
+                lambda r: "pending" if r["labor_missing"] else _ps(r["flex_gap"]), axis=1)
+
+            def _style_signal(val):
+                if val == "WATCH":
+                    return "color: #B00020; font-weight: bold"
+                if val == "GOOD":
+                    return "color: #1a7a3a; font-weight: bold"
+                if val == "OK":
+                    return "color: #555555"
+                return "color: #999999"
+
+            show = disp[[
+                "Month", "Billed Amount", "Temp Labor", "Temp % of Sales",
+                "Activity Units", "Temp Change", "Activity Change",
+                "Flex Gap", "Signal",
+            ]]
+            st.dataframe(
+                show.style.applymap(_style_signal, subset=["Signal"]),
+                use_container_width=True, hide_index=True,
+            )
+            
     # ---- Warehouse ----
     with tab_warehouse:
         wh_df = load_program_warehouse(engine, selected, year, month)
