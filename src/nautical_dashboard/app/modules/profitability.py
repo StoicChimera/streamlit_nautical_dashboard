@@ -511,33 +511,34 @@ def load_program_labor_employees(_engine, program: str, year: int, month: int) -
 @st.cache_data(ttl=60, show_spinner=False)
 def load_program_activity_flex(_engine, program: str, year: int, month: int) -> pd.DataFrame:
     """
-    Rolling 4-month temp-labor-vs-activity flex for a single program.
+    Rolling 4-month labor-vs-activity flex for a single program.
 
-    Activity = SUM(qty) from PSD, bucketed by contract_completion_date (the
-    month the work was done, so it aligns with when labor is incurred), gated
-    to non-voided lines, joined to the program via the dim_customer crosswalk
-    (qbo_full_path -> customer_name).
+    Temp labor and direct hire are tracked as INDEPENDENT levers, each with its
+    own MoM change and flex signal against the same activity denominator. They
+    flex differently — temp is variable, direct hire is sticky — so a blended
+    signal would hide the operational story. Kept separate on purpose.
 
-    Labor + sales = temp_labor / billed_amount from mv_program_profitability,
-    same program key.
+    Activity = SUM(qty) from PSD, bucketed by contract_completion_date (aligns
+    with when labor is incurred), gated to non-voided lines, joined via the
+    dim_customer crosswalk (qbo_full_path -> customer_name).
+
+    Labor + sales = temp_labor / direct_hire / billed_amount from
+    mv_program_profitability, same program key.
 
     Queries 5 months (4 display + 1 lookback so the leftmost month's MoM is
-    real), then drops the lookback. Returns an empty DataFrame when the flex
-    view does not apply to the program (no temp labor, experiential, or a
-    smartsheet-driven producer) — the renderer skips the section on empty.
+    real), then drops the lookback. Returns empty when the flex view does not
+    apply (no temp labor, experiential, or a smartsheet producer).
+
+    allow_direct_hire is carried on every row so the renderer can suppress the
+    DH block for temp-only programs (e.g. Altria) without a second query.
 
     All percentage columns are decimal ratios (0.505 = 50.5%).
     """
-    # Scope guard. This flex view is for non-production programs only (SCAAS +
-    # direct customers: Altria, Life Time, Coke, AMT, GP Acoustics, LogIQ...).
-    # Production programs (experiential demo/OGP/overwrap, and the smartsheet
-    # producers) are handled separately via per-unit labor cost. Edit the set
-    # and the flag checks below to change scope.
     PRODUCTION_PROGRAMS = {"Arrived Co", "RECESS Digital Inc."}
 
     meta = pd.read_sql(
         text("""
-            SELECT allow_temp_labor, is_experiential
+            SELECT allow_temp_labor, allow_direct_hire, is_experiential
             FROM dim_customer
             WHERE customer_name = :program
               AND active = TRUE
@@ -548,12 +549,14 @@ def load_program_activity_flex(_engine, program: str, year: int, month: int) -> 
     )
     if meta.empty:
         return pd.DataFrame()
-    if not bool(meta["allow_temp_labor"].iloc[0]):
-        return pd.DataFrame()          # e.g. Dorco: no temp labor -> section hidden
+    if not bool(meta["allow_temp_labor"].iloc[0]) and not bool(meta["allow_direct_hire"].iloc[0]):
+        return pd.DataFrame()          # neither lever -> nothing to flex
     if bool(meta["is_experiential"].iloc[0]):
         return pd.DataFrame()          # demo/OGP/other-fulfillment: production track
     if program in PRODUCTION_PROGRAMS:
         return pd.DataFrame()          # smartsheet producers: per-unit cost track
+
+    allow_dh = bool(meta["allow_direct_hire"].iloc[0])
 
     anchor        = pd.Timestamp(year=year, month=month, day=1)
     anchor_period = anchor.strftime("%Y-%m-01")
@@ -583,6 +586,7 @@ def load_program_activity_flex(_engine, program: str, year: int, month: int) -> 
                 SELECT
                     TO_CHAR(month_start, 'YYYY-MM') AS period,
                     SUM(temp_labor)    AS temp_labor,
+                    SUM(direct_hire)   AS direct_hire,
                     SUM(billed_amount) AS billed_amount
                 FROM mv_program_profitability
                 WHERE customer_program = :program
@@ -592,6 +596,7 @@ def load_program_activity_flex(_engine, program: str, year: int, month: int) -> 
                 m.period,
                 COALESCE(l.billed_amount, 0)  AS billed_amount,
                 COALESCE(l.temp_labor, 0)     AS temp_labor,
+                COALESCE(l.direct_hire, 0)    AS direct_hire,
                 COALESCE(a.activity_units, 0) AS activity_units
             FROM months m
             LEFT JOIN labor    l ON l.period = m.period
@@ -605,36 +610,55 @@ def load_program_activity_flex(_engine, program: str, year: int, month: int) -> 
     if raw.empty:
         return pd.DataFrame()
 
-    for c in ("billed_amount", "temp_labor", "activity_units"):
+    for c in ("billed_amount", "temp_labor", "direct_hire", "activity_units"):
         raw[c] = pd.to_numeric(raw[c], errors="coerce").fillna(0.0)
 
     raw["prior_temp"]     = raw["temp_labor"].shift(1)
+    raw["prior_dh"]       = raw["direct_hire"].shift(1)
     raw["prior_activity"] = raw["activity_units"].shift(1)
 
     def _ratio(n, d):
         return (n / d) if (d is not None and not pd.isna(d) and d != 0) else None
 
+    # % of sales
     raw["temp_pct_sales"] = raw.apply(
         lambda r: _ratio(r["temp_labor"], r["billed_amount"]), axis=1)
+    raw["dh_pct_sales"] = raw.apply(
+        lambda r: _ratio(r["direct_hire"], r["billed_amount"]), axis=1)
+
+    # MoM change
     raw["temp_mom_pct"] = raw.apply(
         lambda r: (_ratio(r["temp_labor"], r["prior_temp"]) - 1)
         if _ratio(r["temp_labor"], r["prior_temp"]) is not None else None, axis=1)
+    raw["dh_mom_pct"] = raw.apply(
+        lambda r: (_ratio(r["direct_hire"], r["prior_dh"]) - 1)
+        if _ratio(r["direct_hire"], r["prior_dh"]) is not None else None, axis=1)
     raw["activity_mom_pct"] = raw.apply(
         lambda r: (_ratio(r["activity_units"], r["prior_activity"]) - 1)
         if _ratio(r["activity_units"], r["prior_activity"]) is not None else None, axis=1)
-    raw["flex_gap"] = raw.apply(
+
+    # flex gap per lever = labor change - activity change
+    raw["temp_flex_gap"] = raw.apply(
         lambda r: (r["temp_mom_pct"] - r["activity_mom_pct"])
         if pd.notna(r["temp_mom_pct"]) and pd.notna(r["activity_mom_pct"]) else None,
         axis=1)
+    raw["dh_flex_gap"] = raw.apply(
+        lambda r: (r["dh_mom_pct"] - r["activity_mom_pct"])
+        if pd.notna(r["dh_mom_pct"]) and pd.notna(r["activity_mom_pct"]) else None,
+        axis=1)
 
-    raw["labor_missing"] = (raw["temp_labor"] == 0) | (raw["billed_amount"] == 0)
-    raw["is_committed"]  = raw["period"].map(lambda p: bool(is_period_committed(p)))
+    # per-lever "labor not applied yet" guards
+    raw["temp_missing"] = (raw["temp_labor"] == 0) | (raw["billed_amount"] == 0)
+    raw["dh_missing"]   = (raw["direct_hire"] == 0) | (raw["billed_amount"] == 0)
+    raw["is_committed"] = raw["period"].map(lambda p: bool(is_period_committed(p)))
+    raw["allow_dh"]     = allow_dh
 
     out = raw.iloc[1:].reset_index(drop=True)   # drop lookback month
     return out[[
-        "period", "billed_amount", "temp_labor", "activity_units",
-        "temp_pct_sales", "temp_mom_pct", "activity_mom_pct", "flex_gap",
-        "labor_missing", "is_committed",
+        "period", "billed_amount", "activity_units", "activity_mom_pct",
+        "temp_labor", "temp_pct_sales", "temp_mom_pct", "temp_flex_gap", "temp_missing",
+        "direct_hire", "dh_pct_sales", "dh_mom_pct", "dh_flex_gap", "dh_missing",
+        "is_committed", "allow_dh",
     ]]
 
 
@@ -1375,16 +1399,18 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                 hide_index=True,
             )
 
-        # ── Temp Labor vs Activity Flex ──────────────────────────
+        # ── Labor vs Activity Flex ───────────────────────────────
         flex_df = load_program_activity_flex(engine, selected, year, month)
         if not flex_df.empty:
-            st.markdown("**Temp Labor vs Activity Flex**")
+            show_dh = bool(flex_df["allow_dh"].iloc[0])
+            st.markdown("**Labor vs Activity Flex**")
             st.caption(
-                "Month-over-month change in temp labor against change in program "
-                "activity (units completed, by contract completion date). GOOD = labor "
-                "flexed favorably (grew slower / shed faster than activity). WATCH = labor "
-                "did not flex with activity. OK = moved together. 'pending' = temp labor "
-                "not yet applied. '(open)' = period not locked, figures may change."
+                "Month-over-month change in labor against change in program "
+                "activity (units completed, by contract completion date), tracked "
+                "separately for temp and direct hire. GOOD = labor flexed favorably "
+                "(grew slower / shed faster than activity). WATCH = labor did not flex "
+                "with activity. OK = moved together. 'pending' = labor not yet applied. "
+                "'(open)' = period not locked, figures may change."
             )
 
             def _sig(gap, missing):
@@ -1409,19 +1435,40 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                 + ("" if r["is_committed"] else " (open)"),
                 axis=1,
             )
-            disp["Signal"] = disp.apply(
-                lambda r: _sig(r["flex_gap"], bool(r["labor_missing"])), axis=1)
-            disp["Billed Amount"] = disp["billed_amount"].map(lambda x: f"${float(x):,.2f}")
-            disp["Temp Labor"] = disp.apply(
-                lambda r: "pending" if r["labor_missing"] else f"${float(r['temp_labor']):,.2f}", axis=1)
-            disp["Temp % of Sales"] = disp.apply(
-                lambda r: "pending" if r["labor_missing"] else _p(r["temp_pct_sales"]), axis=1)
-            disp["Activity Units"] = disp["activity_units"].map(lambda x: f"{float(x):,.0f}")
-            disp["Temp Change"] = disp.apply(
-                lambda r: "pending" if r["labor_missing"] else _ps(r["temp_mom_pct"]), axis=1)
+            disp["Billed Amount"]   = disp["billed_amount"].map(lambda x: f"${float(x):,.2f}")
+            disp["Activity Units"]  = disp["activity_units"].map(lambda x: f"{float(x):,.0f}")
             disp["Activity Change"] = disp["activity_mom_pct"].map(_ps)
-            disp["Flex Gap"] = disp.apply(
-                lambda r: "pending" if r["labor_missing"] else _ps(r["flex_gap"]), axis=1)
+
+            # Temp lever
+            disp["Temp Labor"] = disp.apply(
+                lambda r: "pending" if r["temp_missing"] else f"${float(r['temp_labor']):,.2f}", axis=1)
+            disp["Temp % Sales"] = disp.apply(
+                lambda r: "pending" if r["temp_missing"] else _p(r["temp_pct_sales"]), axis=1)
+            disp["Temp Change"] = disp.apply(
+                lambda r: "pending" if r["temp_missing"] else _ps(r["temp_mom_pct"]), axis=1)
+            disp["Temp Gap"] = disp.apply(
+                lambda r: "pending" if r["temp_missing"] else _ps(r["temp_flex_gap"]), axis=1)
+            disp["Temp Signal"] = disp.apply(
+                lambda r: _sig(r["temp_flex_gap"], bool(r["temp_missing"])), axis=1)
+
+            cols = [
+                "Month", "Billed Amount", "Activity Units", "Activity Change",
+                "Temp Labor", "Temp % Sales", "Temp Change", "Temp Gap", "Temp Signal",
+            ]
+
+            # Direct hire lever — only if the program allows it
+            if show_dh:
+                disp["Direct Hire"] = disp.apply(
+                    lambda r: "pending" if r["dh_missing"] else f"${float(r['direct_hire']):,.2f}", axis=1)
+                disp["DH % Sales"] = disp.apply(
+                    lambda r: "pending" if r["dh_missing"] else _p(r["dh_pct_sales"]), axis=1)
+                disp["DH Change"] = disp.apply(
+                    lambda r: "pending" if r["dh_missing"] else _ps(r["dh_mom_pct"]), axis=1)
+                disp["DH Gap"] = disp.apply(
+                    lambda r: "pending" if r["dh_missing"] else _ps(r["dh_flex_gap"]), axis=1)
+                disp["DH Signal"] = disp.apply(
+                    lambda r: _sig(r["dh_flex_gap"], bool(r["dh_missing"])), axis=1)
+                cols += ["Direct Hire", "DH % Sales", "DH Change", "DH Gap", "DH Signal"]
 
             def _style_signal(val):
                 if val == "WATCH":
@@ -1432,16 +1479,12 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                     return "color: #555555"
                 return "color: #999999"
 
-            show = disp[[
-                "Month", "Billed Amount", "Temp Labor", "Temp % of Sales",
-                "Activity Units", "Temp Change", "Activity Change",
-                "Flex Gap", "Signal",
-            ]]
+            signal_cols = ["Temp Signal"] + (["DH Signal"] if show_dh else [])
             st.dataframe(
-                show.style.applymap(_style_signal, subset=["Signal"]),
+                disp[cols].style.applymap(_style_signal, subset=signal_cols),
                 use_container_width=True, hide_index=True,
             )
-            
+
     # ---- Warehouse ----
     with tab_warehouse:
         wh_df = load_program_warehouse(engine, selected, year, month)

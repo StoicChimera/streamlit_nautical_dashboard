@@ -515,16 +515,15 @@ def build_program_snapshot(
 
         # ─── Temp Labor vs Activity Flex ─────────────────────────────
         if not labor_flex_df.empty:
+            show_dh = bool(labor_flex_df["allow_dh"].iloc[0])
             story.append(PageBreak())
-            _section("Temp Labor vs Activity Flex")
+            _section("Labor vs Activity Flex")
             story.append(Paragraph(
-                "Month-over-month change in temp labor against change in program "
-                "activity (units completed, bucketed by contract completion date). "
-                "GOOD means labor grew slower than activity, or shed faster "
-                "(favorable flex). WATCH means labor did not flex with activity. "
-                "OK means they moved together. 'pending' means temp labor is not "
-                "yet applied for the month. '(open)' means the period is not locked "
-                "and figures may still change.",
+                "Month-over-month change in labor against change in program "
+                "activity (units completed, by contract completion date), tracked "
+                "separately for temp and direct hire. GOOD = labor flexed favorably. "
+                "WATCH = labor did not flex with activity. OK = moved together. "
+                "'pending' = labor not yet applied. '(open)' = period not locked.",
                 caption_style,
             ))
             story.append(Spacer(1, SPACE_S))
@@ -536,16 +535,16 @@ def build_program_snapshot(
                     lbl = str(p)
                 return lbl if committed else f"{lbl} (open)"
 
-            def _pct_plain(v):
+            def _pp(v):
                 return f"{float(v)*100:.1f}%" if v is not None and pd.notna(v) else ""
 
-            def _pct_signed(v):
+            def _psg(v):
                 return f"{float(v)*100:+.1f}%" if v is not None and pd.notna(v) else ""
 
             def _units(v):
                 return f"{float(v):,.0f}" if v is not None and pd.notna(v) else ""
 
-            def _signal_cell(gap, missing):
+            def _sig_cell(gap, missing):
                 if missing or gap is None or pd.isna(gap):
                     return "pending"
                 g = float(gap)
@@ -555,41 +554,42 @@ def build_program_snapshot(
                     return '<font color="#1a7a3a"><b>GOOD</b></font>'
                 return '<font color="#555555">OK</font>'
 
-            # Levels
-            level_rows = []
+            header = ["Month", "Billed", "Activity", "Act Chg",
+                      "Temp", "Temp %Sls", "Temp Chg", "Temp Sig"]
+            if show_dh:
+                header += ["Dir Hire", "DH %Sls", "DH Chg", "DH Sig"]
+
+            rows = []
             for _, r in labor_flex_df.iterrows():
-                missing = bool(r["labor_missing"])
-                level_rows.append([
+                tmiss = bool(r["temp_missing"])
+                row = [
                     _mlabel(r["period"], bool(r["is_committed"])),
                     _dollar(r["billed_amount"]),
-                    "pending" if missing else _dollar(r["temp_labor"]),
-                    "pending" if missing else _pct_plain(r["temp_pct_sales"]),
                     _units(r["activity_units"]),
-                ])
-            story.append(_data_table(
-                ["Month", "Billed Amount", "Temp Labor", "Temp % of Sales", "Activity Units"],
-                level_rows,
-                col_ratios=[0.22, 0.22, 0.18, 0.18, 0.20],
-            ))
-            story.append(Spacer(1, SPACE_M))
+                    _psg(r["activity_mom_pct"]),
+                    "pending" if tmiss else _dollar(r["temp_labor"]),
+                    "pending" if tmiss else _pp(r["temp_pct_sales"]),
+                    "pending" if tmiss else _psg(r["temp_mom_pct"]),
+                    _sig_cell(r["temp_flex_gap"], tmiss),
+                ]
+                if show_dh:
+                    dmiss = bool(r["dh_missing"])
+                    row += [
+                        "pending" if dmiss else _dollar(r["direct_hire"]),
+                        "pending" if dmiss else _pp(r["dh_pct_sales"]),
+                        "pending" if dmiss else _psg(r["dh_mom_pct"]),
+                        _sig_cell(r["dh_flex_gap"], dmiss),
+                    ]
+                rows.append(row)
 
-            # Month-over-month flex
-            flex_rows = []
-            for _, r in labor_flex_df.iterrows():
-                missing = bool(r["labor_missing"])
-                flex_rows.append([
-                    _mlabel(r["period"], bool(r["is_committed"])),
-                    "pending" if missing else _pct_signed(r["temp_mom_pct"]),
-                    _pct_signed(r["activity_mom_pct"]),
-                    "pending" if missing else _pct_signed(r["flex_gap"]),
-                    _signal_cell(r["flex_gap"], missing),
-                ])
-            story.append(_data_table(
-                ["Month", "Temp Labor Change", "Activity Change", "Flex Gap", "Signal"],
-                flex_rows,
-                col_ratios=[0.24, 0.20, 0.20, 0.16, 0.20],
-            ))
-            
+            if show_dh:
+                ratios = [0.11, 0.11, 0.09, 0.08, 0.09, 0.08, 0.08, 0.08,
+                          0.09, 0.08, 0.08, 0.08]
+            else:
+                ratios = [0.16, 0.15, 0.13, 0.12, 0.12, 0.11, 0.11, 0.10]
+
+            story.append(_data_table(header, rows, col_ratios=ratios))
+
     story.append(PageBreak())
 
     # =================================================================
