@@ -1190,7 +1190,7 @@ def run_fifo_matching(period: str, applied_by: str):
         """), engine, params={"period": period})
 
     demo_sales     = _get_sales("v_kit_sales_by_iso_week_v2")
-    bag_sales      = _get_sales("v_bag_sales_by_iso_week")
+    bag_sales      = _get_sales("v_bag_sales_by_iso_week_v2")
     ow_sales       = _get_sales("v_overwrap_sales_by_iso_week_v2")
     pickpack_sales = _get_sales("v_pickpack_sales_by_iso_week")
 
@@ -2627,7 +2627,7 @@ def _check_orphan_invoices(period: str, threshold) -> dict:
             GROUP BY 1, 2, 3
             UNION ALL
             SELECT 'bag', doc_number, customer_name, SUM(total_units)
-            FROM v_bag_sales_by_iso_week
+            FROM v_bag_sales_by_iso_week_v2
             WHERE contract_completion_date IS NOT NULL
               AND DATE_TRUNC('month', contract_completion_date::date)
                   = TO_DATE(:period, 'YYYY-MM')
