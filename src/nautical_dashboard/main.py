@@ -11,6 +11,7 @@ from nautical_dashboard.app.modules import (
     revenue,
     allocations,
     profitability,
+    scaas_revenue_comparison,
     sga,
     wip_labor,
     production_activity,
@@ -29,6 +30,7 @@ auth.render_logout_button()
 
 PAGES = {
     "Profitability Dashboard": profitability.render,
+    "SCAAS Revenue Comparison": scaas_revenue_comparison.render,
     "Revenue":                 revenue.render,
     "Production Activity":     production_activity.render,
     "Raw Goods - COGS":        raw_goods.render,
