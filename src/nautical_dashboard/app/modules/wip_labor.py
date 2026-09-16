@@ -513,11 +513,11 @@ def get_ogp_units(period: str) -> pd.DataFrame:
         SELECT
             DATE_TRUNC('week', s.date)                    AS week_start,
             EXTRACT(WEEK FROM s.date)::int                AS iso_week,
-            COALESCE(a.canonical_name, s.job_name)        AS customer,
+            COALESCE(a.canonical_name, s.customer_resolved)        AS customer,
             SUM(s.daily_production_complete)              AS units
         FROM stg_smartsheet_ogp s
         LEFT JOIN dim_customer_alias a
-            ON LOWER(a.alias) = LOWER(s.job_name)
+            ON LOWER(a.alias) = LOWER(s.customer_resolved)
             AND a.active = TRUE
         WHERE s.accrual_month = :period
           AND s.daily_production_complete > 0
@@ -1042,7 +1042,7 @@ def write_production_layers(period: str, committed_by: str):
     ogp_units = pd.read_sql(text("""
         SELECT
             EXTRACT(WEEK FROM s.date)::int                AS iso_week,
-            COALESCE(a.canonical_name, s.job_name)        AS customer,
+            COALESCE(a.canonical_name, s.customer_resolved)        AS customer,
             CASE
                 WHEN s.bag_version ILIKE '%packout%' THEN 'packout'
                 ELSE 'bag'
@@ -1050,7 +1050,7 @@ def write_production_layers(period: str, committed_by: str):
             SUM(s.daily_production_complete)              AS units
         FROM stg_smartsheet_ogp s
         LEFT JOIN dim_customer_alias a
-            ON LOWER(a.alias) = LOWER(s.job_name) AND a.active = TRUE
+            ON LOWER(a.alias) = LOWER(s.customer_resolved) AND a.active = TRUE
         WHERE s.accrual_month = :period
           AND s.daily_production_complete > 0
           AND s.date IS NOT NULL
@@ -2295,10 +2295,10 @@ def _check_production_alias_strand(period: str, threshold) -> dict:
             UNION
             -- OGP
             SELECT 'OGP',
-                   LOWER(COALESCE(a.canonical_name, s.job_name))
+                   LOWER(COALESCE(a.canonical_name, s.customer_resolved))
             FROM stg_smartsheet_ogp s
             LEFT JOIN dim_customer_alias a
-                ON LOWER(a.alias) = LOWER(s.job_name) AND a.active = TRUE
+                ON LOWER(a.alias) = LOWER(s.customer_resolved) AND a.active = TRUE
             WHERE s.accrual_month = :period
               AND s.daily_production_complete > 0
               AND s.date IS NOT NULL
@@ -2355,12 +2355,12 @@ def _check_production_alias_strand(period: str, threshold) -> dict:
             GROUP BY 1, 2, 3
             UNION ALL
             SELECT 'OGP',
-                   COALESCE(a.canonical_name, s.job_name),
-                   LOWER(COALESCE(a.canonical_name, s.job_name)),
+                   COALESCE(a.canonical_name, s.customer_resolved),
+                   LOWER(COALESCE(a.canonical_name, s.customer_resolved)),
                    SUM(s.daily_production_complete)
             FROM stg_smartsheet_ogp s
             LEFT JOIN dim_customer_alias a
-                ON LOWER(a.alias) = LOWER(s.job_name) AND a.active = TRUE
+                ON LOWER(a.alias) = LOWER(s.customer_resolved) AND a.active = TRUE
             WHERE s.accrual_month = :period
               AND s.daily_production_complete > 0
               AND s.date IS NOT NULL
@@ -2821,10 +2821,10 @@ def _check_layers_without_smartsheet_basis(period: str, threshold) -> dict:
             UNION
 
             SELECT DISTINCT 
-                LOWER(COALESCE(a.canonical_name, s.job_name))
+                LOWER(COALESCE(a.canonical_name, s.customer_resolved))
             FROM stg_smartsheet_ogp s
             LEFT JOIN dim_customer_alias a
-                ON LOWER(a.alias) = LOWER(s.job_name)
+                ON LOWER(a.alias) = LOWER(s.customer_resolved)
                AND a.active = TRUE
                AND COALESCE(a.exclude, FALSE) = FALSE
             WHERE s.accrual_month = :period

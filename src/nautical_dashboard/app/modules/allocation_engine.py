@@ -546,11 +546,11 @@ def _get_ogp_units(period: str, alias_map: dict) -> pd.DataFrame:
     df = pd.read_sql(
         text("""
             SELECT
-                COALESCE(a.canonical_name, s.job_name) AS customer,
+                COALESCE(a.canonical_name, s.customer_resolved) AS customer,
                 SUM(s.daily_production_complete)        AS units
             FROM stg_smartsheet_ogp s
             LEFT JOIN dim_customer_alias a
-                ON LOWER(a.alias) = LOWER(s.job_name) AND a.active = TRUE
+                ON LOWER(a.alias) = LOWER(s.customer_resolved) AND a.active = TRUE
             WHERE s.accrual_month = :period
               AND s.daily_production_complete > 0
               AND s.date IS NOT NULL
