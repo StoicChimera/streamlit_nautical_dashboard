@@ -149,6 +149,70 @@ def load_sga_warehouse_gated(_engine, year: int, month: int) -> float:
     return float(df["total"].iloc[0])
 
 
+# Display labels for the unallocated freight breakdown
+UNASSIGNED_FREIGHT_KEY = "Unassigned 50200"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_unallocated_freight(_engine, year: int, month: int) -> pd.DataFrame:
+    """Freight & Storage that exists in mv_freight_by_program for the period
+    but never lands on a program row in mv_program_profitability.
+
+    Two ways this happens:
+      - No customer: 50200 bills/expenses with no customer tag and no vendor
+        default ('Unassigned 50200'), e.g. techSHIP label fees.
+      - No revenue: freight tagged to a program that has no revenue row in
+        the period. mv_program_profitability starts from revenue, so that
+        freight is dropped from the program table.
+
+    The CASE below must mirror the program-name collapsing in the freight
+    CTE of mv_program_profitability (AMT family, LogIQ). If that CASE
+    changes in the MV, change it here too.
+
+    Returns columns: customer_program, amount, reason
+    """
+    df = pd.read_sql(
+        text("""
+            SELECT
+                f.customer_program,
+                SUM(f.freight_storage)::float AS amount
+            FROM mv_freight_by_program f
+            WHERE f.recognized_year  = :year
+              AND f.recognized_month = :month
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM mv_program_profitability p
+                  WHERE p.recognized_year  = f.recognized_year
+                    AND p.recognized_month = f.recognized_month
+                    AND p.customer_program = CASE
+                        WHEN f.customer_program IN (
+                            'Advanced Media Technologies',
+                            'SMARTLOCK - Advanced Media Technology',
+                            'Plume - Advanced Media Technology'
+                        ) THEN 'Advanced Media Technologies'
+                        WHEN f.customer_program IN ('LogIQ', 'LogIQ Sage') THEN 'LogIQ'
+                        ELSE f.customer_program
+                    END
+              )
+            GROUP BY f.customer_program
+            HAVING ABS(SUM(f.freight_storage)) >= 0.005
+            ORDER BY SUM(f.freight_storage) DESC
+        """),
+        _engine,
+        params={"year": year, "month": month},
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["customer_program", "amount", "reason"])
+
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["reason"] = df["customer_program"].map(
+        lambda p: "No customer on bill"
+        if p == UNASSIGNED_FREIGHT_KEY
+        else "No revenue for this program in period"
+    )
+    return df
+
+
 BELOW_LINE_CATEGORIES = {"Interest & Financing"}
  
  
@@ -157,15 +221,27 @@ def _render_consolidated_pnl(
     sga_df: pd.DataFrame,
     warehouse_sga: float,
     period_label: str,
+    unallocated_freight_df: pd.DataFrame | None = None,
 ) -> None:
     """Standard income statement rollup across all programs for the period.
- 
+
     Interest & Financing (and any other BELOW_LINE_CATEGORIES) are presented
     below Total SG&A in an Other Income / (Expense) section, with an
     Operating Income subtotal in between — traditional P&L structure.
+
+    Unallocated Freight & Storage (freight with no customer, or tagged to a
+    program with no revenue in the period) is added to COGS here so the
+    consolidated P&L carries the full freight total. The program table below
+    stays program-only, so the difference between the two is exactly this line.
     """
     if df.empty:
         return
+
+    if unallocated_freight_df is None or unallocated_freight_df.empty:
+        unallocated_freight = 0.0
+    else:
+        unallocated_freight = float(unallocated_freight_df["amount"].sum())
+    show_unallocated = abs(unallocated_freight) >= 0.005
  
     revenue       = float(df["revenue"].sum())
     temp_labor    = float(df["temp_labor"].sum())
@@ -176,7 +252,7 @@ def _render_consolidated_pnl(
     freight       = float(df["freight_storage"].sum())
     applied_wh    = float(df["applied_wh"].sum())
     total_cogs    = (temp_labor + direct_hire + raw_materials + equipment
-                     + commission + freight + applied_wh)
+                     + commission + freight + unallocated_freight + applied_wh)
     gross_profit  = revenue - total_cogs
     gp_margin     = gross_profit / revenue if revenue else 0
  
@@ -221,13 +297,19 @@ def _render_consolidated_pnl(
         ("  Equipment",            equipment,     _pct(equipment)),
         ("  Commission",           commission,    _pct(commission)),
         ("  Freight & Storage",    freight,       _pct(freight)),
+    ]
+    if show_unallocated:
+        rows.append(
+            ("  Unallocated Freight & Storage", unallocated_freight, _pct(unallocated_freight))
+        )
+    rows.extend([
         ("  Applied Warehouse",    applied_wh,    _pct(applied_wh)),
         ("Total COGS",             total_cogs,    _pct(total_cogs)),
         ("", None, ""),
         ("Gross Profit",           gross_profit,  f"{gp_margin*100:.1f}%"),
         ("", None, ""),
         ("Operating Expenses",     None,          ""),
-    ]
+    ])
     for cat, amt in operating_sga_categories:
         rows.append((f"  {cat}", amt, _pct(amt)))
     if warehouse_sga:
@@ -280,6 +362,30 @@ def _render_consolidated_pnl(
  
     styled = pnl_df.style.apply(_highlight_pnl, axis=1)
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    if show_unallocated:
+        st.caption(
+            f"Unallocated Freight & Storage of {_amt(unallocated_freight)} is in the "
+            "consolidated P&L but not in the program table below. It is freight with "
+            "no customer on the bill, or freight tagged to a program with no revenue "
+            "this period. Consolidated Gross Profit and Net Profit are lower than the "
+            "program table totals by this amount."
+        )
+        with st.expander(
+            f"Unallocated Freight & Storage detail ({_amt(unallocated_freight)})",
+            expanded=False,
+        ):
+            detail = unallocated_freight_df.copy()
+            detail["customer_program"] = detail["customer_program"].replace(
+                {UNASSIGNED_FREIGHT_KEY: "Unassigned (50200, no customer)"}
+            )
+            detail = detail.rename(columns={
+                "customer_program": "Program",
+                "amount":           "Amount",
+                "reason":           "Reason",
+            })[["Program", "Reason", "Amount"]]
+            detail["Amount"] = detail["Amount"].map(_amt)
+            st.dataframe(detail, use_container_width=True, hide_index=True)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1607,13 +1713,17 @@ def render():
     with col_refresh:
         if st.button("Refresh View"):
             with st.spinner("Refreshing materialized views..."):
+                # Order matters: every input MV must refresh before
+                # mv_program_profitability, which reads them. Freight
+                # previously refreshed AFTER profitability, so profitability
+                # always showed the prior refresh's freight.
                 with engine.begin() as conn:
                     conn.execute(text("REFRESH MATERIALIZED VIEW mv_raw_materials_by_program"))
                     conn.execute(text("REFRESH MATERIALIZED VIEW mv_equipment_by_program"))
                     conn.execute(text("REFRESH MATERIALIZED VIEW mv_commission_by_program"))
                     conn.execute(text("REFRESH MATERIALIZED VIEW mv_sga_by_program"))
-                    conn.execute(text("REFRESH MATERIALIZED VIEW mv_program_profitability"))
                     conn.execute(text("REFRESH MATERIALIZED VIEW mv_freight_by_program"))
+                    conn.execute(text("REFRESH MATERIALIZED VIEW mv_program_profitability"))
             st.cache_data.clear()
             st.rerun()
 
@@ -1819,12 +1929,14 @@ def render():
 
     sga_breakdown       = load_sga_breakdown_gated(engine, year, month)
     sga_warehouse_total = load_sga_warehouse_gated(engine, year, month)
+    unallocated_freight = load_unallocated_freight(engine, year, month)
 
     # ── Consolidated P&L ────────────────────────────────────────────────────
     st.divider()
-    
+
     _render_consolidated_pnl(
-        df, sga_breakdown, sga_warehouse_total, month_label
+        df, sga_breakdown, sga_warehouse_total, month_label,
+        unallocated_freight_df=unallocated_freight,
     )
 
     st.divider()
