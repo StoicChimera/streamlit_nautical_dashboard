@@ -213,6 +213,70 @@ def load_unallocated_freight(_engine, year: int, month: int) -> pd.DataFrame:
     return df
 
 
+# COGS accounts that hit the GL but are not allocated to programs by any MV.
+# Matched against account_name (sub-accounts roll up to 55000 in
+# account_number, so the sub-account number is matched in the name).
+UNALLOCATED_MOH_ACCOUNTS = {
+    "55200": "MOH - Propane",
+    "55300": "MOH - Supplies",
+    "53000": "Inventory Shrinkage",
+}
+
+# Non-posting transaction types never hit the GL; excluded defensively in
+# case older splits chunks still contain them.
+NON_POSTING_TXN_TYPES = (
+    "Purchase Order", "Estimate", "Delayed Charge", "Delayed Credit", "Charge", "Credit",
+)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_unallocated_moh(_engine, year: int, month: int) -> pd.DataFrame:
+    """GL activity for COGS accounts with no program allocation, by GL date.
+
+    Returns columns: account, txn_type, lines, amount
+    """
+    month_start = pd.Timestamp(year=year, month=month, day=1).date()
+    next_month = (pd.Timestamp(month_start) + pd.DateOffset(months=1)).date()
+
+    patterns = [f"%{acct}%" for acct in UNALLOCATED_MOH_ACCOUNTS]
+    df = pd.read_sql(
+        text("""
+            SELECT
+                account_name,
+                txn_type,
+                COUNT(*)                  AS lines,
+                SUM(amount::numeric)::float AS amount
+            FROM clean_qbo_transaction_splits_flat
+            WHERE NULLIF(TRIM(date), '')::date >= :start
+              AND NULLIF(TRIM(date), '')::date <  :end
+              AND account_name ILIKE ANY(:patterns)
+              AND COALESCE(txn_type, '') <> ALL(:non_posting)
+            GROUP BY account_name, txn_type
+            HAVING ABS(SUM(amount::numeric)) >= 0.005
+            ORDER BY account_name, txn_type
+        """),
+        _engine,
+        params={
+            "start": month_start,
+            "end": next_month,
+            "patterns": patterns,
+            "non_posting": list(NON_POSTING_TXN_TYPES),
+        },
+    )
+    if df.empty:
+        return pd.DataFrame(columns=["account", "txn_type", "lines", "amount"])
+
+    def _label(name: str) -> str:
+        for acct, label in UNALLOCATED_MOH_ACCOUNTS.items():
+            if acct in str(name):
+                return f"{acct} {label}"
+        return str(name)
+
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    df["account"] = df["account_name"].map(_label)
+    return df[["account", "txn_type", "lines", "amount"]]
+
+
 BELOW_LINE_CATEGORIES = {"Interest & Financing"}
  
  
@@ -222,6 +286,7 @@ def _render_consolidated_pnl(
     warehouse_sga: float,
     period_label: str,
     unallocated_freight_df: pd.DataFrame | None = None,
+    unallocated_moh_df: pd.DataFrame | None = None,
 ) -> None:
     """Standard income statement rollup across all programs for the period.
 
@@ -242,6 +307,12 @@ def _render_consolidated_pnl(
     else:
         unallocated_freight = float(unallocated_freight_df["amount"].sum())
     show_unallocated = abs(unallocated_freight) >= 0.005
+
+    if unallocated_moh_df is None or unallocated_moh_df.empty:
+        unallocated_moh = 0.0
+    else:
+        unallocated_moh = float(unallocated_moh_df["amount"].sum())
+    show_moh = abs(unallocated_moh) >= 0.005
  
     revenue       = float(df["revenue"].sum())
     temp_labor    = float(df["temp_labor"].sum())
@@ -252,7 +323,8 @@ def _render_consolidated_pnl(
     freight       = float(df["freight_storage"].sum())
     applied_wh    = float(df["applied_wh"].sum())
     total_cogs    = (temp_labor + direct_hire + raw_materials + equipment
-                     + commission + freight + unallocated_freight + applied_wh)
+                     + commission + freight + unallocated_freight + applied_wh
+                     + unallocated_moh)
     gross_profit  = revenue - total_cogs
     gp_margin     = gross_profit / revenue if revenue else 0
  
@@ -302,8 +374,10 @@ def _render_consolidated_pnl(
         rows.append(
             ("  Unallocated Freight & Storage", unallocated_freight, _pct(unallocated_freight))
         )
+    rows.append(("  Applied Warehouse",    applied_wh,    _pct(applied_wh)))
+    if show_moh:
+        rows.append(("  Unallocated MOH", unallocated_moh, _pct(unallocated_moh)))
     rows.extend([
-        ("  Applied Warehouse",    applied_wh,    _pct(applied_wh)),
         ("Total COGS",             total_cogs,    _pct(total_cogs)),
         ("", None, ""),
         ("Gross Profit",           gross_profit,  f"{gp_margin*100:.1f}%"),
@@ -386,6 +460,25 @@ def _render_consolidated_pnl(
             })[["Program", "Reason", "Amount"]]
             detail["Amount"] = detail["Amount"].map(_amt)
             st.dataframe(detail, use_container_width=True, hide_index=True)
+
+    if show_moh:
+        st.caption(
+            f"Unallocated MOH of {_amt(unallocated_moh)} is GL activity in "
+            "MOH supplies, propane and inventory shrinkage for the month (by GL date). "
+            "It is in the consolidated P&L but not yet allocated to programs."
+        )
+        with st.expander(
+            f"Unallocated MOH detail ({_amt(unallocated_moh)})",
+            expanded=False,
+        ):
+            moh = unallocated_moh_df.rename(columns={
+                "account":  "Account",
+                "txn_type": "Transaction Type",
+                "lines":    "Lines",
+                "amount":   "Amount",
+            })[["Account", "Transaction Type", "Lines", "Amount"]].copy()
+            moh["Amount"] = moh["Amount"].map(_amt)
+            st.dataframe(moh, use_container_width=True, hide_index=True)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -1930,6 +2023,7 @@ def render():
     sga_breakdown       = load_sga_breakdown_gated(engine, year, month)
     sga_warehouse_total = load_sga_warehouse_gated(engine, year, month)
     unallocated_freight = load_unallocated_freight(engine, year, month)
+    unallocated_moh     = load_unallocated_moh(engine, year, month)
 
     # ── Consolidated P&L ────────────────────────────────────────────────────
     st.divider()
@@ -1937,6 +2031,7 @@ def render():
     _render_consolidated_pnl(
         df, sga_breakdown, sga_warehouse_total, month_label,
         unallocated_freight_df=unallocated_freight,
+        unallocated_moh_df=unallocated_moh,
     )
 
     st.divider()
