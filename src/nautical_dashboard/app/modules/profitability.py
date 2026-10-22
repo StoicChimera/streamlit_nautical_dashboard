@@ -190,7 +190,7 @@ def load_unallocated_freight(_engine, year: int, month: int) -> pd.DataFrame:
                             'SMARTLOCK - Advanced Media Technology',
                             'Plume - Advanced Media Technology'
                         ) THEN 'Advanced Media Technologies'
-                        WHEN f.customer_program IN ('LogIQ', 'LogIQ Sage') THEN 'LogIQ'
+                        WHEN f.customer_program IN ('LogIQ', 'LogIQ Sage', 'LogIQ - SAGE') THEN 'LogIQ'
                         ELSE f.customer_program
                     END
               )

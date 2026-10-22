@@ -94,8 +94,8 @@ def _consolidate_program(name: str) -> str:
     ):
         return "Advanced Media Technologies"
 
-    # LogIQ rollup
-    if n in ("LogIQ", "LogIQ Sage"):
+    # LogIQ rollup (QBO name is "LogIQ - SAGE"; "LogIQ Sage" kept for safety)
+    if n in ("LogIQ", "LogIQ Sage", "LogIQ - SAGE"):
         return "LogIQ"
 
     return n
