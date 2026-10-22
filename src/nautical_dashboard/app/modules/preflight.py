@@ -60,6 +60,8 @@ def _status_pill(status: str) -> str:
     colors = {
         "fresh":     ("#0b5a25", "#c8e6c9"),
         "stale":     ("#92400e", "#fed7aa"),
+        "failed":    ("#991b1b", "#fecaca"),
+        "empty":     ("#854d0e", "#fef3c7"),
         "never":     ("#374151", "#e5e7eb"),
         "done":      ("#0b5a25", "#c8e6c9"),
         "pending":   ("#92400e", "#fed7aa"),
@@ -362,8 +364,11 @@ def _render_freshness_panel() -> None:
     st.caption(f"_Loaded: {datetime.now(pytz.timezone('US/Mountain')).strftime('%I:%M:%S %p MT')}_")
 
     st.caption(
-        "Every ETL writes to data_source_sync_log on success. "
-        "Anything stale means rerun that source before relying on downstream numbers."
+        "Status comes from each source's most recent run in data_source_sync_log. "
+        "Failed: the last run did not succeed. Empty: the last run succeeded but "
+        "loaded 0 rows (normal for some incremental loads, a problem for full "
+        "reloads). Stale: the last run is older than its expected cadence. "
+        "Rerun anything not green before relying on downstream numbers."
     )
 
     df = load_freshness()
@@ -371,15 +376,23 @@ def _render_freshness_panel() -> None:
         st.warning("No data sources registered in dim_data_sources.")
         return
 
-    fresh_n = int((df["freshness"] == "fresh").sum())
-    stale_n = int((df["freshness"] == "stale").sum())
-    never_n = int((df["freshness"] == "never").sum())
+    fresh_n  = int((df["freshness"] == "fresh").sum())
+    stale_n  = int((df["freshness"] == "stale").sum())
+    failed_n = int((df["freshness"] == "failed").sum())
+    empty_n  = int((df["freshness"] == "empty").sum())
+    never_n  = int((df["freshness"] == "never").sum())
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Total Sources", len(df))
     c2.metric("Fresh", fresh_n)
     c3.metric("Stale", stale_n)
-    c4.metric("Never Synced", never_n)
+    c4.metric("Failed", failed_n)
+    c5.metric("Empty", empty_n)
+    c6.metric("Never Synced", never_n)
+
+    if failed_n:
+        failed_names = ", ".join(df.loc[df["freshness"] == "failed", "display_name"].astype(str))
+        st.error(f"Last run failed: {failed_names}. Rerun before trusting dependent numbers.")
 
     out = df.copy()
     out["Status"] = out["freshness"].apply(_status_pill)
