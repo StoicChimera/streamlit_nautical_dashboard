@@ -4,7 +4,7 @@ program_snapshot.py
 Builds a single-program PDF snapshot.
 
 Pages:
-  1 — Cover + P&L
+  1 — Cover + P&L + Revenue Mix
   2 — Labor detail + Week-over-Week trend
   3 — Warehouse detail
   4 — Freight lines
@@ -176,6 +176,7 @@ def build_program_snapshot(
     logo_path: Optional[str] = None,
     labor_weekly_df: Optional[pd.DataFrame] = None,
     labor_flex_df: Optional[pd.DataFrame] = None,
+    revenue_mix_df: Optional[pd.DataFrame] = None,
 ) -> str:
 
     if labor_employee_df is None:
@@ -184,6 +185,8 @@ def build_program_snapshot(
         labor_weekly_df = pd.DataFrame()
     if labor_flex_df is None:
         labor_flex_df = pd.DataFrame()
+    if revenue_mix_df is None:
+        revenue_mix_df = pd.DataFrame()
 
     styles = getSampleStyleSheet()
     ts = _dt.now().strftime("%Y-%m-%d %H:%M")
@@ -360,6 +363,38 @@ def build_program_snapshot(
             ("LINEBELOW",     (0, 10), (-1, 10), 0.5, BRAND_NAVY),
         ]))
         story.append(pt)
+
+    # =================================================================
+    # Revenue Mix (category / subcategory of the revenue line above)
+    # =================================================================
+    if not revenue_mix_df.empty:
+        mix = revenue_mix_df.copy()
+        mix["revenue"] = pd.to_numeric(mix["revenue"], errors="coerce").fillna(0.0)
+        mix_total = float(mix.loc[mix["category"] != "Excluded", "revenue"].sum())
+        mix_rows = []
+        for _, mr in mix.iterrows():
+            is_excl = mr["category"] == "Excluded"
+            share = "" if is_excl or mix_total == 0 else _pct(float(mr["revenue"]) / mix_total)
+            mix_rows.append([mr["category"], mr["subcategory"], _dollar(mr["revenue"]), share])
+        mix_rows.append(["Total", "", _dollar(float(mix["revenue"].sum())), ""])
+
+        story.append(Spacer(1, SPACE_M))
+        story.append(KeepTogether([
+            Paragraph("Revenue Mix", h2_style),
+            HRFlowable(width=CONTENT_WIDTH, thickness=0.5, color=BRAND_NAVY,
+                       spaceBefore=0, spaceAfter=SPACE_S, hAlign="LEFT"),
+            _data_table(
+                ["Category", "Subcategory", "Revenue", "Share"],
+                mix_rows,
+                col_ratios=[0.30, 0.40, 0.18, 0.12],
+            ),
+            Spacer(1, SPACE_XS),
+            Paragraph(
+                "Revenue split by service category. Total equals the Revenue line above. "
+                "Costs are not split by category, so margins are for the whole program.",
+                caption_style,
+            ),
+        ]))
 
     story.append(PageBreak())
 

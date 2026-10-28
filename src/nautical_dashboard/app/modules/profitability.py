@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from nautical_dashboard.app.modules.wip_labor_allocation import is_period_committed
+from nautical_dashboard.app.modules import revenue_mix
 
 load_dotenv()
 
@@ -1390,8 +1391,8 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
     if not selected:
         return
 
-    tab_pnl, tab_labor, tab_warehouse, tab_freight, tab_wip = st.tabs([
-        "P&L", "Labor", "Warehouse", "Freight", "WIP"
+    tab_pnl, tab_mix, tab_labor, tab_warehouse, tab_freight, tab_wip = st.tabs([
+        "P&L", "Revenue Mix", "Labor", "Warehouse", "Freight", "WIP"
     ])
 
     col_snap, _ = st.columns([2, 6])
@@ -1413,6 +1414,7 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
 
                 snap_emp = load_program_labor_employees(engine, selected, year, month)
                 snap_flex = load_program_activity_flex(engine, selected, year, month)
+                snap_mix  = revenue_mix.load_program_month_mix(selected, year, month)
 
                 build_program_snapshot(
                     out_path          = tmp_path,
@@ -1427,6 +1429,7 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                     logo_path         = logo_path,
                     labor_weekly_df   = snap_weekly,
                     labor_flex_df     = snap_flex,
+                    revenue_mix_df    = snap_mix,
                 )
 
                 with open(tmp_path, "rb") as f:
@@ -1472,6 +1475,15 @@ def _render_program_snapshot(engine, df: pd.DataFrame, year: int, month: int, mo
                     rows.append({"Line Item": label, "Amount": f"${float(val):,.2f}"})
             pnl_df = pd.DataFrame(rows)
             st.dataframe(pnl_df, use_container_width=True, hide_index=True)
+
+    # ---- Revenue Mix ----
+    with tab_mix:
+        _m = pd.Timestamp(year=year, month=month, day=1).date()
+        revenue_mix.render_program_mix_callout(selected, _m, _m, key="snapshot_mix")
+        st.caption(
+            "Display only. Costs are not split by revenue category, so margins on "
+            "the P&L tab are for the whole program."
+        )
 
     # ---- Labor ----
     with tab_labor:

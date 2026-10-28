@@ -553,6 +553,7 @@ def render_program_mix_callout(program: str, start_month: date, end_month: date,
         st.caption("No revenue mix data for this program and period.")
         return
     total = _mix_total(p)
+    excluded = float(p.loc[p["category"] == "Excluded", "revenue"].sum())
     by_cat = p[p["category"] != "Excluded"].groupby("category")["revenue"].sum()
     cats = _ordered(by_cat.index)
     st.markdown("##### Revenue mix")
@@ -562,12 +563,40 @@ def render_program_mix_callout(program: str, start_month: date, end_month: date,
         share = val / total if total else 0.0
         col.metric(cat, _money(val))
         col.caption(f"{share:.1%}")
-    with st.expander("Subcategory detail"):
-        d = (p.groupby(["category", "subcategory"], as_index=False)["revenue"].sum()
-             .rename(columns={"category": "Category", "subcategory": "Subcategory",
-                              "revenue": "Revenue"}))
-        d["Share"] = d["Revenue"] / total if total else 0.0
-        _show_df(_style_money(d, ["Revenue"], ["Share"]))
+    tie = f"Mix total {_money(total + excluded)} ties to P&L revenue."
+    if abs(excluded) >= 0.5:
+        tie += f" Includes {_money(excluded)} Excluded (loans, financing, deposits)."
+    st.caption(tie)
+    d = (p.groupby(["category", "subcategory"], as_index=False)["revenue"].sum()
+         .rename(columns={"category": "Category", "subcategory": "Subcategory",
+                          "revenue": "Revenue"}))
+    d["Share"] = d["Revenue"] / total if total else 0.0
+    d.loc[d["Category"] == "Excluded", "Share"] = float("nan")
+    d["_o"] = d["Category"].map({c: i for i, c in enumerate(CATEGORY_ORDER)}).fillna(99)
+    d = d.sort_values(["_o", "Revenue"], ascending=[True, False]).drop(columns="_o")
+    _show_df(_style_money(d, ["Revenue"], ["Share"]))
+
+
+def load_program_month_mix(program: str, year: int, month: int) -> pd.DataFrame:
+    """Category and subcategory revenue for one program and month.
+
+    Used by the program snapshot PDF. Columns: category, subcategory, revenue.
+    Uses the same month basis and program names as mv_program_profitability,
+    so the total equals the P&L revenue line. Returns an empty frame on error
+    so the export never fails because of the mix.
+    """
+    try:
+        df = load_mix()
+    except Exception:
+        return pd.DataFrame(columns=["category", "subcategory", "revenue"])
+    m = pd.Timestamp(year=year, month=month, day=1)
+    p = df[(df["customer_program"] == program) & (df["month_start"] == m)]
+    if p.empty:
+        return pd.DataFrame(columns=["category", "subcategory", "revenue"])
+    out = p.groupby(["category", "subcategory"], as_index=False)["revenue"].sum()
+    out["_o"] = out["category"].map({c: i for i, c in enumerate(CATEGORY_ORDER)}).fillna(99)
+    return (out.sort_values(["_o", "revenue"], ascending=[True, False])
+               .drop(columns="_o").reset_index(drop=True))
 
 
 if __name__ == "__main__":
