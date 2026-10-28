@@ -154,18 +154,23 @@ def _style_money(df: pd.DataFrame, money_cols, pct_cols=()):
 
 
 def _show_df(obj) -> None:
-    """st.dataframe at full width on old and new Streamlit versions."""
+    """st.dataframe at full width on old and new Streamlit versions.
+
+    Newer Streamlit takes width="stretch"; older versions reject it and use
+    use_container_width=True. The fallback calls Streamlit directly.
+    """
     try:
-        _show_df(obj, hide_index=True, width="stretch")
-    except (TypeError, Exception):
-        st.dataframe(obj)
+        st.dataframe(obj, hide_index=True, width="stretch")
+    except Exception:
+        st.dataframe(obj, hide_index=True, use_container_width=True)
 
 
 def _show_chart(chart) -> None:
+    """st.altair_chart at full width on old and new Streamlit versions."""
     try:
         st.altair_chart(chart, width="stretch")
-    except (TypeError, Exception):
-        _show_chart(chart)
+    except Exception:
+        st.altair_chart(chart, use_container_width=True)
 
 
 def _mix_total(df: pd.DataFrame) -> float:
