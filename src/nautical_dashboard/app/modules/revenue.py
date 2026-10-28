@@ -6,6 +6,12 @@ import altair as alt
 import os
 from dotenv import load_dotenv
 
+# Revenue mix tab (Production / Fulfillment / Parcel Shipping / Sourcing / Other)
+try:
+    from . import revenue_mix
+except ImportError:
+    from nautical_dashboard.app.modules import revenue_mix
+
 # === Load env + DB ===
 load_dotenv()  # loads from .env / .env.prod depending on your alias/env
 SUPABASE_CONN = os.getenv("SUPABASE_CONN")
@@ -283,13 +289,17 @@ def render():
         unsafe_allow_html=True,
     )
 
-    tabs = st.tabs(["Overview", "Kits", "OW Units", "Bags", "Pallets"])
+    tabs = st.tabs(["Overview", "Revenue Mix", "Kits", "OW Units", "Bags", "Pallets"])
 
     # === Tab 0: Overview ===
     with tabs[0]:
         render_topline_overview()
 
-    # === Tabs 1–4: Revenue by Category (NOW includes customer rollups + details) ===
+    # === Tab 1: Revenue Mix ===
+    with tabs[1]:
+        revenue_mix.render(key="revmix")
+
+    # === Tabs 2–5: Revenue by Category (NOW includes customer rollups + details) ===
     category_queries = {
         "Kits": f"""
             SELECT
@@ -346,6 +356,6 @@ def render():
         """,
     }
 
-    # Render tabs 1..4
-    for i, (label, sql) in enumerate(category_queries.items(), start=1):
+    # Render tabs 2..5 (tab 1 is Revenue Mix)
+    for i, (label, sql) in enumerate(category_queries.items(), start=2):
         render_category_tab(tabs[i], label, sql)
